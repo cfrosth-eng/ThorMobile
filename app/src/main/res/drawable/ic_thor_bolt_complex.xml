@@ -1,0 +1,27 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Outer Glow / Aura -->
+    <path
+        android:pathData="M 28,4 L 14,20 L 22,20 L 16,32 L 24,32 L 18,44 L 38,24 L 30,24 L 34,14 L 28,14 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="24"
+                android:centerY="24"
+                android:gradientRadius="24"
+                android:type="radial">
+                <item android:offset="0.0" android:color="#66FFD700"/>
+                <item android:offset="1.0" android:color="#00FFD700"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Inner Solid Bolt (Staircase structure) -->
+    <path
+        android:fillColor="#FFD700"
+        android:pathData="M 28,4 L 14,20 L 22,20 L 16,32 L 24,32 L 18,44 L 38,24 L 30,24 L 34,14 L 28,14 Z"/>
+</vector>

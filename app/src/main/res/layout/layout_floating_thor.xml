@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="120dp"
+    android:layout_height="120dp">
+
+    <!--
+      Layer 1: The Glowing Ring (Background)
+      Maximized to 120dp and set to centerCrop.
+    -->
+    <ImageView
+        android:id="@+id/thor_glow_ring"
+        android:layout_width="120dp"
+        android:layout_height="120dp"
+        android:layout_gravity="center"
+        android:src="@drawable/glow_ring"
+        android:alpha="0.0"
+        android:scaleType="centerCrop"
+        android:contentDescription="Active Listening Glow" />
+
+    <!--
+      Layer 2: Your Original Thor Icon (Foreground)
+      Expanded to 70dp to flush perfectly against the inside of the gold band.
+      Corner radius set to 35dp.
+    -->
+    <androidx.cardview.widget.CardView
+        android:layout_width="70dp"
+        android:layout_height="70dp"
+        android:layout_gravity="center"
+        app:cardBackgroundColor="@android:color/transparent"
+        app:cardCornerRadius="35dp"
+        app:cardElevation="0dp">
+
+        <ImageView
+            android:id="@+id/thor_icon_image"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:src="@drawable/image_5"
+            android:scaleType="centerCrop"
+            android:contentDescription="Thor Mjolnir Badge" />
+
+    </androidx.cardview.widget.CardView>
+
+</FrameLayout>
