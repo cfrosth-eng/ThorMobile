@@ -4,26 +4,20 @@
     android:layout_width="120dp"
     android:layout_height="120dp">
 
-    <!--
-      Layer 1: The Glowing Ring (Background)
-      Maximized to 120dp and set to centerCrop.
-    -->
+    <!-- Layer 1: The Orbiting Golden Ring (Background) -->
     <ImageView
         android:id="@+id/thor_glow_ring"
         android:layout_width="120dp"
         android:layout_height="120dp"
         android:layout_gravity="center"
         android:src="@drawable/glow_ring"
-        android:alpha="0.0"
+        android:alpha="0.75"
         android:scaleType="centerCrop"
         android:contentDescription="Active Listening Glow" />
 
-    <!--
-      Layer 2: Your Original Thor Icon (Foreground)
-      Expanded to 70dp to flush perfectly against the inside of the gold band.
-      Corner radius set to 35dp.
-    -->
+    <!-- Layer 2: Mjolnir Badge + Dual-Zone High-Voltage Lightning Overlays -->
     <androidx.cardview.widget.CardView
+        android:id="@+id/thor_badge_card"
         android:layout_width="70dp"
         android:layout_height="70dp"
         android:layout_gravity="center"
@@ -31,13 +25,35 @@
         app:cardCornerRadius="35dp"
         app:cardElevation="0dp">
 
-        <ImageView
-            android:id="@+id/thor_icon_image"
+        <FrameLayout
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:src="@drawable/image_5"
-            android:scaleType="centerCrop"
-            android:contentDescription="Thor Mjolnir Badge" />
+            android:layout_height="match_parent">
+
+            <ImageView
+                android:id="@+id/thor_icon_image"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:src="@drawable/image_5"
+                android:scaleType="centerCrop"
+                android:contentDescription="Thor Mjolnir Badge" />
+
+            <ImageView
+                android:id="@+id/thor_lightning_upper"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:alpha="0.0"
+                android:scaleType="centerCrop"
+                android:contentDescription="Upper Lightning Bolts" />
+
+            <ImageView
+                android:id="@+id/thor_lightning_lower"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:alpha="0.0"
+                android:scaleType="centerCrop"
+                android:contentDescription="Lower Lightning Bolts" />
+
+        </FrameLayout>
 
     </androidx.cardview.widget.CardView>
 

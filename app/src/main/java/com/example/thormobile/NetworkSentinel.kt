@@ -5,13 +5,15 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 
 class NetworkSentinel(context: Context) {
 
     private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
-    var isConnected: Boolean = false
+    @Volatile var isConnected: Boolean = false
         private set
 
     // This function will be triggered later in Phase 4 to flush the Outbox
@@ -27,7 +29,7 @@ class NetworkSentinel(context: Context) {
 
             if (wasDisconnected) {
                 // We just regained a signal. Trigger the flush sequence.
-                onConnectionRestored?.invoke()
+                Handler(Looper.getMainLooper()).post { onConnectionRestored?.invoke() }
             }
         }
 

@@ -13,3 +13,10 @@
 .externalNativeBuild
 .cxx
 local.properties
+.idea/deviceManager.xml
+.idea/caches/
+.idea/libraries/
+*.apk
+*.aab
+*.jks
+*.keystore
