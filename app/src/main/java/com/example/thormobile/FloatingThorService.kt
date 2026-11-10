@@ -2,18 +2,25 @@ package com.example.thormobile
 
 import android.Manifest
 import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.PorterDuff
+import android.graphics.Rect
+import android.graphics.drawable.Drawable
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
@@ -36,10 +43,17 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -53,6 +67,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.min
+import kotlin.random.Random
 
 class FloatingThorService : Service() {
 
@@ -61,43 +76,181 @@ class FloatingThorService : Service() {
         private const val TAG_AUDIO = "ThorAudio"
         private const val TAG_WS = "ThorWebSocket"
         private const val NOTIFICATION_ID = 1
-        private const val CHANNEL_ID = "ThorChannelId"
+        private const val CHANNEL_ID = "ThorOverlayNoBadgeV2"
         const val ACTION_STOP = "com.example.thormobile.action.STOP"
+        const val ACTION_KEEP_ALIVE = "com.example.thormobile.action.KEEP_ALIVE"
+        @Volatile var isServiceRunning = false
+        @Volatile var userRequestedStop = false
+        @Volatile var serviceCreatedElapsedMs = 0L
         private const val BRIDGE_URL = "wss://thor-api-443941171993.us-east4.run.app"
+        // Single-Cloud Architecture (V25.2): Direct connection to primary thor-api only
         private const val END_SESSION_TEXT = "END_SESSION"
-        private const val END_DRAIN_MAX_MS = 15_000L
-        private const val END_DRAIN_TAIL_MS = 500L
-        private const val MIC_SETTLE_DELAY_MS = 600L
+        private const val END_DRAIN_MAX_MS = 6_000L
+        private const val END_DRAIN_TAIL_MS = 180L
+        private const val MIC_SETTLE_DELAY_MS = 25L
         private const val ASSET_DIR = "wakeword"
         private const val WAKE_THRESHOLD = 0.8f
         private const val CAPTURE_SAMPLE_RATE = 16000
         private const val CAPTURE_FRAME_BYTES = 1600
         private const val PRE_ROLL_IDLE_MAX_BYTES = 16000 * 2
-        private const val PRE_ROLL_CONNECT_MAX_BYTES = 16000 * 2 * 8
+        private const val PRE_ROLL_CONNECT_MAX_BYTES = 480000 // 15.0s of 16kHz PCM16 speech across valley dips * 2 * 8
         private const val PLAYBACK_SAMPLE_RATE = 24000
         private const val PLAYBACK_SLICE_BYTES = 1920
         private const val CAPTURE_RING_BYTES = CAPTURE_SAMPLE_RATE * 2
         private const val MAX_SEND_QUEUE_BYTES = 1024L * 1024L
+
+        private const val PRE_BUFFER_DELAY_MS = 20L
+        private const val OVERLAY_PREFS = "thor_overlay_v2"
+        private const val KEY_POS_X = "overlay_pos_x"
+        private const val KEY_POS_Y = "overlay_pos_y"
+
         private val FLUSH_MARKER: ByteString =
             byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte()).toByteString()
     }
 
-    private class PcmChunk(val generation: Int, val data: ByteArray)
+    private class PcmChunk(
+        val generation: Int,
+        val data: ByteArray,
+        val enqueueTime: Long = SystemClock.elapsedRealtime()
+    )
+
+    /**
+     * Animates ONLY the actual painted lightning bolts extracted from image_5.png
+     * (core + electric bloom halo) cascading downward in 8 stepped-leader jumps
+     * over the 100% undimmed original Mjolnir artwork. Zero fake drawn lines.
+     */
+    private class ActualArtworkBoltDrawable(
+        private val coreBitmap: Bitmap,
+        private val haloBitmap: Bitmap
+    ) : Drawable() {
+        private val haloPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        private val corePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        private val dstRect = Rect()
+        private val steps = 8
+
+        // progress: 0.0f..0.70f (stepped downward cascade along real bolts),
+        //           0.70f..0.92f (return-stroke flash across all real forks),
+        //           0.92f..1.30f (top-to-bottom tail sweep & fade)
+        var strikeProgress: Float = -1f
+            set(value) {
+                field = value
+                invalidateSelf()
+            }
+
+        override fun draw(canvas: Canvas) {
+            val p = strikeProgress
+            if (p < 0f || p > 1.30f) return
+
+            val b = bounds
+            if (b.isEmpty) return
+            dstRect.set(b)
+            val h = b.height()
+
+            if (p <= 0.70f) {
+                // Phase 1: Stepped-leader downward cascade along the artwork's actual lightning forks
+                val rawNorm = (p / 0.70f).coerceIn(0f, 1f)
+                val steppedNorm = ((rawNorm * steps).toInt() + 1).toFloat() / steps.toFloat()
+                val frontY = b.top + (h * steppedNorm.coerceIn(0f, 1f)).toInt()
+                val leaderBand = (h * 0.24f).toInt().coerceAtLeast(10)
+                val leaderTop = (frontY - leaderBand).coerceAtLeast(b.top)
+
+                // Upper trail already ignited
+                haloPaint.alpha = 185
+                corePaint.alpha = 210
+                canvas.save()
+                canvas.clipRect(b.left, b.top, b.right, frontY)
+                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
+                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
+                canvas.restore()
+
+                // Blazing downward-moving leading wave tip on the real forks
+                haloPaint.alpha = 255
+                corePaint.alpha = 255
+                canvas.save()
+                canvas.clipRect(b.left, leaderTop, b.right, frontY)
+                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
+                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
+                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
+                canvas.restore()
+            } else if (p <= 0.92f) {
+                // Phase 2: Full return-stroke flash along all real lightning bolts in image_5
+                val crackle = if (p in 0.78f..0.82f) 0.55f else 1.0f
+                haloPaint.alpha = (255 * crackle).toInt()
+                corePaint.alpha = (255 * crackle).toInt()
+                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
+                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
+                if (crackle == 1.0f) {
+                    canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
+                }
+            } else {
+                // Phase 3: Top-to-bottom tail sweep as the surge dissipates into the hammer
+                val fadeNorm = ((p - 0.92f) / 0.38f).coerceIn(0f, 1f)
+                val tailTopY = b.top + (h * fadeNorm * 0.60f).toInt()
+                val alpha = ((1f - fadeNorm) * 255f).toInt().coerceIn(0, 255)
+                haloPaint.alpha = alpha
+                corePaint.alpha = alpha
+                canvas.save()
+                canvas.clipRect(b.left, tailTopY, b.right, b.bottom)
+                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
+                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
+                canvas.restore()
+            }
+        }
+
+        override fun setAlpha(alpha: Int) {
+            corePaint.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: ColorFilter?) {
+            corePaint.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private var locationCallback: LocationCallback? = null
+    @Volatile private var lastKnownLat: Double? = null
+    @Volatile private var lastKnownLon: Double? = null
+    @Volatile private var lastKnownSpeedMph: Double = 0.0
+    @Volatile private var lastKnownHeading: Double = 0.0
 
     private lateinit var windowManager: WindowManager
     private lateinit var floatingView: View
     private var glowRingView: ImageView? = null
+    private var hammerImageView: ImageView? = null
+    private var lightningUpperView: ImageView? = null
+    private var lightningLowerView: ImageView? = null
+    private var badgeCardView: View? = null
+
+    private var artworkBoltDrawable: ActualArtworkBoltDrawable? = null
+    private var boltAnimator: ValueAnimator? = null
     private var pulseAnimator: ObjectAnimator? = null
+    private var ringRotateAnimator: ObjectAnimator? = null
+    private var nextIdleStrikeAt = 0L
+
     private lateinit var audioManager: AudioManager
     private lateinit var powerGuard: PowerGuard
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var destroyed = false
     @Volatile private var isStandby = false
 
-    // THOR MICRO-AGENT COMPONENTS
     private lateinit var db: ThorDatabase
     private lateinit var networkSentinel: NetworkSentinel
+    private lateinit var localBrain: ThorLocalBrain
     private val outboxExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var offlineModeActive = false
+    @Volatile private var valleyReconnectAttempts = 0
+    private val offlineTurnBuffer = java.io.ByteArrayOutputStream()
+    private val currentTurnPcm = java.io.ByteArrayOutputStream()
+    @Volatile private var turnSpeechDetected = false
+    @Volatile private var turnLastVoiceMs = 0L
+    @Volatile private var socketDroppedDuringTurn = false
+    @Volatile private var waitingForCloudBurst = false
+    @Volatile private var offlineSpeechDetected = false
+    @Volatile private var offlineLastVoiceMs = 0L
+    @Volatile private var offlineStartedMs = 0L
 
     private val lock = Any()
     @Volatile private var activeSession = 0
@@ -120,15 +273,23 @@ class FloatingThorService : Service() {
     private val captureToken = AtomicInteger(0)
     private var captureThread: Thread? = null
     private var audioRecord: AudioRecord? = null
-    private var echoCanceler: AcousticEchoCanceler? = null
+
+    private var aec: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
+    @Volatile private var sharedAudioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
+    @Volatile private var localNoiseFloorRms: Double = 95.0
+    @Volatile private var localBargeInStreak: Int = 0
 
     private var audioTrack: AudioTrack? = null
     private var playbackThread: Thread? = null
     private val playbackQueue = LinkedBlockingQueue<PcmChunk>()
     private val flushGeneration = AtomicInteger(0)
+
     @Volatile private var isPlayingAudio = false
     @Volatile private var playbackBusy = false
+    @Volatile private var currentPlaybackRms: Double = 0.0
+    @Volatile private var lastPlaybackTime = 0L
+
     @Volatile private var endingSession = false
     @Volatile private var micSettling = false
 
@@ -138,20 +299,57 @@ class FloatingThorService : Service() {
         Log.d(TAG_AUDIO, "Audio focus changed: $change")
     }
 
+    private val stormTicker = object : Runnable {
+        override fun run() {
+            if (destroyed) return
+            val now = SystemClock.elapsedRealtime()
+
+            when {
+                isStandby -> {
+                    boltAnimator?.cancel()
+                    artworkBoltDrawable?.strikeProgress = -1f
+                    mainHandler.postDelayed(this, 500L)
+                }
+                playbackBusy || (now - lastPlaybackTime < 180L) -> {
+                    if (boltAnimator?.isRunning != true) {
+                        fireArtworkLightningCascade(durationMs = 380L)
+                    }
+                    mainHandler.postDelayed(this, 110L)
+                }
+                activeSession != 0 -> {
+                    if (now >= nextIdleStrikeAt && boltAnimator?.isRunning != true) {
+                        fireArtworkLightningCascade(durationMs = 480L)
+                        nextIdleStrikeAt = now + Random.nextLong(1400L, 2500L)
+                    }
+                    mainHandler.postDelayed(this, 180L)
+                }
+                else -> {
+                    if (now >= nextIdleStrikeAt && boltAnimator?.isRunning != true) {
+                        fireArtworkLightningCascade(durationMs = 520L)
+                        nextIdleStrikeAt = now + Random.nextLong(3000L, 5000L)
+                    }
+                    mainHandler.postDelayed(this, 240L)
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
+        ObdLinkAutoWatchdog.startAutonomousWatchdog("https://" + "thor-api-443941171993.us-east4.run.app")
+        VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
+        isServiceRunning = true
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         powerGuard = PowerGuard(this)
 
-        // Initialize Thor Local Memory & Sentinel
         db = ThorDatabase.getDatabase(this)
         networkSentinel = NetworkSentinel(this)
+        localBrain = ThorLocalBrain(this)
         networkSentinel.onConnectionRestored = {
             synchronized(lock) {
                 if (activeSession != 0) {
                     if (!socketReady && webSocket == null) {
-                        Log.d(TAG_WS, "Network restored. Reconnecting socket for active session...")
                         openBridgeSocket(activeSession)
                     } else if (socketReady) {
                         flushOutbox()
@@ -165,7 +363,7 @@ class FloatingThorService : Service() {
         try {
             val notification = buildNotification(sessionActive = false, wakeReady = false)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
@@ -178,6 +376,12 @@ class FloatingThorService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         floatingView = LayoutInflater.from(this).inflate(R.layout.layout_floating_thor, null)
         glowRingView = floatingView.findViewById(R.id.thor_glow_ring)
+        hammerImageView = floatingView.findViewById(R.id.thor_icon_image)
+        lightningUpperView = floatingView.findViewById(R.id.thor_lightning_upper)
+        lightningLowerView = floatingView.findViewById(R.id.thor_lightning_lower)
+        badgeCardView = floatingView.findViewById(R.id.thor_badge_card)
+
+        buildActualArtworkLightningLayer()
 
         val layoutFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -185,6 +389,13 @@ class FloatingThorService : Service() {
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
         }
+
+        val metrics = resources.displayMetrics
+        val iconPx = (120 * metrics.density).toInt()
+        val touchSlopPx = (10 * metrics.density).toInt().coerceAtLeast(10)
+        val defaultX = (metrics.widthPixels - iconPx - (10 * metrics.density).toInt()).coerceAtLeast(0)
+        val defaultY = (metrics.heightPixels * 0.36f).toInt()
+        val posPrefs = getSharedPreferences(OVERLAY_PREFS, MODE_PRIVATE)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -194,9 +405,15 @@ class FloatingThorService : Service() {
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = 0
-        params.y = 100
+        params.x = posPrefs.getInt(KEY_POS_X, defaultX)
+        params.y = posPrefs.getInt(KEY_POS_Y, defaultY)
         windowManager.addView(floatingView, params)
+
+        applyVisualState()
+        loadWakeWordAsync()
+        nextIdleStrikeAt = SystemClock.elapsedRealtime() + 1800L
+        mainHandler.postDelayed({ fireArtworkLightningCascade(durationMs = 500L) }, 350L)
+        mainHandler.post(stormTicker)
 
         var initialX = 0
         var initialY = 0
@@ -208,6 +425,7 @@ class FloatingThorService : Service() {
         val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 if (!isStandby) {
+                    fireArtworkLightningCascade(durationMs = 450L)
                     handleOverlayTap()
                 } else {
                     toast("Thor is resting. Double-tap to wake.")
@@ -216,7 +434,11 @@ class FloatingThorService : Service() {
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
-                toggleStandby()
+                if (!isStandby && activeSession != 0) {
+                    stopStreamingAudio()
+                } else {
+                    toggleStandby()
+                }
                 return true
             }
 
@@ -226,7 +448,7 @@ class FloatingThorService : Service() {
             }
         })
 
-        floatingView.setOnTouchListener { _, event ->
+        floatingView.setOnTouchListener { _: View, event: MotionEvent ->
             gestureDetector.onTouchEvent(event)
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
@@ -241,26 +463,221 @@ class FloatingThorService : Service() {
                     val dx = event.rawX - initialTouchX
                     val dy = event.rawY - initialTouchY
 
-                    if (abs(dx) > 10 || abs(dy) > 10) {
+                    if (abs(dx) > touchSlopPx || abs(dy) > touchSlopPx) {
                         isDragging = true
                         params.x = initialX + dx.toInt()
                         params.y = initialY + dy.toInt()
                         windowManager.updateViewLayout(floatingView, params)
                     }
                 }
+                MotionEvent.ACTION_UP -> {
+                    if (isDragging) {
+                        posPrefs.edit()
+                            .putInt(KEY_POS_X, params.x)
+                            .putInt(KEY_POS_Y, params.y)
+                            .apply()
+                    }
+                }
             }
             true
         }
 
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(locationResult: LocationResult) {
+                for (location in locationResult.locations) {
+                    val lat = location.latitude
+                    val lon = location.longitude
+                    val spdMph = if (location.hasSpeed()) (location.speed * 2.2369363) else 0.0
+                    val hdg = if (location.hasBearing()) location.bearing.toDouble() else 0.0
+                    lastKnownLat = lat
+                    lastKnownLon = lon
+                    lastKnownSpeedMph = spdMph
+                    lastKnownHeading = hdg
+                    val payload = org.json.JSONObject()
+                        .put("type", "gps_update")
+                        .put("lat", lat)
+                        .put("lon", lon)
+                        .put("speed_mph", Math.round(spdMph * 10.0) / 10.0)
+                        .put("heading", Math.round(hdg))
+                        .toString()
+                    synchronized(lock) {
+                        if (socketReady && webSocket != null) {
+                            try {
+                                webSocket?.send(payload)
+                            } catch (e: Exception) {
+                                Log.e(TAG_WS, "Failed to send gps_update", e)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10000)
+                .setMinUpdateDistanceMeters(10f)
+                .build()
+            fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback!!, Looper.getMainLooper())
+            fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                if (loc != null) {
+                    lastKnownLat = loc.latitude
+                    lastKnownLon = loc.longitude
+                }
+            }
+        }
+
         loadWakeWordAsync()
+    }
+
+    /**
+     * Keeps image_5.png 100% untouched on hammerImageView, and extracts ONLY the real
+     * cyan-white lightning forks from image_5.png into a supercharged core + bloom halo
+     * so the artwork's own lightning bolts visibly cascade downward from top to bottom.
+     */
+    private fun buildActualArtworkLightningLayer() {
+        try {
+            hammerImageView?.setImageResource(R.drawable.image_5)
+            hammerImageView?.alpha = 1.0f
+
+            val src = BitmapFactory.decodeResource(resources, R.drawable.image_5) ?: return
+            val w = src.width
+            val h = src.height
+            val pixels = IntArray(w * h)
+            src.getPixels(pixels, 0, w, 0, 0, w, h)
+
+            val corePixels = IntArray(w * h)
+            val haloSeedPixels = IntArray(w * h)
+
+            for (y in 0 until h) {
+                val rowOffset = y * w
+                for (x in 0 until w) {
+                    val idx = rowOffset + x
+                    val c = pixels[idx]
+                    val r = (c shr 16) and 0xFF
+                    val g = (c shr 8) and 0xFF
+                    val b = c and 0xFF
+
+                    val cyanExcess = b - (r * 0.58f).toInt()
+                    val luma = (r * 0.25f + g * 0.40f + b * 0.35f).toInt()
+
+                    // Strictly match only the real cyan-white lightning forks in image_5.png
+                    if (b > 140 && g > 120 && cyanExcess > 42 && luma > 135) {
+                        val alpha = ((luma - 125) * 2.5f).toInt().coerceIn(0, 255)
+                        // Pure white-hot core on the exact bolt filaments
+                        corePixels[idx] = (alpha shl 24) or (255 shl 16) or (255 shl 8) or 255
+                        // Electric cyan-blue halo seed around the forks
+                        haloSeedPixels[idx] = (alpha shl 24) or (110 shl 16) or (230 shl 8) or 255
+                    }
+                }
+            }
+
+            val coreBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            coreBmp.setPixels(corePixels, 0, w, 0, 0, w, h)
+
+            val haloSeedBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            haloSeedBmp.setPixels(haloSeedPixels, 0, w, 0, 0, w, h)
+
+            // Fast downscale-upscale bloom so the real lightning forks expand & glow when struck
+            val smallW = (w / 5).coerceAtLeast(16)
+            val smallH = (h / 5).coerceAtLeast(16)
+            val smallBmp = Bitmap.createScaledBitmap(haloSeedBmp, smallW, smallH, true)
+            val haloBmp = Bitmap.createScaledBitmap(smallBmp, w, h, true)
+
+            val drawable = ActualArtworkBoltDrawable(coreBmp, haloBmp)
+            artworkBoltDrawable = drawable
+            lightningUpperView?.colorFilter = null
+            lightningUpperView?.alpha = 1.0f
+            lightningUpperView?.setImageDrawable(drawable)
+            lightningLowerView?.alpha = 0.0f
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed building artwork lightning layer", e)
+        }
+    }
+
+    private fun fireArtworkLightningCascade(durationMs: Long) {
+        if (destroyed || isStandby) return
+        val drawable = artworkBoltDrawable ?: return
+
+        boltAnimator?.cancel()
+        boltAnimator = ValueAnimator.ofFloat(0.0f, 1.30f).apply {
+            duration = durationMs
+            interpolator = LinearInterpolator()
+            addUpdateListener { anim ->
+                drawable.strikeProgress = anim.animatedValue as Float
+            }
+            start()
+        }
+    }
+
+    private fun applyVisualState() {
+        mainHandler.post {
+            if (destroyed) return@post
+            pulseAnimator?.cancel()
+            pulseAnimator = null
+            ringRotateAnimator?.cancel()
+            ringRotateAnimator = null
+
+            val ring = glowRingView ?: return@post
+
+            when {
+                isStandby -> {
+                    ring.setColorFilter(Color.RED, PorterDuff.Mode.SRC_IN)
+                    hammerImageView?.alpha = 0.70f
+                    boltAnimator?.cancel()
+                    artworkBoltDrawable?.strikeProgress = -1f
+                    pulseAnimator = ObjectAnimator.ofFloat(ring, View.ALPHA, 0.25f, 0.95f).apply {
+                        duration = 1000L
+                        repeatCount = ValueAnimator.INFINITE
+                        repeatMode = ValueAnimator.REVERSE
+                        start()
+                    }
+                }
+                activeSession != 0 -> {
+                    ring.colorFilter = null
+                    hammerImageView?.alpha = 1.0f
+                    pulseAnimator = ObjectAnimator.ofFloat(ring, View.ALPHA, 0.45f, 1.0f).apply {
+                        duration = 550L
+                        repeatCount = ValueAnimator.INFINITE
+                        repeatMode = ValueAnimator.REVERSE
+                        start()
+                    }
+                    ringRotateAnimator = ObjectAnimator.ofFloat(ring, View.ROTATION, ring.rotation, ring.rotation + 360f).apply {
+                        duration = 7000L
+                        interpolator = LinearInterpolator()
+                        repeatCount = ValueAnimator.INFINITE
+                        repeatMode = ValueAnimator.RESTART
+                        start()
+                    }
+                }
+                else -> {
+                    ring.colorFilter = null
+                    hammerImageView?.alpha = 1.0f
+                    pulseAnimator = ObjectAnimator.ofFloat(ring, View.ALPHA, 0.35f, 0.95f).apply {
+                        duration = 1050L
+                        repeatCount = ValueAnimator.INFINITE
+                        repeatMode = ValueAnimator.REVERSE
+                        start()
+                    }
+                    ringRotateAnimator = ObjectAnimator.ofFloat(ring, View.ROTATION, ring.rotation, ring.rotation + 360f).apply {
+                        duration = 16000L
+                        interpolator = LinearInterpolator()
+                        repeatCount = ValueAnimator.INFINITE
+                        repeatMode = ValueAnimator.RESTART
+                        start()
+                    }
+                }
+            }
+        }
     }
 
     private fun toggleStandby() {
         if (isStandby) {
             isStandby = false
             mainHandler.post {
-                glowRingView?.colorFilter = null
-                stopListeningAnimation()
+                applyVisualState()
+                fireArtworkLightningCascade(durationMs = 450L)
                 toast("Microphone Locked. Thor is listening.")
             }
             synchronized(lock) { ensureCapture() }
@@ -268,14 +685,10 @@ class FloatingThorService : Service() {
         } else {
             isStandby = true
             stopStreamingAudio()
-            synchronized(lock) {
-                captureToken.incrementAndGet()
-                preRoll.clear()
-            }
+            stopCaptureAndReleaseMic()
             mainHandler.post {
-                glowRingView?.setColorFilter(Color.RED, PorterDuff.Mode.SRC_IN)
-                startListeningAnimation()
-                toast("Standby Mode: Microphone Free.")
+                applyVisualState()
+                toast("Standby Mode: Microphone Free for Gemini/Other Apps.")
                 refreshNotification()
             }
         }
@@ -283,19 +696,267 @@ class FloatingThorService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            userRequestedStop = true
+            getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
             shutdownService()
             return START_NOT_STICKY
         }
+        userRequestedStop = false
+        getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", false).apply()
+        VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
         return START_STICKY
     }
 
-    @Suppress("DEPRECATION")
+    private fun scheduleKeepAliveIfAllowed() {
+        val stoppedByUser = userRequestedStop ||
+            getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).getBoolean("user_stopped", false)
+        val ranLongEnough = (android.os.SystemClock.elapsedRealtime() - serviceCreatedElapsedMs) > 1500L
+        if (!stoppedByUser && ranLongEnough && android.provider.Settings.canDrawOverlays(this) && hasMicPermission()) {
+            try {
+                val keepIntent = Intent(applicationContext, FloatingThorService::class.java).apply {
+                    action = ACTION_KEEP_ALIVE
+                }
+                val pi = PendingIntent.getForegroundService(
+                    applicationContext,
+                    777,
+                    keepIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                val am = getSystemService(android.app.AlarmManager::class.java)
+                am?.set(
+                    android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    android.os.SystemClock.elapsedRealtime() + 450L,
+                    pi
+                )
+            } catch (_: Exception) {}
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        scheduleKeepAliveIfAllowed()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun cancelOverlayNotificationCompletely() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (_: Exception) {}
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.cancel(NOTIFICATION_ID)
+            nm?.cancelAll()
+        } catch (_: Exception) {}
+    }
+
     private fun shutdownService() {
-        if (destroyed) return
+        userRequestedStop = true
+        isServiceRunning = false
+        if (destroyed) {
+            cancelOverlayNotificationCompletely()
+            return
+        }
+        destroyed = true
         mainHandler.removeCallbacksAndMessages(null)
         stopStreamingAudio()
-        stopForeground(true)
+        mainHandler.removeCallbacksAndMessages(null)
+        cancelOverlayNotificationCompletely()
         stopSelf()
+    }
+
+    private fun resolveContactNameOrNumber(rawAddress: String): String {
+        if (rawAddress.isBlank()) return "Unknown"
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return rawAddress
+        }
+        try {
+            val uri = android.net.Uri.withAppendedPath(android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI, android.net.Uri.encode(rawAddress))
+            contentResolver.query(uri, arrayOf(android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val name = c.getString(0)
+                    if (!name.isNullOrBlank()) return "$name ($rawAddress)"
+                }
+            }
+        } catch (_: Exception) {}
+        return rawAddress
+    }
+
+    private fun normalizeDialableSmsNumber(raw: String): String {
+        val trimmed = raw.trim()
+        val sb = StringBuilder()
+        for (ch in trimmed) {
+            if (ch.isDigit() || (ch == '+' && sb.isEmpty())) sb.append(ch)
+        }
+        return sb.toString()
+    }
+
+    private fun resolvePhoneNumberFromContactName(nameQuery: String): String {
+        val clean = nameQuery.trim()
+        if (clean.isEmpty()) return ""
+        val hasLetters = clean.any { it.isLetter() }
+        if (!hasLetters) {
+            val norm = normalizeDialableSmsNumber(clean)
+            return if (norm.count { it.isDigit() } >= 7) norm else ""
+        }
+        val embedded = Regex("[+0-9][0-9()\\-\\s.]{6,}").find(clean)?.value
+        if (embedded != null) {
+            val normEmb = normalizeDialableSmsNumber(embedded)
+            if (normEmb.count { it.isDigit() } >= 7) return normEmb
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return ""
+        }
+        var bestNumber = ""
+        try {
+            val uri = android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+            val proj = arrayOf(
+                android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER,
+                android.provider.ContactsContract.CommonDataKinds.Phone.TYPE
+            )
+            val sel = "${android.provider.ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?"
+            contentResolver.query(uri, proj, sel, arrayOf("%$clean%"), null)?.use { c ->
+                while (c.moveToNext()) {
+                    val candidate = normalizeDialableSmsNumber(c.getString(0) ?: "")
+                    val pType = c.getInt(1)
+                    if (candidate.count { it.isDigit() } >= 7) {
+                        if (bestNumber.isEmpty() || pType == android.provider.ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE) {
+                            bestNumber = candidate
+                            if (pType == android.provider.ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE) break
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return bestNumber
+    }
+
+    private fun readRecentGoogleMessagesJson(): org.json.JSONArray {
+        val arr = org.json.JSONArray()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+            return arr
+        }
+        try {
+            val uri = android.net.Uri.parse("content://sms")
+            contentResolver.query(uri, arrayOf("address", "body", "date", "type", "read"), null, null, "date DESC LIMIT 10")?.use { c ->
+                val sdf = java.text.SimpleDateFormat("MMM d, h:mm a", java.util.Locale.US)
+                while (c.moveToNext()) {
+                    val addr = c.getString(0) ?: ""
+                    val body = c.getString(1) ?: ""
+                    val dateMs = c.getLong(2)
+                    val msgType = c.getInt(3)
+                    val isRead = c.getInt(4) == 1
+                    val item = org.json.JSONObject()
+                        .put("sender", resolveContactNameOrNumber(addr))
+                        .put("address", addr)
+                        .put("direction", if (msgType == 2) "SENT_BY_BOSS" else "RECEIVED")
+                        .put("unread", !isRead && msgType == 1)
+                        .put("time", sdf.format(java.util.Date(dateMs)))
+                        .put("body", body.take(400))
+                    arr.put(item)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("ThorSMS", "Failed reading SMS inbox: ${e.message}")
+        }
+        return arr
+    }
+
+    private fun sendSmsAckToServer(reqId: String, recipientRaw: String, number: String, ok: Boolean, status: String) {
+        try {
+            val ack = org.json.JSONObject()
+                .put("type", "sms_delivery_ack")
+                .put("req_id", reqId)
+                .put("recipient", recipientRaw)
+                .put("number", number)
+                .put("ok", ok)
+                .put("status", status)
+            webSocket?.send(ack.toString())
+        } catch (_: Exception) {}
+    }
+
+    private fun dispatchGoogleMessageSms(recipientRaw: String, messageBody: String, reqId: String = "latest") {
+        val targetNumber = resolvePhoneNumberFromContactName(recipientRaw)
+        if (targetNumber.count { it.isDigit() } < 7 || messageBody.isBlank()) {
+            Log.w("ThorSMS", "Cannot send SMS: unresolved contact/number for '$recipientRaw'")
+            sendSmsAckToServer(reqId, recipientRaw, targetNumber, false, "contact_not_found")
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
+            try {
+                val smsMgr = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                    getSystemService(android.telephony.SmsManager::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    android.telephony.SmsManager.getDefault()
+                }
+                if (smsMgr != null) {
+                    val ackAction = "com.example.thormobile.SMS_ACK_${System.nanoTime()}"
+                    val ackDone = java.util.concurrent.atomic.AtomicBoolean(false)
+                    val ackReceiver = object : android.content.BroadcastReceiver() {
+                        override fun onReceive(ctx: android.content.Context?, intent: Intent?) {
+                            if (ackDone.compareAndSet(false, true)) {
+                                try { unregisterReceiver(this) } catch (_: Exception) {}
+                                val sentOk = (resultCode == android.app.Activity.RESULT_OK)
+                                val st = if (sentOk) "carrier_radio_sent" else "carrier_radio_error_$resultCode"
+                                Log.i("ThorSMS", "Carrier SMS ACK ($targetNumber): $st")
+                                sendSmsAckToServer(reqId, recipientRaw, targetNumber, sentOk, st)
+                            }
+                        }
+                    }
+                    ContextCompat.registerReceiver(
+                        this,
+                        ackReceiver,
+                        android.content.IntentFilter(ackAction),
+                        ContextCompat.RECEIVER_EXPORTED
+                    )
+                    mainHandler.postDelayed({
+                        if (ackDone.compareAndSet(false, true)) {
+                            try { unregisterReceiver(ackReceiver) } catch (_: Exception) {}
+                        }
+                    }, 15_000L)
+
+                    val piFlags = android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                    val piIntent = Intent(ackAction).setPackage(packageName)
+                    val sentPi = android.app.PendingIntent.getBroadcast(this, (System.nanoTime() and 0x7FFFFFFF).toInt(), piIntent, piFlags)
+                    val parts = smsMgr.divideMessage(messageBody)
+                    if (parts != null && parts.size > 1) {
+                        val sentIntents = java.util.ArrayList<android.app.PendingIntent>(parts.size)
+                        for (idx in 0 until parts.size) {
+                            if (idx == parts.size - 1 && sentPi != null) {
+                                sentIntents.add(sentPi)
+                            } else {
+                                val noopIntent = Intent("com.example.thormobile.SMS_PART_NOOP_$idx").setPackage(packageName)
+                                val noopPi = android.app.PendingIntent.getBroadcast(this, idx + 1000, noopIntent, piFlags)
+                                if (noopPi != null) sentIntents.add(noopPi)
+                            }
+                        }
+                        smsMgr.sendMultipartTextMessage(targetNumber, null, parts, sentIntents, null)
+                    } else {
+                        smsMgr.sendTextMessage(targetNumber, null, messageBody, sentPi, null)
+                    }
+                    Log.i("ThorSMS", "Dispatched background carrier SMS (${parts?.size ?: 1} part(s)) to $targetNumber")
+                    return
+                }
+            } catch (e: Exception) {
+                Log.w("ThorSMS", "Direct SmsManager threw, falling back to composer: ${e.message}")
+            }
+        }
+        try {
+            val smsUri = android.net.Uri.parse("smsto:" + android.net.Uri.encode(targetNumber))
+            val i = Intent(Intent.ACTION_SENDTO, smsUri).apply {
+                putExtra("sms_body", messageBody)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(i)
+            sendSmsAckToServer(reqId, recipientRaw, targetNumber, false, "opened_composer_permission_needed")
+        } catch (e: Exception) {
+            Log.e("ThorSMS", "SMS composer intent failed", e)
+            sendSmsAckToServer(reqId, recipientRaw, targetNumber, false, "sms_failed_${e.javaClass.simpleName}")
+        }
     }
 
     private fun hasMicPermission(): Boolean =
@@ -303,7 +964,12 @@ class FloatingThorService : Service() {
 
     private fun handleOverlayTap() {
         if (activeSession != 0) {
-            stopStreamingAudio()
+            if (playbackBusy || playbackQueue.isNotEmpty() || SystemClock.elapsedRealtime() - lastPlaybackTime < 500L) {
+                flushPlayback()
+                try { webSocket?.send("INTERRUPT") } catch (_: Exception) {}
+            } else {
+                toast("Listening... (Double-tap to hang up)")
+            }
         } else if (hasMicPermission()) {
             startSession(keepPreRoll = false)
         } else {
@@ -313,32 +979,6 @@ class FloatingThorService : Service() {
 
     private fun toast(message: String) {
         mainHandler.post { Toast.makeText(this, message, Toast.LENGTH_SHORT).show() }
-    }
-
-    private fun startListeningAnimation() {
-        mainHandler.post {
-            glowRingView?.let { view ->
-                if (pulseAnimator == null) {
-                    pulseAnimator = ObjectAnimator.ofFloat(view, View.ALPHA, 0.3f, 1.0f).apply {
-                        duration = 1000L
-                        repeatCount = ObjectAnimator.INFINITE
-                        repeatMode = ObjectAnimator.REVERSE
-                    }
-                }
-                if (pulseAnimator?.isStarted != true) {
-                    view.alpha = 0.3f
-                    pulseAnimator?.start()
-                }
-            }
-        }
-    }
-
-    private fun stopListeningAnimation() {
-        mainHandler.post {
-            pulseAnimator?.cancel()
-            pulseAnimator = null
-            glowRingView?.alpha = 0.0f
-        }
     }
 
     private fun loadWakeWordAsync() {
@@ -359,7 +999,9 @@ class FloatingThorService : Service() {
                     mainHandler.post { refreshNotification() }
                 }
             } catch (e: Exception) {
-                toast("Wake word unavailable; tap the icon to talk.")
+                if (hasMicPermission() && !isStandby) {
+                    synchronized(lock) { ensureCapture() }
+                }
             }
         }, "ThorWakeLoad").start()
     }
@@ -371,35 +1013,93 @@ class FloatingThorService : Service() {
             if (captureThread == null) return
             if (!keepPreRoll) preRoll.clear()
             requestMicAudioFocus()
-            enterCommunicationMode()
             startPlayback()
             endingSession = false
             socketReady = false
+                offlineModeActive = false
+                valleyReconnectAttempts = 0
+            turnSpeechDetected = false
+            socketDroppedDuringTurn = false
+            waitingForCloudBurst = false
+            currentTurnPcm.reset()
             val id = sessionSeq.incrementAndGet()
             activeSession = id
             micSettling = true
             mainHandler.postDelayed({ openBridgeSocket(id) }, MIC_SETTLE_DELAY_MS)
         }
-        startListeningAnimation()
-        mainHandler.post { refreshNotification() }
+        applyVisualState()
+        mainHandler.post {
+            fireArtworkLightningCascade(durationMs = 450L)
+            refreshNotification()
+        }
     }
 
-    private fun openBridgeSocket(id: Int) {
+    private fun enterOfflineLocalSession(id: Int) {
         synchronized(lock) {
             if (id != activeSession || destroyed) return
             micSettling = false
+            socketReady = false
+            offlineModeActive = true
+            offlineSpeechDetected = false
+            val now = SystemClock.elapsedRealtime()
+            offlineStartedMs = now
+            offlineLastVoiceMs = now
+            offlineTurnBuffer.reset()
+            preRoll.drain { chunk ->
+                offlineTurnBuffer.write(chunk, 0, chunk.size)
+                val ts = System.currentTimeMillis()
+                outboxExecutor.execute {
+                    try { db.outboxDao().insertAudio(OutboxAudio(timestamp = ts, audioData = chunk)) } catch (_: Exception) {}
+                }
+            }
+        }
+        Log.i(TAG_AUDIO, "Entered Offline Local Brain session (session=$id)")
+        mainHandler.post { toast("Offline Mode: Gemma 4 Local Brain listening...") }
+    }
+
+    private fun openBridgeSocket(id: Int) {
+        if (!networkSentinel.isConnected && valleyReconnectAttempts >= 6) {
+            valleyReconnectAttempts = 0
+            enterOfflineLocalSession(id)
+            return
+        }
+        synchronized(lock) {
+            if (id != activeSession || destroyed) return
+            micSettling = false
+            val targetUrl = BRIDGE_URL
             val request = Request.Builder()
-                .url(BRIDGE_URL)
+                .url(targetUrl)
                 .addHeader("ngrok-skip-browser-warning", "true")
                 .build()
             webSocket = okHttpClient.newWebSocket(request, BridgeListener(id))
         }
     }
 
+    private fun stopCaptureAndReleaseMic() {
+        var threadToJoin: Thread? = null
+        var recordToRelease: AudioRecord? = null
+        synchronized(lock) {
+            captureToken.incrementAndGet()
+            threadToJoin = captureThread
+            captureThread = null
+            recordToRelease = audioRecord
+            audioRecord = null
+            preRoll.clear()
+            currentTurnPcm.reset()
+            turnSpeechDetected = false
+        }
+        try { threadToJoin?.interrupt() } catch (_: Exception) {}
+        releaseCapture(recordToRelease)
+        try { powerGuard.releaseWakeLock() } catch (_: Exception) {}
+    }
+
     private fun stopStreamingAudio() {
         var socketToClose: WebSocket? = null
         synchronized(lock) {
-            if (activeSession == 0) return
+            if (activeSession == 0) {
+                abandonMicAudioFocus()
+                return
+            }
             activeSession = 0
             socketReady = false
             endingSession = false
@@ -407,13 +1107,18 @@ class FloatingThorService : Service() {
             socketToClose = webSocket
             webSocket = null
             preRoll.clear()
+            currentTurnPcm.reset()
+            turnSpeechDetected = false
             detectorResetRequested = true
             stopPlayback()
-            exitCommunicationMode()
+            // Immediately release AudioFocus so YouTube / Music resumes playing automatically!
             abandonMicAudioFocus()
         }
+        if (isStandby) {
+            stopCaptureAndReleaseMic()
+        }
         socketToClose?.close(1000, "Client disconnect")
-        if (!isStandby) stopListeningAnimation()
+        applyVisualState()
         mainHandler.post { refreshNotification() }
     }
 
@@ -449,14 +1154,124 @@ class FloatingThorService : Service() {
                 }
                 preRoll.drain { ws.send(it.toByteString(0, it.size)) }
                 socketReady = true
+                val lat = lastKnownLat
+                val lon = lastKnownLon
+                if (lat != null && lon != null) {
+                    try {
+                        ws.send(
+                                org.json.JSONObject()
+                                    .put("type", "gps_update")
+                                    .put("lat", lat)
+                                    .put("lon", lon)
+                                    .put("speed_mph", Math.round(lastKnownSpeedMph * 10.0) / 10.0)
+                                    .put("heading", Math.round(lastKnownHeading))
+                                    .put("sms_recent", readRecentGoogleMessagesJson())
+                                    .toString()
+                            )
+                    } catch (e: Exception) {
+                        Log.e(TAG_WS, "Failed to send initial gps_update on connect", e)
+                    }
+                }
             }
-            // Trigger flush for any offline audio saved in the Outbox
             flushOutbox()
         }
+
         override fun onMessage(ws: WebSocket, text: String) {
             if (sessionId != activeSession) return
-            if (text == END_SESSION_TEXT) beginEndDrain(sessionId)
+
+            if (text == END_SESSION_TEXT) {
+                beginEndDrain(sessionId)
+                return
+            }
+
+            try {
+                val json = org.json.JSONObject(text)
+                if (json.optString("action") == "request_sms_sync") {
+                        try {
+                            ws.send(org.json.JSONObject().put("type", "sms_sync").put("messages", readRecentGoogleMessagesJson()).toString())
+                        } catch (_: Exception) {}
+                    }
+                    if (json.optString("action") == "upgrade_progress_event") {
+                        VikingPopupOverlayManager.pollNow(this@FloatingThorService, "https://" + "thor-api-443941171993.us-east4.run.app")
+                    }
+                    if (json.optString("action") == "phone_intent") {
+                    val intentType = json.optString("intent_type")
+                    val label = json.optString("label", "Thor")
+                    when (intentType) {
+                            "send_sms" -> {
+                                val recip = json.optString("recipient")
+                                val body = json.optString("message_body")
+                                val reqId = json.optString("req_id", "latest")
+                                dispatchGoogleMessageSms(recip, body, reqId)
+                            }
+                            "timer" -> {
+                            val secs = json.optInt("seconds", 60)
+                            val i = Intent(android.provider.AlarmClock.ACTION_SET_TIMER).apply {
+                                putExtra(android.provider.AlarmClock.EXTRA_LENGTH, secs)
+                                putExtra(android.provider.AlarmClock.EXTRA_MESSAGE, label)
+                                putExtra(android.provider.AlarmClock.EXTRA_SKIP_UI, true)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            try { startActivity(i) } catch (e: Exception) { Log.e("ThorBridge", "Timer intent failed", e) }
+                        }
+                        "alarm" -> {
+                            val hr = json.optInt("hour", 7)
+                            val min = json.optInt("minute", 0)
+                            val i = Intent(android.provider.AlarmClock.ACTION_SET_ALARM).apply {
+                                putExtra(android.provider.AlarmClock.EXTRA_HOUR, hr)
+                                putExtra(android.provider.AlarmClock.EXTRA_MINUTES, min)
+                                putExtra(android.provider.AlarmClock.EXTRA_MESSAGE, label)
+                                putExtra(android.provider.AlarmClock.EXTRA_SKIP_UI, true)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            try { startActivity(i) } catch (e: Exception) { Log.e("ThorBridge", "Alarm intent failed", e) }
+                        }
+                        "dial" -> {
+                            val num = json.optString("phone_number")
+                            if (num.isNotEmpty()) {
+                                val i = Intent(Intent.ACTION_DIAL, android.net.Uri.parse("tel:" + android.net.Uri.encode(num))).apply {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                try { startActivity(i) } catch (e: Exception) { Log.e("ThorBridge", "Dial intent failed", e) }
+                            }
+                        }
+                    }
+                }
+                if (json.optString("action") == "launch_maps") {
+                    val dest = json.optString("destination")
+                    val waypointsRaw = json.optString("waypoints", "").trim()
+                    if (dest.isNotEmpty()) {
+                        val gmmIntentUri = if (waypointsRaw.isNotEmpty()) {
+                            android.net.Uri.parse(
+                                "https://www.google.com/maps/dir/?api=1" +
+                                "&destination=" + android.net.Uri.encode(dest) +
+                                "&waypoints=" + android.net.Uri.encode(waypointsRaw) +
+                                "&travelmode=driving&dir_action=navigate"
+                            )
+                        } else {
+                            android.net.Uri.parse("google.navigation:q=" + android.net.Uri.encode(dest))
+                        }
+
+                        val mapIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, gmmIntentUri)
+                        mapIntent.setPackage("com.google.android.apps.maps")
+                        mapIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+
+                        try {
+                            startActivity(mapIntent)
+                            android.util.Log.i("ThorBridge", "Launching Google Maps to: $dest (waypoints=$waypointsRaw)")
+                        } catch (e: Exception) {
+                            android.util.Log.e("ThorBridge", "Google Maps app not found.", e)
+                            val fallbackUri = android.net.Uri.parse("geo:0,0?q=" + android.net.Uri.encode(dest))
+                            val fallbackIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, fallbackUri)
+                            fallbackIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(fallbackIntent)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+            }
         }
+
         override fun onMessage(ws: WebSocket, bytes: ByteString) {
             if (sessionId != activeSession) return
             if (bytes == FLUSH_MARKER) flushPlayback()
@@ -469,15 +1284,34 @@ class FloatingThorService : Service() {
             if (sessionId == activeSession) stopStreamingAudio()
         }
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-            // Do NOT stop the session. Safely drop the socket and let the Interceptor queue to the Outbox.
-            synchronized(lock) {
-                if (sessionId == activeSession) {
-                    socketReady = false
-                    webSocket = null
-                    mainHandler.post { toast("Connection lost. Routing to offline Outbox.") }
-                }
+                    val wasReady = socketReady
+                    Log.w(TAG_WS, "Hill-Hopper WebSocket dip (wasReady=$wasReady, attempts=$valleyReconnectAttempts): ${t.message}")
+                    if (sessionId == activeSession && !destroyed && !isStandby) {
+                        synchronized(lock) {
+                            socketReady = false
+                            webSocket = null
+                            socketDroppedDuringTurn = true
+                            valleyReconnectAttempts += 1
+                        }
+                        try { ws.cancel() } catch (_: Exception) {}
+
+                        // HILL-HOPPER VALLEY RECOVERY:
+                        // Keep activeSession & microphone capture running into preRoll for up to 12 reconnect attempts (~14 seconds)
+                        // so when Boss crests the next hill, preRoll bursts the entire uninterrupted sentence to thor-api!
+                        if (valleyReconnectAttempts <= 12) {
+                            val retryDelayMs = if (wasReady) 800L else 1100L
+                            mainHandler.postDelayed({
+                                if (sessionId == activeSession && !socketReady && !offlineModeActive && !destroyed && !isStandby) {
+                                    openBridgeSocket(sessionId)
+                                }
+                            }, retryDelayMs)
+                        } else {
+                            // True extended dead zone (>14s with zero tower reach) -> seamlessly hand preRoll to Gemma 4 E2B Local Brain
+                            valleyReconnectAttempts = 0
+                            enterOfflineLocalSession(sessionId)
+                        }
+                    }
             }
-        }
     }
 
     private fun flushOutbox() {
@@ -485,6 +1319,18 @@ class FloatingThorService : Service() {
             try {
                 val pending = db.outboxDao().getPendingAudio()
                 if (pending.isNotEmpty()) {
+                    // STORAGE AUTO-PURGE GUARD: Immediately delete any item older than 24h or beyond the newest 20 items
+                    val cutoffMs = System.currentTimeMillis() - (24L * 3600L * 1000L)
+                    if (pending.size > 20) {
+                        for (oldItem in pending.dropLast(20)) {
+                            try { db.outboxDao().deleteAudio(oldItem) } catch (_: Exception) {}
+                        }
+                    }
+                    for (item in pending) {
+                        if (item.timestamp < cutoffMs) {
+                            try { db.outboxDao().deleteAudio(item) } catch (_: Exception) {}
+                        }
+                    }
                     Log.d(TAG_WS, "Flushing ${pending.size} offline chunks to Thor...")
                     var targetWs: WebSocket? = null
                     synchronized(lock) { targetWs = webSocket }
@@ -507,27 +1353,27 @@ class FloatingThorService : Service() {
     private fun requestMicAudioFocus() {
         if (hasAudioFocus) return
         val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                .setAcceptsDelayedFocusGain(false)
+                .setWillPauseWhenDucked(true)
                 .setOnAudioFocusChangeListener(audioFocusListener, mainHandler)
                 .build()
             audioFocusRequest = request
             audioManager.requestAudioFocus(request)
         } else {
+            @Suppress("DEPRECATION")
             audioManager.requestAudioFocus(
                 audioFocusListener,
-                AudioManager.STREAM_VOICE_CALL,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
             )
         }
-        hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        if (!hasAudioFocus) Log.w(TAG_AUDIO, "Audio focus request not granted (result=$result)")
+        hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
     }
 
     @Suppress("DEPRECATION")
@@ -542,33 +1388,19 @@ class FloatingThorService : Service() {
         hasAudioFocus = false
     }
 
-    @Suppress("DEPRECATION")
-    private fun enterCommunicationMode() {
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = true
-    }
-
-    @Suppress("DEPRECATION")
-    private fun exitCommunicationMode() {
-        audioManager.mode = AudioManager.MODE_NORMAL
-        audioManager.isSpeakerphoneOn = false
-    }
-
     private fun ensureCapture() {
         if (captureThread != null || destroyed || !hasMicPermission() || isStandby) return
         val record = createAudioRecord() ?: return
-        val aec = attachEchoCanceler(record)
-        val ns = attachNoiseSuppressor(record)
+
         audioRecord = record
-        echoCanceler = aec
-        noiseSuppressor = ns
         powerGuard.acquireWakeLock()
         val token = captureToken.incrementAndGet()
-        val thread = Thread({ captureLoop(token, record, aec, ns) }, "ThorCapture")
+        val thread = Thread({ captureLoop(token, record) }, "ThorCapture")
         captureThread = thread
         thread.start()
     }
 
+    @Suppress("MissingPermission")
     private fun createAudioRecord(): AudioRecord? {
         val minBuffer = AudioRecord.getMinBufferSize(
             CAPTURE_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
@@ -576,7 +1408,7 @@ class FloatingThorService : Service() {
         val bufferSize = if (minBuffer > 0) maxOf(minBuffer, CAPTURE_RING_BYTES) else CAPTURE_RING_BYTES
         val record = try {
             AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 CAPTURE_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize
             )
         } catch (e: Exception) { return null }
@@ -584,27 +1416,27 @@ class FloatingThorService : Service() {
             record.release()
             return null
         }
+
+        sharedAudioSessionId = record.audioSessionId
+        if (AcousticEchoCanceler.isAvailable()) {
+            aec = AcousticEchoCanceler.create(record.audioSessionId)
+            aec?.enabled = true
+            Log.i(TAG_AUDIO, "Acoustic Echo Canceler natively bound to session ${record.audioSessionId}")
+        } else {
+            Log.w(TAG_AUDIO, "Acoustic Echo Canceler not available on this device.")
+        }
+        if (NoiseSuppressor.isAvailable()) {
+            noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)
+            noiseSuppressor?.enabled = true
+            Log.i(TAG_AUDIO, "Hardware NoiseSuppressor natively bound to session ${record.audioSessionId}")
+        } else {
+            Log.w(TAG_AUDIO, "Hardware NoiseSuppressor not available on this device.")
+        }
+
         return record
     }
 
-    private fun attachEchoCanceler(record: AudioRecord): AcousticEchoCanceler? {
-        if (!AcousticEchoCanceler.isAvailable()) return null
-        val aec = AcousticEchoCanceler.create(record.audioSessionId)
-        if (aec != null) aec.enabled = true
-        return aec
-    }
-
-    private fun attachNoiseSuppressor(record: AudioRecord): NoiseSuppressor? {
-        if (!NoiseSuppressor.isAvailable()) return null
-        val ns = NoiseSuppressor.create(record.audioSessionId)
-        if (ns != null) {
-            ns.enabled = true
-            Log.d(TAG_AUDIO, "Hardware Noise Suppressor engaged.")
-        }
-        return ns
-    }
-
-    private fun captureLoop(token: Int, record: AudioRecord, aec: AcousticEchoCanceler?, ns: NoiseSuppressor?) {
+    private fun captureLoop(token: Int, record: AudioRecord) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         var failed = false
         try {
@@ -625,6 +1457,31 @@ class FloatingThorService : Service() {
                 }
                 if (read == 0) continue
 
+                // V26 FULL-DUPLEX HARDWARE AEC +VOCAL-BAND FILTER + SUB-25MS LOCAL BARGE-IN
+                var vocalSumSq = 0.0
+                val scCount = read / 2
+                var prevSample = 0.0
+                for (i in 0 until scCount) {
+                    val curSample = ((frame[2 * i + 1].toInt() shl 8) or (frame[2 * i].toInt() and 0xFF)).toShort().toDouble()
+                    // First-order 300Hz+ vocal high-pass difference filter strips sub-250Hz road/heater hum
+                    val hpDiff = curSample - (0.86 * prevSample)
+                    prevSample = curSample
+                    vocalSumSq += hpDiff * hpDiff
+                }
+                val vocalRms = if (scCount > 0) kotlin.math.sqrt(vocalSumSq / scCount) else 0.0
+                val inPlaybackWindow = playbackBusy || playbackQueue.isNotEmpty() || (SystemClock.elapsedRealtime() - lastPlaybackTime < 680L)
+
+                if (inPlaybackWindow) {
+                    // Speaker is actively playing or draining hardware buffer: clear preRoll/turn buffers and do not send echo to server
+                    localBargeInStreak = 0
+                    synchronized(lock) {
+                        preRoll.clear()
+                        currentTurnPcm.reset()
+                        turnSpeechDetected = false
+                    }
+                    continue
+                }
+
                 var target: WebSocket? = null
                 var listening = false
                 var shouldSaveToOutbox = false
@@ -639,9 +1496,64 @@ class FloatingThorService : Service() {
                         endingSession -> Unit
                         micSettling -> Unit
                         socketReady && networkSentinel.isConnected -> target = webSocket
+                        !socketReady && networkSentinel.isConnected -> {
+                            preRoll.add(frame.copyOf(read))
+                            preRoll.trimTo(PRE_ROLL_CONNECT_MAX_BYTES)
+                        }
                         else -> {
-                            // ACTIVE SESSION INTERCEPTOR: No Socket or No Internet
                             shouldSaveToOutbox = true
+                        }
+                    }
+                }
+
+                if (activeSession != 0 && !offlineModeActive && !endingSession) {
+                    val pcmCopy = frame.copyOf(read)
+                    val nowMs = SystemClock.elapsedRealtime()
+                    val dynSpeechThresh = kotlin.math.max(220.0, kotlin.math.min(440.0, localNoiseFloorRms + 135.0))
+                    if (!inPlaybackWindow && vocalRms >= dynSpeechThresh) {
+                        if (!turnSpeechDetected) {
+                            turnSpeechDetected = true
+                            currentTurnPcm.reset()
+                        }
+                        turnLastVoiceMs = nowMs
+                    } else if (!turnSpeechDetected && !inPlaybackWindow) {
+                        localNoiseFloorRms = (0.92 * localNoiseFloorRms) + (0.08 * kotlin.math.min(vocalRms, 320.0))
+                    }
+                    // Hard 480KB (15s) cap on currentTurnPcm in RAM; auto-wiped the moment turn finishes
+                    if (turnSpeechDetected && currentTurnPcm.size() < 480000) {
+                        currentTurnPcm.write(pcmCopy, 0, pcmCopy.size)
+                    }
+                    if (turnSpeechDetected && (nowMs - turnLastVoiceMs) >= 720L && currentTurnPcm.size() >= 9600) {
+                        if (target != null && !socketDroppedDuringTurn) {
+                            try { target!!.send("END_OF_TURN") } catch (_: Exception) {}
+                            turnSpeechDetected = false
+                            currentTurnPcm.reset()
+                        } else if (!waitingForCloudBurst) {
+                            waitingForCloudBurst = true
+                            val turnSnapshot = currentTurnPcm.toByteArray()
+                            val snapSession = activeSession
+                            mainHandler.postDelayed({
+                                if (waitingForCloudBurst && snapSession == activeSession && !socketReady && !offlineModeActive) {
+                                    waitingForCloudBurst = false
+                                    turnSpeechDetected = false
+                                    currentTurnPcm.reset()
+                                    val ts = System.currentTimeMillis()
+                                    outboxExecutor.execute {
+                                        try { db.outboxDao().insertAudio(OutboxAudio(timestamp = ts, audioData = turnSnapshot)) } catch (_: Exception) {}
+                                    }
+                                    offlineModeActive = true
+                                    localBrain.processOfflineVoiceTurn(
+                                        pcm16kMono = turnSnapshot,
+                                        onStartSpeaking = { playbackBusy = true },
+                                        onFinishedSpeaking = {
+                                            playbackBusy = false
+                                            offlineModeActive = false
+                                            lastPlaybackTime = SystemClock.elapsedRealtime()
+                                            mainHandler.post { stopStreamingAudio() }
+                                        }
+                                    )
+                                }
+                            }, 3800L)
                         }
                     }
                 }
@@ -650,22 +1562,57 @@ class FloatingThorService : Service() {
                     if (target!!.queueSize() <= MAX_SEND_QUEUE_BYTES) {
                         target!!.send(frame.toByteString(0, read))
                     } else {
+                        socketDroppedDuringTurn = true
                         droppedFrames++
                         if (droppedFrames % 100 == 1) {
-                            Log.w(TAG_AUDIO, "Uplink stalled: send queue over cap, dropped $droppedFrames frame(s).")
+                            Log.w(TAG_AUDIO, "Uplink stalled: send queue over cap, marked turn for burst recovery.")
                         }
                     }
                 } else if (shouldSaveToOutbox) {
-                    // STORE-AND-FORWARD: Write raw PCM to the local Android SQLite Database
                     val chunk = frame.copyOf(read)
                     val ts = System.currentTimeMillis()
-                    outboxExecutor.execute {
-                        try {
-                            db.outboxDao().insertAudio(OutboxAudio(timestamp = ts, audioData = chunk))
-                        } catch (e: Exception) {
-                            Log.e(TAG_AUDIO, "Failed to write to offline Outbox", e)
+                    // Per-20ms frame DB spam disabled; complete turn is saved once when utterance completes
+                        if (offlineModeActive) {
+                            offlineTurnBuffer.write(chunk, 0, chunk.size)
+                            var sumSq = 0.0
+                            val sampleCount = read / 2
+                            for (i in 0 until sampleCount) {
+                                val s = ((chunk[2 * i + 1].toInt() shl 8) or (chunk[2 * i].toInt() and 0xFF)).toShort().toDouble()
+                                sumSq += s * s
+                            }
+                            val rms = if (sampleCount > 0) kotlin.math.sqrt(sumSq / sampleCount) else 0.0
+                            val now = SystemClock.elapsedRealtime()
+                            if (rms > 320.0) {
+                                offlineSpeechDetected = true
+                                offlineLastVoiceMs = now
+                            }
+                            val silenceMs = now - offlineLastVoiceMs
+                            val totalMs = now - offlineStartedMs
+                            if ((offlineSpeechDetected && offlineTurnBuffer.size() >= 16000 && silenceMs >= 1300L) || offlineTurnBuffer.size() >= 384000) {
+                                offlineModeActive = false
+                                val recordedPcm = offlineTurnBuffer.toByteArray()
+                                offlineTurnBuffer.reset()
+                                Log.i(TAG_AUDIO, "Dispatching ${recordedPcm.size} PCM bytes to Gemma 4 Local Brain.")
+                                    outboxExecutor.execute {
+                                        try { db.outboxDao().insertAudio(OutboxAudio(timestamp = System.currentTimeMillis(), audioData = recordedPcm)) } catch (_: Exception) {}
+                                    }
+                                localBrain.processOfflineVoiceTurn(
+                                    pcm16kMono = recordedPcm,
+                                    onStartSpeaking = {
+                                        playbackBusy = true
+                                    },
+                                    onFinishedSpeaking = {
+                                        playbackBusy = false
+                                        lastPlaybackTime = SystemClock.elapsedRealtime()
+                                        mainHandler.post { stopStreamingAudio() }
+                                    }
+                                )
+                            } else if (!offlineSpeechDetected && totalMs >= 6500L) {
+                                offlineModeActive = false
+                                offlineTurnBuffer.reset()
+                                mainHandler.post { stopStreamingAudio() }
+                            }
                         }
-                    }
                 } else if (listening) {
                     runWakeWord(shorts, frame, read)
                 }
@@ -679,12 +1626,10 @@ class FloatingThorService : Service() {
                     current = true
                     captureThread = null
                     audioRecord = null
-                    echoCanceler = null
-                    noiseSuppressor = null
                     powerGuard.releaseWakeLock()
                 }
             }
-            releaseCapture(record, aec, ns)
+            releaseCapture(record)
 
             if (current && failed && !destroyed && !isStandby) {
                 Log.w(TAG_AUDIO, "Microphone preempted. Entering Auto-Standby.")
@@ -716,9 +1661,10 @@ class FloatingThorService : Service() {
         if (triggered) startSession(keepPreRoll = true)
     }
 
-    private fun releaseCapture(record: AudioRecord?, aec: AcousticEchoCanceler?, ns: NoiseSuppressor?) {
-        try { ns?.release() } catch (e: Exception) {}
-        try { aec?.release() } catch (e: Exception) {}
+    private fun releaseCapture(record: AudioRecord?) {
+        try { aec?.release()
+        try { noiseSuppressor?.release() } catch (_: Exception) {}
+        noiseSuppressor = null; aec = null } catch (e: Exception) {}
         try { if (record?.recordingState == AudioRecord.RECORDSTATE_RECORDING) record.stop() } catch (e: Exception) {}
         try { record?.release() } catch (e: Exception) {}
     }
@@ -728,12 +1674,12 @@ class FloatingThorService : Service() {
         val minBuffer = AudioTrack.getMinBufferSize(
             PLAYBACK_SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = if (minBuffer > 0) minBuffer * 2 else PLAYBACK_SLICE_BYTES * 8
+        val bufferSize = if (minBuffer > 0) maxOf(minBuffer * 2, PLAYBACK_SLICE_BYTES * 4) else PLAYBACK_SLICE_BYTES * 8
 
-        val track = AudioTrack.Builder()
+        val trackBuilder = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -746,27 +1692,50 @@ class FloatingThorService : Service() {
             )
             .setBufferSizeInBytes(bufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
+        val track = trackBuilder.build()
         track.play()
         audioTrack = track
 
         isPlayingAudio = true
+        val silenceKeepAlive = ByteArray(960) // 20ms of 24kHz PCM16 silence flushes ring buffer & prevents AudioTrack underrun
         val thread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             try {
                 while (isPlayingAudio) {
-                    val chunk = playbackQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    val chunk = playbackQueue.poll(20, TimeUnit.MILLISECONDS)
+                    if (chunk == null) {
+                        if (playbackQueue.isEmpty()) {
+                            playbackBusy = false
+                            currentPlaybackRms = 0.0
+                        }
+                        try { track.write(silenceKeepAlive, 0, silenceKeepAlive.size) } catch (_: Exception) {}
+                        continue
+                    }
+                    if (chunk.generation != flushGeneration.get()) continue
+
                     playbackBusy = true
                     try {
+                        var sq = 0.0
+                        val nSamp = chunk.data.size / 2
+                        for (i in 0 until nSamp step 4) {
+                            val s = ((chunk.data[2 * i + 1].toInt() shl 8) or (chunk.data[2 * i].toInt() and 0xFF)).toShort().toDouble()
+                            sq += s * s
+                        }
+                        currentPlaybackRms = if (nSamp > 0) kotlin.math.sqrt(sq / ((nSamp + 3) / 4)) else 0.0
                         var offset = 0
                         while (offset < chunk.data.size && chunk.generation == flushGeneration.get()) {
                             val length = min(PLAYBACK_SLICE_BYTES, chunk.data.size - offset)
                             val written = track.write(chunk.data, offset, length)
                             if (written < 0) break
                             offset += written
+                            lastPlaybackTime = SystemClock.elapsedRealtime()
                         }
                     } finally {
-                        playbackBusy = false
+                        lastPlaybackTime = SystemClock.elapsedRealtime()
+                        if (playbackQueue.isEmpty()) {
+                            playbackBusy = false
+                            currentPlaybackRms = 0.0
+                        }
                     }
                 }
             } catch (e: InterruptedException) {
@@ -803,17 +1772,21 @@ class FloatingThorService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "Thor Service Channel", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            val nm = getSystemService(NotificationManager::class.java)
+            try { nm?.deleteNotificationChannel("ThorChannelId") } catch (_: Exception) {}
+            val channel = NotificationChannel(CHANNEL_ID, "Thor Service Channel", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+            }
+            nm?.createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification(sessionActive: Boolean, wakeReady: Boolean): Notification {
         val text = when {
-            sessionActive -> "In conversation. Tap to hang up."
-            isStandby -> "Standby Mode. Double-tap to wake."
-            wakeReady -> "Listening for 'Thor'."
-            else -> "Tap the icon to talk."
+            sessionActive -> "In conversation. Double-tap icon or pause 8s to hang up."
+            isStandby -> "Standby Mode (Mic Free). Double-tap icon to wake."
+            wakeReady -> "Listening for 'Thor' (or Single-Tap icon to talk)."
+            else -> "Single-Tap icon to talk, Double-Tap to free mic."
         }
         val stopIntent = PendingIntent.getService(
             this, 0,
@@ -821,16 +1794,18 @@ class FloatingThorService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Vanguard Online")
+            .setContentTitle("Thor Voice Overlay")
             .setContentText(text)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
+            .setNumber(0)
+            .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
             .addAction(0, "Stop Thor", stopIntent)
             .build()
     }
 
     private fun refreshNotification() {
-        if (destroyed) return
+        if (destroyed || !isServiceRunning || userRequestedStop) return
         val wakeReady = detector != null && captureThread != null
         val notification = buildNotification(sessionActive = activeSession != 0, wakeReady = wakeReady)
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
@@ -839,15 +1814,26 @@ class FloatingThorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        val shouldReviveAfterTaskSwipe = !userRequestedStop &&
+            !getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).getBoolean("user_stopped", false)
+        if (shouldReviveAfterTaskSwipe) {
+            scheduleKeepAliveIfAllowed()
+        }
         destroyed = true
+        isServiceRunning = false
+        cancelOverlayNotificationCompletely()
         mainHandler.removeCallbacksAndMessages(null)
         stopStreamingAudio()
+        mainHandler.removeCallbacksAndMessages(null)
+        cancelOverlayNotificationCompletely()
         if (::audioManager.isInitialized) abandonMicAudioFocus()
-        stopListeningAnimation()
+        boltAnimator?.cancel()
+        pulseAnimator?.cancel()
+        ringRotateAnimator?.cancel()
 
-        // Shut down Micro-Agent components
         networkSentinel.stopMonitoring()
         outboxExecutor.shutdown()
+        if (::localBrain.isInitialized) localBrain.shutdown()
 
         synchronized(lock) {
             captureToken.incrementAndGet()
@@ -862,6 +1848,9 @@ class FloatingThorService : Service() {
         detectorModels = null
         if (::floatingView.isInitialized) {
             try { windowManager.removeView(floatingView) } catch (e: Exception) {}
+        }
+        locationCallback?.let {
+            fusedLocationClient.removeLocationUpdates(it)
         }
         super.onDestroy()
     }
