@@ -301,6 +301,7 @@ class FloatingThorService : Service() {
     @Volatile private var bargeStartedMs: Long = 0L
     @Volatile private var bargeLastVoiceMs: Long = 0L
     @Volatile private var lastBargeCheckSentMs: Long = 0L
+    @Volatile private var ambientCabinNoiseRms: Double = 95.0
     private val bargePcmBuffer = java.io.ByteArrayOutputStream()
 
     @Volatile private var endingSession = false
@@ -1618,14 +1619,27 @@ class FloatingThorService : Service() {
                         turnLastVoiceMs = nowMs
                     } else if (!turnSpeechDetected && !inPlaybackWindow) {
                         localNoiseFloorRms = (0.92 * localNoiseFloorRms) + (0.08 * kotlin.math.min(vocalRms, 320.0))
+                        ambientCabinNoiseRms = (0.90 * ambientCabinNoiseRms) + (0.10 * kotlin.math.min(vocalRms, 1200.0))
                     }
                     // Hard 480KB (15s) cap on currentTurnPcm in RAM; auto-wiped the moment turn finishes
                     if (turnSpeechDetected && currentTurnPcm.size() < 480000) {
                         currentTurnPcm.write(pcmCopy, 0, pcmCopy.size)
                     }
-                    val requiredSilenceMs = if (currentTurnPcm.size() < 32000) 960L else 820L
-                    if (turnSpeechDetected && (nowMs - turnLastVoiceMs) >= requiredSilenceMs && currentTurnPcm.size() >= 9600) {
+                    val turnBytes = currentTurnPcm.size()
+                    val requiredSilenceMs = when {
+                        turnBytes < 28800 -> 920L
+                        turnBytes <= 76800 -> 1220L
+                        else -> 860L
+                    }
+                    if (turnSpeechDetected && (nowMs - turnLastVoiceMs) >= requiredSilenceMs && turnBytes >= 9600) {
                         if (target != null && !socketDroppedDuringTurn) {
+                            try {
+                                val noiseMsg = org.json.JSONObject()
+                                    .put("type", "ambient_noise")
+                                    .put("noise_rms", Math.round(ambientCabinNoiseRms * 10.0) / 10.0)
+                                    .toString()
+                                target!!.send(noiseMsg)
+                            } catch (_: Exception) {}
                             try { target!!.send("END_OF_TURN") } catch (_: Exception) {}
                             turnSpeechDetected = false
                             currentTurnPcm.reset()
