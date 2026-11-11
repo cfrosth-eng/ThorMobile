@@ -289,6 +289,19 @@ class FloatingThorService : Service() {
     @Volatile private var playbackBusy = false
     @Volatile private var currentPlaybackRms: Double = 0.0
     @Volatile private var lastPlaybackTime = 0L
+    @Volatile private var totalFramesWritten: Long = 0L
+    @Volatile private var speechEndFrame: Long = 0L
+    @Volatile private var playbackStartedAtMs: Long = 0L
+    @Volatile private var echoBaselineRms: Double = 260.0
+    @Volatile private var lastKnownMusicVol: Int = -1
+    @Volatile private var volChangedCooldownUntilMs: Long = 0L
+    @Volatile private var lastOutputDevCheckMs: Long = 0L
+    @Volatile private var cachedExternalAudioOut: Boolean = false
+    @Volatile private var bargeRecordingActive: Boolean = false
+    @Volatile private var bargeStartedMs: Long = 0L
+    @Volatile private var bargeLastVoiceMs: Long = 0L
+    @Volatile private var lastBargeCheckSentMs: Long = 0L
+    private val bargePcmBuffer = java.io.ByteArrayOutputStream()
 
     @Volatile private var endingSession = false
     @Volatile private var micSettling = false
@@ -1132,7 +1145,7 @@ class FloatingThorService : Service() {
         mainHandler.post(object : Runnable {
             override fun run() {
                 if (sessionId != activeSession) return
-                val quiet = playbackQueue.isEmpty() && !playbackBusy
+                val quiet = playbackQueue.isEmpty() && !playbackBusy && remainingHardwareSpeechMs() <= 0L
                 quietChecks = if (quiet) quietChecks + 1 else 0
                 when {
                     quietChecks >= 3 -> mainHandler.postDelayed({
@@ -1469,17 +1482,102 @@ class FloatingThorService : Service() {
                     vocalSumSq += hpDiff * hpDiff
                 }
                 val vocalRms = if (scCount > 0) kotlin.math.sqrt(vocalSumSq / scCount) else 0.0
-                val inPlaybackWindow = playbackBusy || playbackQueue.isNotEmpty() || (SystemClock.elapsedRealtime() - lastPlaybackTime < 680L)
+                val nowPlaybackMs = SystemClock.elapsedRealtime()
+                val curVol = try { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) } catch (_: Exception) { 8 }
+                val maxVol = try { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1) } catch (_: Exception) { 15 }
+                val volRatio = curVol.toDouble() / maxVol.toDouble()
+                if (lastKnownMusicVol != -1 && curVol != lastKnownMusicVol) {
+                    volChangedCooldownUntilMs = nowPlaybackMs + 1000L
+                    bargeRecordingActive = false
+                    bargePcmBuffer.reset()
+                    localBargeInStreak = 0
+                }
+                lastKnownMusicVol = curVol
+
+                if (nowPlaybackMs - lastOutputDevCheckMs >= 2000L) {
+                    lastOutputDevCheckMs = nowPlaybackMs
+                    cachedExternalAudioOut = try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                                    it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                                    it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                                    it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                                    it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                                    it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                            }
+                        } else false
+                    } catch (_: Exception) { false }
+                }
+
+                val remHwMs = remainingHardwareSpeechMs()
+                val inPlaybackWindow = playbackBusy || playbackQueue.isNotEmpty() || remHwMs > 0L || (nowPlaybackMs - lastPlaybackTime < 160L)
 
                 if (inPlaybackWindow) {
-                    // Speaker is actively playing or draining hardware buffer: clear preRoll/turn buffers and do not send echo to server
-                    localBargeInStreak = 0
+                    // Calibrate live speaker echo on first 350ms & volume-key presses; never blindly flush AudioTrack on speaker bleed!
+                    val inCalibOrVolGrace = (nowPlaybackMs < volChangedCooldownUntilMs) || (nowPlaybackMs - playbackStartedAtMs < 350L)
+                    val bargeTrig = if (cachedExternalAudioOut) {
+                        kotlin.math.max(420.0, echoBaselineRms * 1.65 + 220.0)
+                    } else {
+                        kotlin.math.max(760.0 + volRatio * 520.0, echoBaselineRms * 1.75 + 340.0)
+                    }
+
+                    if (inCalibOrVolGrace) {
+                        echoBaselineRms = 0.80 * echoBaselineRms + 0.20 * kotlin.math.min(vocalRms, 2600.0)
+                        localBargeInStreak = 0
+                    } else if (vocalRms >= bargeTrig) {
+                        localBargeInStreak += 1
+                        if (localBargeInStreak >= 4 && !bargeRecordingActive && (nowPlaybackMs - lastBargeCheckSentMs) >= 1800L) {
+                            bargeRecordingActive = true
+                            bargeStartedMs = nowPlaybackMs
+                            bargeLastVoiceMs = nowPlaybackMs
+                            bargePcmBuffer.reset()
+                        }
+                        if (bargeRecordingActive) {
+                            bargeLastVoiceMs = nowPlaybackMs
+                        }
+                    } else {
+                        localBargeInStreak = 0
+                        if (!bargeRecordingActive) {
+                            echoBaselineRms = 0.92 * echoBaselineRms + 0.08 * kotlin.math.min(vocalRms, 2400.0)
+                        }
+                    }
+
+                    if (bargeRecordingActive) {
+                        if (bargePcmBuffer.size() < 48000) {
+                            bargePcmBuffer.write(frame, 0, read)
+                        }
+                        val quietSinceBargeVoice = nowPlaybackMs - bargeLastVoiceMs
+                        val totalBargeMs = nowPlaybackMs - bargeStartedMs
+                        if ((bargePcmBuffer.size() >= 12800 && quietSinceBargeVoice >= 420L) || totalBargeMs >= 1350L) {
+                            val clipBytes = bargePcmBuffer.toByteArray()
+                            bargeRecordingActive = false
+                            bargePcmBuffer.reset()
+                            lastBargeCheckSentMs = nowPlaybackMs
+                            val wsNow = webSocket
+                            if (wsNow != null && socketReady && clipBytes.size >= 12800) {
+                                try {
+                                    val b64 = android.util.Base64.encodeToString(clipBytes, android.util.Base64.NO_WRAP)
+                                    val msgJson = org.json.JSONObject()
+                                        .put("type", "barge_in_check")
+                                        .put("pcm_b64", b64)
+                                        .toString()
+                                    wsNow.send(msgJson)
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }
+
                     synchronized(lock) {
                         preRoll.clear()
                         currentTurnPcm.reset()
                         turnSpeechDetected = false
                     }
                     continue
+                } else if (bargeRecordingActive) {
+                    bargeRecordingActive = false
+                    bargePcmBuffer.reset()
                 }
 
                 var target: WebSocket? = null
@@ -1509,7 +1607,9 @@ class FloatingThorService : Service() {
                 if (activeSession != 0 && !offlineModeActive && !endingSession) {
                     val pcmCopy = frame.copyOf(read)
                     val nowMs = SystemClock.elapsedRealtime()
-                    val dynSpeechThresh = kotlin.math.max(220.0, kotlin.math.min(440.0, localNoiseFloorRms + 135.0))
+                    val dynOnsetThresh = kotlin.math.max(210.0, kotlin.math.min(430.0, localNoiseFloorRms + 130.0))
+                    val dynSustainThresh = kotlin.math.max(135.0, kotlin.math.min(290.0, localNoiseFloorRms + 65.0))
+                    val dynSpeechThresh = if (turnSpeechDetected) dynSustainThresh else dynOnsetThresh
                     if (!inPlaybackWindow && vocalRms >= dynSpeechThresh) {
                         if (!turnSpeechDetected) {
                             turnSpeechDetected = true
@@ -1523,7 +1623,8 @@ class FloatingThorService : Service() {
                     if (turnSpeechDetected && currentTurnPcm.size() < 480000) {
                         currentTurnPcm.write(pcmCopy, 0, pcmCopy.size)
                     }
-                    if (turnSpeechDetected && (nowMs - turnLastVoiceMs) >= 720L && currentTurnPcm.size() >= 9600) {
+                    val requiredSilenceMs = if (currentTurnPcm.size() < 32000) 960L else 820L
+                    if (turnSpeechDetected && (nowMs - turnLastVoiceMs) >= requiredSilenceMs && currentTurnPcm.size() >= 9600) {
                         if (target != null && !socketDroppedDuringTurn) {
                             try { target!!.send("END_OF_TURN") } catch (_: Exception) {}
                             turnSpeechDetected = false
@@ -1692,10 +1793,17 @@ class FloatingThorService : Service() {
             )
             .setBufferSizeInBytes(bufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
+        try {
+            if (sharedAudioSessionId > 0) {
+                trackBuilder.setSessionId(sharedAudioSessionId)
+            }
+        } catch (_: Exception) {}
         val track = trackBuilder.build()
         track.play()
         audioTrack = track
 
+        totalFramesWritten = 0L
+        speechEndFrame = 0L
         isPlayingAudio = true
         val silenceKeepAlive = ByteArray(960) // 20ms of 24kHz PCM16 silence flushes ring buffer & prevents AudioTrack underrun
         val thread = Thread({
@@ -1708,11 +1816,15 @@ class FloatingThorService : Service() {
                             playbackBusy = false
                             currentPlaybackRms = 0.0
                         }
-                        try { track.write(silenceKeepAlive, 0, silenceKeepAlive.size) } catch (_: Exception) {}
+                        val sw = try { track.write(silenceKeepAlive, 0, silenceKeepAlive.size) } catch (_: Exception) { 0 }
+                        if (sw > 0) totalFramesWritten += (sw / 2).toLong()
                         continue
                     }
                     if (chunk.generation != flushGeneration.get()) continue
 
+                    if (!playbackBusy && remainingHardwareSpeechMs() <= 0L) {
+                        playbackStartedAtMs = SystemClock.elapsedRealtime()
+                    }
                     playbackBusy = true
                     try {
                         var sq = 0.0
@@ -1728,6 +1840,8 @@ class FloatingThorService : Service() {
                             val written = track.write(chunk.data, offset, length)
                             if (written < 0) break
                             offset += written
+                            totalFramesWritten += (written / 2).toLong()
+                            speechEndFrame = totalFramesWritten
                             lastPlaybackTime = SystemClock.elapsedRealtime()
                         }
                     } finally {
@@ -1745,19 +1859,44 @@ class FloatingThorService : Service() {
         thread.start()
     }
 
+    private fun remainingHardwareSpeechMs(): Long {
+        val track = audioTrack ?: return 0L
+        val endF = speechEndFrame
+        if (endF <= 0L) return 0L
+        return try {
+            val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            if (endF > head) ((endF - head) * 1000L) / PLAYBACK_SAMPLE_RATE else 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
     private fun flushPlayback() {
         flushGeneration.incrementAndGet()
         playbackQueue.clear()
+        playbackBusy = false
+        currentPlaybackRms = 0.0
+        bargeRecordingActive = false
+        bargePcmBuffer.reset()
         val track = audioTrack ?: return
         try {
             track.pause()
             track.flush()
+            val headNow = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            totalFramesWritten = headNow
+            speechEndFrame = headNow
             track.play()
         } catch (e: Exception) {}
     }
 
     private fun stopPlayback() {
         isPlayingAudio = false
+        playbackBusy = false
+        currentPlaybackRms = 0.0
+        totalFramesWritten = 0L
+        speechEndFrame = 0L
+        bargeRecordingActive = false
+        bargePcmBuffer.reset()
         playbackThread?.interrupt()
         playbackThread = null
         flushGeneration.incrementAndGet()
