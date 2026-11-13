@@ -12,6 +12,9 @@ import android.graphics.LinearGradient
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.os.SystemClock
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
@@ -65,16 +68,17 @@ object VikingPopupOverlayManager {
     private var recallBadgeView: TextView? = null
     private var recallBadgeParams: WindowManager.LayoutParams? = null
 
-    // Stage-1 Living Raven Herald Window (739x921 HD Raven + Pulsating Gold Ring + Electric White-Blue Sky Bolts)
+    // Stage-1 Living Raven V3 Herald Window (WO-145: 1280x1595 Ultra-HD, Clockwise Floating-Icon Gold Ring, 4 Random Sky Bolts & Shimmering Gold Pedestal Runes)
     private var livingRavenView: LivingRavenCrestContainer? = null
     private var livingRavenParams: WindowManager.LayoutParams? = null
-    private var ravenBoltDrawable: ActualRavenBoltDrawable? = null
-    private var ravenPulseAnimator: ValueAnimator? = null
-    private var ravenBoltAnimator: ValueAnimator? = null
+    private var ravenBoltDrawable: IndependentRavenBoltFieldDrawable? = null
+    private var ravenRunesShimmerDrawable: ShimmeringPedestalRunesDrawable? = null
+    private var ravenLoopAnimator: ValueAnimator? = null
     private var ravenBaseBmp: Bitmap? = null
-    private var ravenCoreBmp: Bitmap? = null
-    private var ravenHaloBmp: Bitmap? = null
+    private var ravenRingStripBmp: Bitmap? = null
     private var ravenRunesBmp: Bitmap? = null
+    private var ravenBoltCores: Array<Bitmap?> = arrayOfNulls(4)
+    private var ravenBoltHalos: Array<Bitmap?> = arrayOfNulls(4)
 
     private var runeHeaderView: TextView? = null
     private var titleView: TextView? = null
@@ -100,97 +104,161 @@ object VikingPopupOverlayManager {
     @Volatile private var lastRavenMessage: String = ""
     @Volatile private var lastRavenLinks: JSONArray? = null
 
-    private val ravenStrikeLoopRunnable = object : Runnable {
-        override fun run() {
-            val rv = livingRavenView
-            if (rv != null && rv.parent != null) {
-                val dur = Random.nextLong(720L, 920L)
-                fireRavenLightningCascade(dur)
-                val nextDelay = Random.nextLong(2300L, 4400L)
-                mainHandler.postDelayed(this, nextDelay)
-            }
-        }
-    }
-
     private val http = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(12, TimeUnit.SECONDS)
         .build()
 
     /**
-     * 8-step downward stepped-leader + double return-stroke plasma flash across the real painted sky bolts
-     * in natural white-hot core + electric ice-blue storm ionization halo.
+     * WO-145: 4 Independent Random Sky Lightning Bolt Channels.
+     * Each bolt fork across the stormy sky schedules its own random strike interval, duration,
+     * and local top-to-bottom stepped leader + double return-stroke plasma flash so bolts NEVER drop in unison.
      */
-    private class ActualRavenBoltDrawable(
-        private val coreBitmap: Bitmap,
-        private val haloBitmap: Bitmap
+    private class IndependentRavenBoltFieldDrawable(
+        private val cores: Array<Bitmap?>,
+        private val halos: Array<Bitmap?>
     ) : Drawable() {
+        private val normRects = arrayOf(
+                RectF(0.00000f, 0.06207f, 0.44609f, 0.56677f),
+                RectF(0.31562f, 0.00000f, 0.77578f, 0.22696f),
+                RectF(0.30469f, 0.26583f, 0.77656f, 0.49843f),
+                RectF(0.67812f, 0.19875f, 1.00000f, 0.56489f)
+        )
         private val haloPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
         private val corePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
-        private val dstRect = Rect()
-        private val steps = 8
+        private val dstRect = RectF()
+        private val startMs = LongArray(4)
+        private val durMs = LongArray(4)
+        private val nextAtMs = LongArray(4)
+        private var lastAnyLaunchMs = 0L
 
-        var strikeProgress: Float = -1f
-            set(value) {
-                field = value
-                invalidateSelf()
+        init {
+            seedInitialSchedule(SystemClock.elapsedRealtime())
+        }
+
+        fun seedInitialSchedule(nowMs: Long) {
+            val firstBolt = Random.nextInt(4)
+            lastAnyLaunchMs = nowMs
+            for (i in 0 until 4) {
+                startMs[i] = 0L
+                durMs[i] = Random.nextLong(520L, 840L)
+                nextAtMs[i] = if (i == firstBolt) {
+                    nowMs + Random.nextLong(90L, 240L)
+                } else {
+                    nowMs + Random.nextLong(850L + i * 520L, 2600L + i * 780L)
+                }
             }
+        }
+
+        fun tick(nowMs: Long): Float {
+            var maxSurge = 0f
+            for (i in 0 until 4) {
+                val st = startMs[i]
+                val dur = durMs[i]
+                val active = st > 0L && (nowMs - st) <= dur
+                if (!active && nowMs >= nextAtMs[i]) {
+                    if ((nowMs - lastAnyLaunchMs) < 310L) {
+                        nextAtMs[i] = lastAnyLaunchMs + Random.nextLong(340L, 920L)
+                    } else {
+                        startMs[i] = nowMs
+                        durMs[i] = Random.nextLong(480L, 860L)
+                        lastAnyLaunchMs = nowMs
+                        nextAtMs[i] = nowMs + durMs[i] + Random.nextLong(1550L, 5200L)
+                    }
+                }
+                val stNow = startMs[i]
+                if (stNow > 0L) {
+                    val elapsed = nowMs - stNow
+                    if (elapsed in 0L..durMs[i]) {
+                        val p = (elapsed.toFloat() / durMs[i].toFloat()) * 1.32f
+                        val s = when {
+                            p in 0.64f..0.94f -> 1.0f
+                            p < 0.64f -> (p / 0.64f) * 0.42f
+                            else -> ((1.32f - p) / 0.38f).coerceIn(0f, 1f) * 0.55f
+                        }
+                        if (s > maxSurge) maxSurge = s
+                    } else if (elapsed > durMs[i]) {
+                        startMs[i] = 0L
+                    }
+                }
+            }
+            invalidateSelf()
+            return maxSurge
+        }
 
         override fun draw(canvas: Canvas) {
-            val p = strikeProgress
-            if (p < 0f || p > 1.32f) return
             val b = bounds
             if (b.isEmpty) return
-            dstRect.set(b)
-            val h = b.height()
+            val bw = b.width().toFloat()
+            val bh = b.height().toFloat()
+            val nowMs = SystemClock.elapsedRealtime()
 
-            if (p <= 0.68f) {
-                val rawNorm = (p / 0.68f).coerceIn(0f, 1f)
-                val steppedNorm = ((rawNorm * steps).toInt() + 1).toFloat() / steps.toFloat()
-                val frontY = b.top + (h * 0.56f * steppedNorm.coerceIn(0f, 1f)).toInt()
-                val leaderBand = (h * 0.15f).toInt().coerceAtLeast(8)
-                val leaderTop = (frontY - leaderBand).coerceAtLeast(b.top)
+            for (i in 0 until 4) {
+                val st = startMs[i]
+                if (st <= 0L) continue
+                val dur = durMs[i].coerceAtLeast(300L)
+                val elapsed = nowMs - st
+                if (elapsed < 0L || elapsed > dur) continue
 
-                haloPaint.alpha = 205
-                corePaint.alpha = 235
-                canvas.save()
-                canvas.clipRect(b.left, b.top, b.right, frontY)
-                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
-                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
-                canvas.restore()
+                val coreBmp = cores[i] ?: continue
+                val haloBmp = halos[i] ?: continue
+                val nr = normRects[i]
+                dstRect.set(
+                    b.left + nr.left * bw,
+                    b.top + nr.top * bh,
+                    b.left + nr.right * bw,
+                    b.top + nr.bottom * bh
+                )
+                val boltH = dstRect.height()
+                val p = (elapsed.toFloat() / dur.toFloat()) * 1.32f
 
-                haloPaint.alpha = 255
-                corePaint.alpha = 255
-                canvas.save()
-                canvas.clipRect(b.left, leaderTop, b.right, frontY)
-                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
-                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
-                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
-                canvas.restore()
-            } else if (p <= 0.94f) {
-                val crackle = when {
-                    p in 0.76f..0.81f -> 0.38f
-                    p in 0.87f..0.90f -> 0.72f
-                    else -> 1.0f
+                if (p <= 0.66f) {
+                    val rawNorm = (p / 0.66f).coerceIn(0f, 1f)
+                    val steppedNorm = ((rawNorm * 7f).toInt() + 1).toFloat() / 7f
+                    val frontY = dstRect.top + boltH * steppedNorm.coerceIn(0f, 1f)
+                    val leaderTop = (frontY - (boltH * 0.22f).coerceAtLeast(10f)).coerceAtLeast(dstRect.top)
+
+                    haloPaint.alpha = 205
+                    corePaint.alpha = 235
+                    canvas.save()
+                    canvas.clipRect(dstRect.left, dstRect.top, dstRect.right, frontY)
+                    canvas.drawBitmap(haloBmp, null, dstRect, haloPaint)
+                    canvas.drawBitmap(coreBmp, null, dstRect, corePaint)
+                    canvas.restore()
+
+                    haloPaint.alpha = 255
+                    corePaint.alpha = 255
+                    canvas.save()
+                    canvas.clipRect(dstRect.left, leaderTop, dstRect.right, frontY)
+                    canvas.drawBitmap(haloBmp, null, dstRect, haloPaint)
+                    canvas.drawBitmap(coreBmp, null, dstRect, corePaint)
+                    canvas.drawBitmap(coreBmp, null, dstRect, corePaint)
+                    canvas.restore()
+                } else if (p <= 0.94f) {
+                    val crackle = when {
+                        p in 0.75f..0.81f -> 0.35f
+                        p in 0.86f..0.90f -> 0.72f
+                        else -> 1.0f
+                    }
+                    haloPaint.alpha = (255f * crackle).toInt()
+                    corePaint.alpha = (255f * crackle).toInt()
+                    canvas.drawBitmap(haloBmp, null, dstRect, haloPaint)
+                    canvas.drawBitmap(coreBmp, null, dstRect, corePaint)
+                    if (crackle >= 0.95f) {
+                        canvas.drawBitmap(coreBmp, null, dstRect, corePaint)
+                    }
+                } else {
+                    val fadeNorm = ((p - 0.94f) / 0.38f).coerceIn(0f, 1f)
+                    val tailTopY = dstRect.top + boltH * fadeNorm * 0.45f
+                    val alpha = ((1f - fadeNorm) * 255f).toInt().coerceIn(0, 255)
+                    haloPaint.alpha = alpha
+                    corePaint.alpha = alpha
+                    canvas.save()
+                    canvas.clipRect(dstRect.left, tailTopY, dstRect.right, dstRect.bottom)
+                    canvas.drawBitmap(haloBmp, null, dstRect, haloPaint)
+                    canvas.drawBitmap(coreBmp, null, dstRect, corePaint)
+                    canvas.restore()
                 }
-                haloPaint.alpha = (255 * crackle).toInt()
-                corePaint.alpha = (255 * crackle).toInt()
-                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
-                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
-                if (crackle >= 0.95f) {
-                    canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
-                }
-            } else {
-                val fadeNorm = ((p - 0.94f) / 0.38f).coerceIn(0f, 1f)
-                val tailTopY = b.top + (h * fadeNorm * 0.36f).toInt()
-                val alpha = ((1f - fadeNorm) * 255f).toInt().coerceIn(0, 255)
-                haloPaint.alpha = alpha
-                corePaint.alpha = alpha
-                canvas.save()
-                canvas.clipRect(b.left, tailTopY, b.right, b.bottom)
-                canvas.drawBitmap(haloBitmap, null, dstRect, haloPaint)
-                canvas.drawBitmap(coreBitmap, null, dstRect, corePaint)
-                canvas.restore()
             }
         }
 
@@ -201,27 +269,126 @@ object VikingPopupOverlayManager {
     }
 
     /**
-     * Pulsating 24k-gold portrait ring & breathing aura around the rounded HD Raven portrait,
-     * with a crisp ice-white inner rim flash synced to the electric sky lightning strikes.
+     * WO-145: Steady Floating-Icon Gold Pedestal Runes (#B6862C / #F1C833) with Continuous Specular Shimmer.
+     * Replaces whole-layer pulsating with a smooth travelling 24k/#FFF791 highlight glint masked strictly
+     * inside the carved rune strokes via PorterDuff.Mode.SRC_ATOP.
+     */
+    private class ShimmeringPedestalRunesDrawable(
+        private val runesBitmap: Bitmap
+    ) : Drawable() {
+        private val normRect = RectF(0.27969f, 0.59248f, 0.69219f, 0.92665f)
+        private val basePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+            alpha = 225
+        }
+        private val shimmerMaskPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
+            alpha = 255
+        }
+        private val shimmerSweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
+        }
+        private val dstRect = RectF()
+        var shimmerPhase: Float = 0f
+            set(value) {
+                field = value
+                invalidateSelf()
+            }
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            if (b.isEmpty) return
+            val bw = b.width().toFloat()
+            val bh = b.height().toFloat()
+            dstRect.set(
+                b.left + normRect.left * bw,
+                b.top + normRect.top * bh,
+                b.left + normRect.right * bw,
+                b.top + normRect.bottom * bh
+            )
+
+            canvas.drawBitmap(runesBitmap, null, dstRect, basePaint)
+
+            val rw = dstRect.width()
+            val rh = dstRect.height()
+            val layerId = canvas.saveLayer(dstRect, null)
+            canvas.drawBitmap(runesBitmap, null, dstRect, shimmerMaskPaint)
+
+            val p1 = (shimmerPhase % 1f + 1f) % 1f
+            val sweepStartX = dstRect.left - rw * 0.65f + (rw * 2.30f) * p1
+            val sweepStartY = dstRect.top - rh * 0.25f + (rh * 0.70f) * p1
+            val bandW = rw * 0.44f
+            val bandH = rh * 0.30f
+
+            shimmerSweepPaint.shader = LinearGradient(
+                sweepStartX, sweepStartY,
+                sweepStartX + bandW, sweepStartY + bandH,
+                intArrayOf(
+                    0x00B6862C,
+                    0x66F1C833,
+                    0xEEFFF791.toInt(),
+                    0xFFFFFBEB.toInt(),
+                    0xEEFFF791.toInt(),
+                    0x66F1C833,
+                    0x00B6862C
+                ),
+                floatArrayOf(0f, 0.24f, 0.44f, 0.50f, 0.56f, 0.76f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawRect(dstRect, shimmerSweepPaint)
+
+            val p2 = ((shimmerPhase * 1.618f + 0.47f) % 1f + 1f) % 1f
+            val glX = dstRect.right + rw * 0.45f - (rw * 1.90f) * p2
+            val glY = dstRect.top + (rh * 0.85f) * p2
+            shimmerSweepPaint.shader = LinearGradient(
+                glX, glY,
+                glX + rw * 0.30f, glY + rh * 0.22f,
+                intArrayOf(0x00B6862C, 0x99FFF791.toInt(), 0x00B6862C),
+                floatArrayOf(0f, 0.5f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawRect(dstRect, shimmerSweepPaint)
+            canvas.restoreToCount(layerId)
+        }
+
+        override fun setAlpha(alpha: Int) { basePaint.alpha = alpha }
+        override fun setColorFilter(colorFilter: ColorFilter?) { basePaint.colorFilter = colorFilter }
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    /**
+     * WO-145: Exact FloatingThorService `glow_ring` Gold Ring Container.
+     * Maps the unwrapped `glow_ring.png` polar strip (identical gold color, gold stardust specks,
+     * and two opposite glimmer highlight spots) conformally around the rounded Raven card using a
+     * zero-seam GPU `drawBitmapMesh`, rotating clockwise at the exact 7000ms linear speed of the floating icon
+     * with ZERO pulsating.
      */
     private class LivingRavenCrestContainer(
         ctx: Context,
         private val padPx: Int,
-        private val cornerPx: Float
+        private val cornerPx: Float,
+        private val ringStripBitmap: Bitmap?
     ) : FrameLayout(ctx) {
-        private val outerGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-        private val innerRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-        private val sparkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        private val segCount = 128
+        private val radSteps = 8
+        private val meshVerts = FloatArray((segCount + 1) * (radSteps + 1) * 2)
+        private val baseBx = FloatArray(segCount)
+        private val baseBy = FloatArray(segCount)
+        private val baseNx = FloatArray(segCount)
+        private val baseNy = FloatArray(segCount)
+        private var geometryReady = false
+
+        private val ringPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+            alpha = 236
+        }
+        private val subtleRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
         private val rectWork = RectF()
 
-        var pulseValue: Float = 0.5f
+        var ringRotationDeg: Float = 0f
             set(value) {
-                field = value
-                invalidate()
-            }
-        var strikeSurge: Float = 0f
-            set(value) {
-                field = value
+                field = ((value % 360f) + 360f) % 360f
+                if (geometryReady) updateRotatedMeshVerts()
                 invalidate()
             }
 
@@ -229,6 +396,146 @@ object VikingPopupOverlayManager {
             setWillNotDraw(false)
             clipChildren = false
             clipToPadding = false
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w > padPx * 2 + 10 && h > padPx * 2 + 10) {
+                buildRoundedRectPerimeterLut(w.toFloat(), h.toFloat())
+                geometryReady = true
+                updateRotatedMeshVerts()
+            }
+        }
+
+        private fun buildRoundedRectPerimeterLut(w: Float, h: Float) {
+            val left = padPx.toFloat()
+            val top = padPx.toFloat()
+            val right = w - padPx.toFloat()
+            val bottom = h - padPx.toFloat()
+            val cardW = right - left
+            val cardH = bottom - top
+            val r = cornerPx.coerceAtMost(minOf(cardW, cardH) * 0.48f)
+
+            val topLen = (cardW - 2f * r).coerceAtLeast(0f)
+            val rightLen = (cardH - 2f * r).coerceAtLeast(0f)
+            val botLen = topLen
+            val leftLen = rightLen
+            val arcLen = (0.5 * Math.PI * r).toFloat()
+            val totalPerim = topLen + rightLen + botLen + leftLen + 4f * arcLen
+            val halfRight = rightLen * 0.5f
+
+            for (k in 0 until segCount) {
+                var s = (k.toFloat() / segCount.toFloat()) * totalPerim
+                var bx: Float
+                var by: Float
+                var nx: Float
+                var ny: Float
+
+                if (s < halfRight) {
+                    bx = right
+                    by = (top + r + halfRight) + s
+                    nx = 1f; ny = 0f
+                } else {
+                    s -= halfRight
+                    if (s < arcLen) {
+                        val a = s / r
+                        val ca = kotlin.math.cos(a.toDouble()).toFloat()
+                        val sa = kotlin.math.sin(a.toDouble()).toFloat()
+                        bx = (right - r) + r * ca
+                        by = (bottom - r) + r * sa
+                        nx = ca; ny = sa
+                    } else {
+                        s -= arcLen
+                        if (s < botLen) {
+                            bx = (right - r) - s
+                            by = bottom
+                            nx = 0f; ny = 1f
+                        } else {
+                            s -= botLen
+                            if (s < arcLen) {
+                                val a = (Math.PI * 0.5).toFloat() + (s / r)
+                                val ca = kotlin.math.cos(a.toDouble()).toFloat()
+                                val sa = kotlin.math.sin(a.toDouble()).toFloat()
+                                bx = (left + r) + r * ca
+                                by = (bottom - r) + r * sa
+                                nx = ca; ny = sa
+                            } else {
+                                s -= arcLen
+                                if (s < leftLen) {
+                                    bx = left
+                                    by = (bottom - r) - s
+                                    nx = -1f; ny = 0f
+                                } else {
+                                    s -= leftLen
+                                    if (s < arcLen) {
+                                        val a = Math.PI.toFloat() + (s / r)
+                                        val ca = kotlin.math.cos(a.toDouble()).toFloat()
+                                        val sa = kotlin.math.sin(a.toDouble()).toFloat()
+                                        bx = (left + r) + r * ca
+                                        by = (top + r) + r * sa
+                                        nx = ca; ny = sa
+                                    } else {
+                                        s -= arcLen
+                                        if (s < topLen) {
+                                            bx = (left + r) + s
+                                            by = top
+                                            nx = 0f; ny = -1f
+                                        } else {
+                                            s -= topLen
+                                            if (s < arcLen) {
+                                                val a = (Math.PI * 1.5).toFloat() + (s / r)
+                                                val ca = kotlin.math.cos(a.toDouble()).toFloat()
+                                                val sa = kotlin.math.sin(a.toDouble()).toFloat()
+                                                bx = (right - r) + r * ca
+                                                by = (top + r) + r * sa
+                                                nx = ca; ny = sa
+                                            } else {
+                                                s -= arcLen
+                                                bx = right
+                                                by = (top + r) + s.coerceAtMost(halfRight)
+                                                nx = 1f; ny = 0f
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                baseBx[k] = bx
+                baseBy[k] = by
+                baseNx[k] = nx
+                baseNy[k] = ny
+            }
+        }
+
+        private fun updateRotatedMeshVerts() {
+            val phase = (ringRotationDeg / 360f) * segCount.toFloat()
+            val innerTuckPx = -dpStatic(context, 2).toFloat()
+            val outerSpanPx = padPx.toFloat() - innerTuckPx
+
+            for (i in 0..segCount) {
+                val pos = ((i % segCount).toFloat() + phase) % segCount.toFloat()
+                val k0 = pos.toInt() % segCount
+                val k1 = (k0 + 1) % segCount
+                val frac = pos - pos.toInt().toFloat()
+
+                val bx = baseBx[k0] + (baseBx[k1] - baseBx[k0]) * frac
+                val by = baseBy[k0] + (baseBy[k1] - baseBy[k0]) * frac
+                var nx = baseNx[k0] + (baseNx[k1] - baseNx[k0]) * frac
+                var ny = baseNy[k0] + (baseNy[k1] - baseNy[k0]) * frac
+                val nLen = kotlin.math.hypot(nx.toDouble(), ny.toDouble()).toFloat().coerceAtLeast(1e-4f)
+                nx /= nLen
+                ny /= nLen
+
+                for (j in 0..radSteps) {
+                    val rFrac = j.toFloat() / radSteps.toFloat()
+                    val dist = innerTuckPx + outerSpanPx * rFrac
+                    val vIdx = (j * (segCount + 1) + i) * 2
+                    meshVerts[vIdx] = bx + nx * dist
+                    meshVerts[vIdx + 1] = by + ny * dist
+                }
+            }
         }
 
         override fun dispatchDraw(canvas: Canvas) {
@@ -239,53 +546,21 @@ object VikingPopupOverlayManager {
                 return
             }
 
-            val energy = (0.35f + 0.65f * pulseValue + 0.35f * strikeSurge).coerceIn(0.25f, 1.30f)
-            val left = padPx.toFloat()
-            val top = padPx.toFloat()
-            val right = w - padPx.toFloat()
-            val bottom = h - padPx.toFloat()
-
-            for (band in 3 downTo 1) {
-                val expand = band * (padPx * 0.26f)
-                rectWork.set(left - expand, top - expand, right + expand, bottom + expand)
-                outerGlowPaint.strokeWidth = padPx * 0.42f
-                val baseAlpha = when (band) {
-                    3 -> 44
-                    2 -> 90
-                    else -> 152
-                }
-                val a = (baseAlpha * energy).toInt().coerceIn(0, 255)
-                outerGlowPaint.color = Color.argb(a, 245, 185, 66)
-                canvas.drawRoundRect(rectWork, cornerPx + expand, cornerPx + expand, outerGlowPaint)
+            val strip = ringStripBitmap
+            if (strip != null && geometryReady) {
+                canvas.drawBitmapMesh(strip, segCount, radSteps, meshVerts, 0, null, 0, ringPaint)
             }
 
             super.dispatchDraw(canvas)
 
+            val left = padPx.toFloat()
+            val top = padPx.toFloat()
+            val right = w - padPx.toFloat()
+            val bottom = h - padPx.toFloat()
             rectWork.set(left, top, right, bottom)
-            innerRimPaint.strokeWidth = dpStatic(context, 3).toFloat()
-            innerRimPaint.shader = LinearGradient(
-                left, top, right, bottom,
-                intArrayOf(
-                    Color.parseColor("#FFFBEB"),
-                    Color.parseColor("#FDE047"),
-                    Color.parseColor("#D97706"),
-                    Color.parseColor("#FDE047"),
-                    Color.parseColor("#FFFBEB")
-                ),
-                null,
-                Shader.TileMode.CLAMP
-            )
-            canvas.drawRoundRect(rectWork, cornerPx, cornerPx, innerRimPaint)
-
-            val innerInset = dpStatic(context, 2).toFloat()
-            rectWork.set(left + innerInset, top + innerInset, right - innerInset, bottom - innerInset)
-            val surgeMix = strikeSurge.coerceIn(0f, 1f)
-            val wireAlpha = (80 + 170 * ((pulseValue * 0.45f + surgeMix).coerceIn(0f, 1f))).toInt().coerceIn(0, 255)
-            val wireR = (255 - (35 * surgeMix)).toInt().coerceIn(200, 255)
-            val wireG = (246 + (8 * surgeMix)).toInt().coerceIn(220, 255)
-            sparkPaint.strokeWidth = dpStatic(context, 1).toFloat()
-            sparkPaint.color = Color.argb(wireAlpha, wireR, wireG, 255)
-            canvas.drawRoundRect(rectWork, (cornerPx - innerInset).coerceAtLeast(4f), (cornerPx - innerInset).coerceAtLeast(4f), sparkPaint)
+            subtleRimPaint.strokeWidth = dpStatic(context, 1).toFloat()
+            subtleRimPaint.color = Color.argb(175, 182, 134, 44)
+            canvas.drawRoundRect(rectWork, cornerPx, cornerPx, subtleRimPaint)
         }
     }
 
@@ -303,14 +578,29 @@ object VikingPopupOverlayManager {
     }
 
     private fun ensureRavenBitmapsLoaded(ctx: Context) {
-        if (ravenBaseBmp != null && ravenCoreBmp != null && ravenHaloBmp != null && ravenRunesBmp != null) return
+        if (ravenBaseBmp != null && ravenRingStripBmp != null && ravenRunesBmp != null && ravenBoltCores[0] != null) return
         try {
-            ravenBaseBmp = decodeMipmappedResource(ctx, R.drawable.raven_storm_base)
-            ravenCoreBmp = decodeMipmappedResource(ctx, R.drawable.raven_bolts_core)
-            ravenHaloBmp = decodeMipmappedResource(ctx, R.drawable.raven_bolts_halo)
-            ravenRunesBmp = decodeMipmappedResource(ctx, R.drawable.raven_runes_glow)
+            ravenBaseBmp = decodeMipmappedResource(ctx, R.drawable.raven_storm_base_hd)
+            ravenRingStripBmp = decodeMipmappedResource(ctx, R.drawable.raven_gold_ring_strip)
+            ravenRunesBmp = decodeMipmappedResource(ctx, R.drawable.raven_runes_gold_hd)
+            val coreIds = intArrayOf(
+                R.drawable.raven_bolt_0_core,
+                R.drawable.raven_bolt_1_core,
+                R.drawable.raven_bolt_2_core,
+                R.drawable.raven_bolt_3_core
+            )
+            val haloIds = intArrayOf(
+                R.drawable.raven_bolt_0_halo,
+                R.drawable.raven_bolt_1_halo,
+                R.drawable.raven_bolt_2_halo,
+                R.drawable.raven_bolt_3_halo
+            )
+            for (i in 0 until 4) {
+                ravenBoltCores[i] = decodeMipmappedResource(ctx, coreIds[i])
+                ravenBoltHalos[i] = decodeMipmappedResource(ctx, haloIds[i])
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed decoding HD Raven storm bitmaps", e)
+            Log.e(TAG, "Failed decoding Ultra-HD Raven V3 bitmaps", e)
         }
     }
 
@@ -426,15 +716,14 @@ object VikingPopupOverlayManager {
         }
 
         if (livingRavenView == null) {
-            val auraPad = dp(ctx, 14)
+            val auraPad = dp(ctx, 20)
             val radiusPx = dp(ctx, 22).toFloat()
-            // Exact 739:921 aspect ratio -> 136dp x 170dp (476x595 physical px @ 560dpi)
             val artW = dp(ctx, 136)
             val artH = dp(ctx, 170)
             val totalW = artW + auraPad * 2
             val totalH = artH + auraPad * 2
 
-            val outerContainer = LivingRavenCrestContainer(ctx, auraPad, radiusPx)
+            val outerContainer = LivingRavenCrestContainer(ctx, auraPad, radiusPx, ravenRingStripBmp)
 
             val roundedCard = FrameLayout(ctx).apply {
                 layoutParams = FrameLayout.LayoutParams(artW, artH, Gravity.CENTER)
@@ -444,7 +733,7 @@ object VikingPopupOverlayManager {
                         outline.setRoundRect(0, 0, view.width, view.height, radiusPx)
                     }
                 }
-                elevation = dp(ctx, 10).toFloat()
+                elevation = dp(ctx, 8).toFloat()
             }
 
             val baseImg = ImageView(ctx).apply {
@@ -457,33 +746,31 @@ object VikingPopupOverlayManager {
             }
             roundedCard.addView(baseImg)
 
-            val runesImg = ImageView(ctx).apply {
-                tag = "raven_runes_layer"
-                scaleType = ImageView.ScaleType.FIT_XY
-                ravenRunesBmp?.let { setImageBitmap(it) }
-                alpha = 0.65f
-                layoutParams = FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                )
-            }
-            roundedCard.addView(runesImg)
-
-            val coreB = ravenCoreBmp
-            val haloB = ravenHaloBmp
-            if (coreB != null && haloB != null) {
-                val bDrawable = ActualRavenBoltDrawable(coreB, haloB)
-                ravenBoltDrawable = bDrawable
-                val boltImg = ImageView(ctx).apply {
+            ravenRunesBmp?.let { rBmp ->
+                val shimmerDrawable = ShimmeringPedestalRunesDrawable(rBmp)
+                ravenRunesShimmerDrawable = shimmerDrawable
+                val runesImg = ImageView(ctx).apply {
                     scaleType = ImageView.ScaleType.FIT_XY
-                    setImageDrawable(bDrawable)
+                    setImageDrawable(shimmerDrawable)
                     layoutParams = FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
                         FrameLayout.LayoutParams.MATCH_PARENT
                     )
                 }
-                roundedCard.addView(boltImg)
+                roundedCard.addView(runesImg)
             }
+
+            val bDrawable = IndependentRavenBoltFieldDrawable(ravenBoltCores, ravenBoltHalos)
+            ravenBoltDrawable = bDrawable
+            val boltImg = ImageView(ctx).apply {
+                scaleType = ImageView.ScaleType.FIT_XY
+                setImageDrawable(bDrawable)
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+            }
+            roundedCard.addView(boltImg)
 
             outerContainer.addView(roundedCard)
 
@@ -494,6 +781,7 @@ object VikingPopupOverlayManager {
                 WindowManager.LayoutParams.TYPE_PHONE
             }
 
+            // WO-145: Arrive in Top-Left corner right underneath the clock (Gravity.TOP | START, x = 0, y = 24dp)
             val rParams = WindowManager.LayoutParams(
                 totalW,
                 totalH,
@@ -501,9 +789,9 @@ object VikingPopupOverlayManager {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                gravity = Gravity.TOP or Gravity.END
-                x = dp(ctx, 10)
-                y = dp(ctx, 76)
+                gravity = Gravity.TOP or Gravity.START
+                x = 0
+                y = dp(ctx, 24)
             }
 
             var downRawX = 0f
@@ -527,17 +815,23 @@ object VikingPopupOverlayManager {
                         val dy = ev.rawY - downRawY
                         if (abs(dx) > dp(ctx, 9) || abs(dy) > dp(ctx, 9)) {
                             moved = true
-                            rParams.x = (startX - dx.toInt()).coerceIn(-dp(ctx, 80), ctx.resources.displayMetrics.widthPixels - dp(ctx, 60))
-                            rParams.y = (startY + dy.toInt()).coerceIn(dp(ctx, 24), ctx.resources.displayMetrics.heightPixels - dp(ctx, 140))
+                            val screenW = ctx.resources.displayMetrics.widthPixels
+                            val screenH = ctx.resources.displayMetrics.heightPixels
+                            rParams.x = (startX + dx.toInt()).coerceIn(-dp(ctx, 80), screenW - dp(ctx, 60))
+                            rParams.y = (startY + dy.toInt()).coerceIn(dp(ctx, 24), screenH - dp(ctx, 140))
                             try { windowManager?.updateViewLayout(v, rParams) } catch (_: Exception) {}
                         }
                         true
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         val totalDx = ev.rawX - downRawX
+                        val screenW = ctx.resources.displayMetrics.widthPixels
                         if (!moved) {
                             openUnfoldedRavenMessageCard(lastRavenCleanBase)
-                        } else if (abs(totalDx) > dp(ctx, 135) && (rParams.x <= -dp(ctx, 35) || rParams.x >= ctx.resources.displayMetrics.widthPixels - dp(ctx, 95))) {
+                        } else if (
+                            (totalDx < -dp(ctx, 95) && rParams.x <= dp(ctx, 8)) ||
+                            (totalDx > dp(ctx, 135) && rParams.x >= screenW - totalW - dp(ctx, 12))
+                        ) {
                             dismissedStagedKey = lastRavenKey
                             triggerServerActionBg(lastRavenCleanBase, "dismiss_reply")
                             hideLivingRavenEmblem()
@@ -553,65 +847,48 @@ object VikingPopupOverlayManager {
         }
 
         val rv = livingRavenView ?: return
-        val runesLayerView: ImageView? = rv.findViewWithTag("raven_runes_layer")
+        val lp = livingRavenParams
 
         if (rv.parent == null) {
+            if (lp != null) {
+                lp.gravity = Gravity.TOP or Gravity.START
+                lp.x = 0
+                lp.y = dp(ctx, 24)
+            }
+            ravenBoltDrawable?.seedInitialSchedule(SystemClock.elapsedRealtime())
             rv.alpha = 0f
-            rv.scaleX = 0.86f
-            rv.scaleY = 0.86f
+            rv.scaleX = 0.88f
+            rv.scaleY = 0.88f
             try {
-                windowManager?.addView(rv, livingRavenParams)
+                windowManager?.addView(rv, lp)
                 rv.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220L).start()
             } catch (e: Exception) {
-                Log.e(TAG, "Failed adding Living Raven overlay", e)
+                Log.e(TAG, "Failed adding Living Raven V3 overlay", e)
             }
         }
 
-        ravenPulseAnimator?.cancel()
-        ravenPulseAnimator = ValueAnimator.ofFloat(0f, (Math.PI * 2.0).toFloat()).apply {
-            duration = 1350L
+        ravenLoopAnimator?.cancel()
+        val loopStartMs = SystemClock.elapsedRealtime()
+        val startRot = rv.ringRotationDeg
+        ravenLoopAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 7000L
             repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.RESTART
             interpolator = LinearInterpolator()
-            addUpdateListener { anim ->
-                val ang = anim.animatedValue as Float
-                val norm = ((sin(ang.toDouble()) + 1.0) * 0.5).toFloat()
-                rv.pulseValue = norm
-                runesLayerView?.alpha = 0.28f + 0.72f * norm
-            }
-            start()
-        }
-
-        mainHandler.removeCallbacks(ravenStrikeLoopRunnable)
-        mainHandler.post(ravenStrikeLoopRunnable)
-    }
-
-    private fun fireRavenLightningCascade(durationMs: Long) {
-        val drawable = ravenBoltDrawable ?: return
-        val rv = livingRavenView ?: return
-        ravenBoltAnimator?.cancel()
-        ravenBoltAnimator = ValueAnimator.ofFloat(0.0f, 1.32f).apply {
-            duration = durationMs
-            interpolator = LinearInterpolator()
-            addUpdateListener { anim ->
-                val p = anim.animatedValue as Float
-                drawable.strikeProgress = p
-                rv.strikeSurge = when {
-                    p in 0.66f..0.95f -> 1.0f
-                    p < 0.66f -> (p / 0.66f) * 0.45f
-                    else -> ((1.32f - p) / 0.37f).coerceIn(0f, 1f) * 0.6f
-                }
+            addUpdateListener {
+                val nowMs = SystemClock.elapsedRealtime()
+                val elapsedMs = (nowMs - loopStartMs).coerceAtLeast(0L)
+                rv.ringRotationDeg = startRot + ((elapsedMs % 7000L).toFloat() / 7000f) * 360f
+                ravenRunesShimmerDrawable?.shimmerPhase = (elapsedMs % 3800L).toFloat() / 3800f
+                ravenBoltDrawable?.tick(nowMs)
             }
             start()
         }
     }
 
     private fun hideLivingRavenEmblem() {
-        mainHandler.removeCallbacks(ravenStrikeLoopRunnable)
-        ravenPulseAnimator?.cancel()
-        ravenPulseAnimator = null
-        ravenBoltAnimator?.cancel()
-        ravenBoltAnimator = null
-        ravenBoltDrawable?.strikeProgress = -1f
+        ravenLoopAnimator?.cancel()
+        ravenLoopAnimator = null
         val rv = livingRavenView ?: return
         if (rv.parent != null) {
             try { windowManager?.removeView(rv) } catch (_: Exception) {}
@@ -742,7 +1019,7 @@ object VikingPopupOverlayManager {
         val cleanBase = serverBaseUrl.trimEnd('/')
         if (polling) return
         polling = true
-        Log.i(TAG, "Starting Viking Pop-Up Herald V7 (HD 739x921 Living Raven + True Electric Sky Bolts)...")
+        Log.i(TAG, "Starting Viking Pop-Up Herald V8 (WO-145 Ultra-HD Living Raven V3 + Clockwise Floating Gold Ring)...")
 
         thread(start = true, isDaemon = true, name = "VikingPopupPoller") {
             while (polling) {
