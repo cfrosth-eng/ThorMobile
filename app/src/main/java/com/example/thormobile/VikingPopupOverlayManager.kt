@@ -668,6 +668,13 @@ object VikingPopupOverlayManager {
         lastRavenMessage = message
         lastRavenLinks = linksJson
         currentEventKey = rKey
+        RavenCenterActivity.recordIncomingRavenCardAsync(
+            context = context,
+            msgId = rKey,
+            title = lastRavenTitle,
+            body = message,
+            linksJson = linksJson
+        )
         mainHandler.post {
             try {
                 hideVikingShield()
@@ -972,9 +979,97 @@ object VikingPopupOverlayManager {
         val container = ravenLinksContainer
         if (container != null) {
             container.removeAllViews()
-            if (pairs.isEmpty()) {
-                container.visibility = View.GONE
-            } else {
+            val tacRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(ctx, 6) }
+            }
+            var tacCount = 0
+            val phoneM = Regex("(?:\\+?1[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]\\d{3}[-.\\s]\\d{4}").find(rawBody)
+            if (phoneM != null) {
+                val digits = phoneM.value.filter { it.isDigit() || it == '+' }
+                tacRow.addView(Button(ctx).apply {
+                    text = "📞 Call"
+                    isAllCaps = false
+                    setTextColor(Color.parseColor("#DCFCE7"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    background = makePillDrawable("#082E1A", "#4ADE80", 1, 99, ctx)
+                    layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 1f).apply { marginEnd = dp(ctx, 5) }
+                    setOnClickListener {
+                        try {
+                            ctx.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$digits")).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                        } catch (_: Exception) {}
+                    }
+                })
+                tacCount++
+            }
+            val addrM = Regex(
+                "\\b\\d{1,6}\\s+[A-Za-z0-9.'\\-\\s]{2,36}\\b(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Pike|Highway|Hwy|Drive|Dr|Lane|Ln|Way|Parkway|Pkwy)\\b",
+                RegexOption.IGNORE_CASE
+            ).find(rawBody)
+            if (addrM != null) {
+                val destAddr = addrM.value.trim()
+                tacRow.addView(Button(ctx).apply {
+                    text = "🧭 Navigate"
+                    isAllCaps = false
+                    setTextColor(Color.parseColor("#E0F2FE"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    background = makePillDrawable("#0B2545", "#38BDF8", 1, 99, ctx)
+                    layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 1f).apply { marginEnd = dp(ctx, 5) }
+                    setOnClickListener {
+                        try {
+                            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=${Uri.encode(destAddr)}")).apply {
+                                setPackage("com.google.android.apps.maps")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            })
+                        } catch (_: Exception) {
+                            launchExternalLinkFromRaven("https://www.google.com/maps/search/?api=1&query=${Uri.encode(destAddr)}")
+                        }
+                    }
+                })
+                tacCount++
+            }
+            if (rawBody.isNotBlank()) {
+                tacRow.addView(Button(ctx).apply {
+                    text = "🔊 Replay"
+                    isAllCaps = false
+                    setTextColor(Color.parseColor("#EDE9FE"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    background = makePillDrawable("#1E1B4B", "#A78BFA", 1, 99, ctx)
+                    layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 1.1f).apply { marginEnd = dp(ctx, 5) }
+                    setOnClickListener {
+                        RavenCenterActivity.requestCloudVoiceReplay(ctx, rawBody, null)
+                    }
+                })
+                tacCount++
+            }
+            tacRow.addView(Button(ctx).apply {
+                text = "🦅 Inbox"
+                isAllCaps = false
+                setTextColor(Color.parseColor("#FDE047"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                background = makePillDrawable("#172033", "#F5B942", 1, 99, ctx)
+                layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 0.95f)
+                setOnClickListener {
+                    hideVikingShield()
+                    try {
+                        ctx.startActivity(Intent(ctx, RavenCenterActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                    } catch (_: Exception) {}
+                }
+            })
+            tacCount++
+            if (tacCount > 0) {
+                container.visibility = View.VISIBLE
+                container.addView(tacRow)
+            }
+
+            if (pairs.isNotEmpty()) {
                 container.visibility = View.VISIBLE
                 for ((idx, pair) in pairs.take(4).withIndex()) {
                     val rawLbl = pair.first
