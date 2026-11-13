@@ -45,6 +45,7 @@ class MainActivity : AppCompatActivity() {
         }
         ObdLinkAutoWatchdog.startAutonomousWatchdog(CLOUD_URL)
         VikingPopupOverlayManager.start(this, CLOUD_URL)
+        RavenHeraldService.ensureRunning(this)
 
         val scroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#040812"))

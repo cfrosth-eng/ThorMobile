@@ -314,6 +314,14 @@ object VikingPopupOverlayManager {
         }
     }
 
+    @Volatile private var fastPollUntilEpochMs: Long = 0L
+    @Volatile private var lastHandledResumeId: String = ""
+
+    fun enableFastReplyWatchPoll(context: Context, serverBaseUrl: String, durationMs: Long = 35_000L) {
+        fastPollUntilEpochMs = System.currentTimeMillis() + durationMs
+        pollNow(context, serverBaseUrl)
+    }
+
     fun pollNow(context: Context, serverBaseUrl: String) {
         appCtx = context.applicationContext
         val cleanBase = serverBaseUrl.trimEnd('/')
@@ -751,7 +759,8 @@ object VikingPopupOverlayManager {
                         }
                     }
                 } catch (_: Exception) {}
-                Thread.sleep(15000L)
+                val sleepMs = if (System.currentTimeMillis() < fastPollUntilEpochMs) 2500L else 10000L
+                Thread.sleep(sleepMs)
             }
         }
     }
@@ -766,6 +775,41 @@ object VikingPopupOverlayManager {
         try {
             val root = JSONObject(rawJson)
             val vault = root.optJSONObject("vault") ?: return
+            val pendingResume = vault.optJSONObject("pending_voice_resume")
+            if (pendingResume != null) {
+                val resId = pendingResume.optString("resume_id", "")
+                val repTxt = pendingResume.optString("reply_text", "")
+                val ctxNow = appCtx
+                if (resId.isNotBlank() && resId != lastHandledResumeId && repTxt.isNotBlank() && ctxNow != null) {
+                    lastHandledResumeId = resId
+                    val stoppedByBoss = ctxNow.getSharedPreferences("thor_overlay_prefs", Context.MODE_PRIVATE)
+                        .getBoolean("user_stopped", false)
+                    if (!stoppedByBoss && FloatingThorService.canAutoResumeMic) {
+                        Log.i(TAG, "WO-139: Active mode -> Thor autonomously re-opening mic to speak $resId")
+                        mainHandler.post {
+                            try {
+                                val resumeIntent = android.content.Intent(ctxNow, FloatingThorService::class.java).apply {
+                                    action = FloatingThorService.ACTION_THOR_RESUME_MIC
+                                    putExtra("resume_id", resId)
+                                }
+                                ctxNow.startService(resumeIntent)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Auto mic resume startService note: ${e.message}")
+                            }
+                        }
+                        return
+                    } else {
+                        // Long-Pressed Off or Red Standby -> NEVER open mic; clear voice flag & fall through to show silent Living Raven!
+                        Log.i(TAG, "WO-139: Mic off/standby -> delivering $resId silently via Living Raven!")
+                        thread(start = true, isDaemon = true) {
+                            try {
+                                val clr = Request.Builder().url("$cleanBase/api/pre-approval?action=clear_voice_resume&t=${System.currentTimeMillis()}").get().build()
+                                http.newCall(clr).execute().close()
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+            }
             val clones = vault.optJSONArray("active_clones")
             val staged = vault.optJSONObject("staged_upgrade")
             val patches = vault.optJSONArray("live_ui_patches")

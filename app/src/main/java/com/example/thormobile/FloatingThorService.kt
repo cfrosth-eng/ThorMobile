@@ -105,6 +105,9 @@ class FloatingThorService : Service() {
         private const val KEY_POS_Y = "overlay_pos_y"
         private const val KEY_BOSS_PHONE = "boss_phone_fallback"
 
+        const val ACTION_THOR_RESUME_MIC = "com.example.thormobile.ACTION_THOR_RESUME_MIC"
+        @Volatile var canAutoResumeMic: Boolean = false
+
         private val FLUSH_MARKER: ByteString =
             byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte()).toByteString()
     }
@@ -289,6 +292,8 @@ class FloatingThorService : Service() {
     @Volatile private var lastFailoverTurnId: String = ""
     @Volatile private var lastFailoverSmsAtMs: Long = 0L
     @Volatile private var userSpokeInActiveSession: Boolean = false
+    @Volatile private var awaitingThorReply: Boolean = false
+    @Volatile private var awaitingReplySinceMs: Long = 0L
     @Volatile private var lastPcmChunkArrivalMs: Long = 0L
     @Volatile private var cellularJitterEwmaMs: Double = 25.0
 
@@ -357,7 +362,9 @@ class FloatingThorService : Service() {
         super.onCreate()
         ObdLinkAutoWatchdog.startAutonomousWatchdog("https://" + "thor-api-443941171993.us-east4.run.app")
         VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
+        RavenHeraldService.ensureRunning(this)
         isServiceRunning = true
+        canAutoResumeMic = !isStandby
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         powerGuard = PowerGuard(this)
@@ -687,6 +694,7 @@ class FloatingThorService : Service() {
     private fun toggleStandby() {
         if (isStandby) {
             isStandby = false
+            canAutoResumeMic = true
             mainHandler.post {
                 applyVisualState()
                 fireArtworkLightningCascade(durationMs = 450L)
@@ -696,6 +704,11 @@ class FloatingThorService : Service() {
             mainHandler.post { refreshNotification() }
         } else {
             isStandby = true
+            canAutoResumeMic = false
+            if (awaitingThorReply) {
+                VikingPopupOverlayManager.enableFastReplyWatchPoll(this, "https://" + "thor-api-443941171993.us-east4.run.app", 45_000L)
+            }
+            awaitingThorReply = false
             stopStreamingAudio()
             stopCaptureAndReleaseMic()
             mainHandler.post {
@@ -707,14 +720,29 @@ class FloatingThorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_THOR_RESUME_MIC) {
+            if (!destroyed && !userRequestedStop && !isStandby && canAutoResumeMic && hasMicPermission()) {
+                Log.i(TAG_AUDIO, "WO-139: Autonomous Thor Mic Re-Open triggered to deliver pending reply.")
+                if (activeSession == 0) {
+                    startSession(keepPreRoll = false)
+                } else {
+                    synchronized(lock) { endingSession = false }
+                    applyVisualState()
+                }
+            }
+            return START_STICKY
+        }
         if (intent?.action == ACTION_STOP) {
             userRequestedStop = true
+            canAutoResumeMic = false
             getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
             shutdownService()
             return START_NOT_STICKY
         }
         userRequestedStop = false
+        canAutoResumeMic = !isStandby
         getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", false).apply()
+        RavenHeraldService.ensureRunning(this)
         VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
         return START_STICKY
     }
@@ -760,16 +788,20 @@ class FloatingThorService : Service() {
         } catch (_: Exception) {}
         try {
             val nm = getSystemService(NotificationManager::class.java)
-            nm?.cancel(NOTIFICATION_ID)
-            nm?.cancelAll()
+                nm?.cancel(NOTIFICATION_ID)
         } catch (_: Exception) {}
     }
 
     private fun shutdownService() {
+        val wasAwaiting = awaitingThorReply
         userRequestedStop = true
+        canAutoResumeMic = false
+        awaitingThorReply = false
         isServiceRunning = false
+        getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
         if (destroyed) {
             cancelOverlayNotificationCompletely()
+            RavenHeraldService.ensureRunning(this)
             return
         }
         destroyed = true
@@ -777,6 +809,11 @@ class FloatingThorService : Service() {
         stopStreamingAudio()
         mainHandler.removeCallbacksAndMessages(null)
         cancelOverlayNotificationCompletely()
+        // Keep zero-mic Silent Raven Herald alive even after long-press shutdown so Ravens always reach Boss!
+        RavenHeraldService.ensureRunning(this)
+        if (wasAwaiting) {
+            VikingPopupOverlayManager.enableFastReplyWatchPoll(this, "https://" + "thor-api-443941171993.us-east4.run.app", 45_000L)
+        }
         stopSelf()
     }
 
@@ -1136,6 +1173,8 @@ class FloatingThorService : Service() {
                 valleyReconnectAttempts = 0
             turnSpeechDetected = false
             userSpokeInActiveSession = false
+            awaitingThorReply = false
+            awaitingReplySinceMs = 0L
             lastPcmChunkArrivalMs = 0L
             socketDroppedDuringTurn = false
             waitingForCloudBurst = false
@@ -1370,8 +1409,13 @@ class FloatingThorService : Service() {
                             ws.send(org.json.JSONObject().put("type", "sms_sync").put("messages", readRecentGoogleMessagesJson()).toString())
                         } catch (_: Exception) {}
                     }
-                    if (json.optString("action") == "voice_turn_envelope") {
-                        scheduleVoiceTurnClosedLoopCheck(
+                if (json.optString("action") == "thinking_complete") {
+                    lastPlaybackTime = SystemClock.elapsedRealtime()
+                    return
+                }
+                if (json.optString("action") == "voice_turn_envelope") {
+                    awaitingThorReply = false
+                    scheduleVoiceTurnClosedLoopCheck(
                             ws = ws,
                             sessionAtStart = sessionId,
                             turnId = json.optString("turn_id", "vt_${System.currentTimeMillis()}"),
@@ -1502,6 +1546,7 @@ class FloatingThorService : Service() {
                 lastPcmChunkArrivalMs = 0L
                 flushPlayback()
             } else {
+                awaitingThorReply = false
                 val nowArr = SystemClock.elapsedRealtime()
                 val prevArr = lastPcmChunkArrivalMs
                 lastPcmChunkArrivalMs = nowArr
@@ -1531,11 +1576,24 @@ class FloatingThorService : Service() {
         }
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
             if (sessionId == activeSession) {
+                val stillWaitingOnThor = awaitingThorReply && !endingSession && !userRequestedStop && !isStandby && canAutoResumeMic
                 synchronized(lock) {
                     socketReady = false
                     if (webSocket === ws) webSocket = null
                 }
-                if (endingSession || playbackQueue.isNotEmpty() || playbackBusy || remainingHardwareSpeechMs() > 0L) {
+                if (stillWaitingOnThor) {
+                    Log.w(TAG_WS, "WO-139: Socket closed while Thor was still thinking -> keeping mic open & reconnecting!")
+                    VikingPopupOverlayManager.enableFastReplyWatchPoll(
+                        this@FloatingThorService,
+                        "https://" + "thor-api-443941171993.us-east4.run.app",
+                        45_000L
+                    )
+                    mainHandler.postDelayed({
+                        if (sessionId == activeSession && !socketReady && !destroyed && !isStandby && !userRequestedStop) {
+                            openBridgeSocket(sessionId)
+                        }
+                    }, 650L)
+                } else if (endingSession || playbackQueue.isNotEmpty() || playbackBusy || remainingHardwareSpeechMs() > 0L) {
                     beginEndDrain(sessionId)
                 } else {
                     stopStreamingAudio()
@@ -1565,16 +1623,30 @@ class FloatingThorService : Service() {
                                 }
                             }, retryDelayMs)
                     } else {
-                        // Extended connection loss mid-session -> notify Boss via Raven Card & hand over cleanly
-                        val notifyDrop = userSpokeInActiveSession || socketDroppedDuringTurn
+                        // Extended connection loss mid-session -> notify Boss via Raven Card & fast-poll for pending resume when signal returns
+                        val wasWaitingReply = awaitingThorReply
+                        val notifyDrop = wasWaitingReply || userSpokeInActiveSession || socketDroppedDuringTurn
                         valleyReconnectAttempts = 0
+                        if (wasWaitingReply) {
+                            VikingPopupOverlayManager.enableFastReplyWatchPoll(
+                                this@FloatingThorService,
+                                "https://" + "thor-api-443941171993.us-east4.run.app",
+                                120_000L
+                            )
+                        }
                         if (notifyDrop) {
+                            val dropTitle = if (wasWaitingReply) "Thor Still Thinking — Signal Lost" else "Voice Line Interrupted"
+                            val dropBody = if (wasWaitingReply) {
+                                "Cell signal dropped before Thor finished answering. Thor saved your reply and will automatically re-open the mic & send a Raven as soon as signal returns."
+                            } else {
+                                "Cloud voice link dropped in weak coverage — switched to local standby. Tap Thor whenever you want to continue."
+                            }
                             mainHandler.post {
                                 VikingPopupOverlayManager.showRavenCard(
                                     context = this@FloatingThorService,
                                     serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
-                                    title = "Voice Line Interrupted",
-                                    message = "Cloud voice link dropped in weak coverage — switched to local standby. Tap Thor whenever you want to continue.",
+                                    title = dropTitle,
+                                    message = dropBody,
                                     linksJson = null
                                 )
                             }
@@ -1904,6 +1976,13 @@ class FloatingThorService : Service() {
                                     .toString()
                                 target!!.send(noiseMsg)
                             } catch (_: Exception) {}
+                            awaitingThorReply = true
+                            awaitingReplySinceMs = nowMs
+                            VikingPopupOverlayManager.enableFastReplyWatchPoll(
+                                this@FloatingThorService,
+                                "https://" + "thor-api-443941171993.us-east4.run.app",
+                                40_000L
+                            )
                             try { target!!.send("END_OF_TURN") } catch (_: Exception) {}
                             turnSpeechDetected = false
                             currentTurnPcm.reset()
@@ -2277,6 +2356,8 @@ class FloatingThorService : Service() {
             scheduleKeepAliveIfAllowed()
         }
         destroyed = true
+        canAutoResumeMic = false
+        awaitingThorReply = false
         isServiceRunning = false
         cancelOverlayNotificationCompletely()
         mainHandler.removeCallbacksAndMessages(null)
