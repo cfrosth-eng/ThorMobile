@@ -276,9 +276,9 @@ object VikingPopupOverlayManager {
     private class ShimmeringPedestalRunesDrawable(
         private val runesBitmap: Bitmap
     ) : Drawable() {
-        private val normRect = RectF(0.27969f, 0.59248f, 0.69219f, 0.92665f)
+        private val normRect = RectF(0.32031f, 0.61129f, 0.62813f, 0.89530f)
         private val basePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
-            alpha = 225
+            alpha = 248
         }
         private val shimmerMaskPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
             alpha = 255
@@ -378,12 +378,15 @@ object VikingPopupOverlayManager {
         private var geometryReady = false
 
         private val ringPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
-            alpha = 236
+            alpha = 245
         }
-        private val subtleRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-        }
-        private val rectWork = RectF()
+
+        var ringPulseAlpha: Float = 0.88f
+            set(value) {
+                field = value.coerceIn(0.45f, 1.0f)
+                ringPaint.alpha = (field * 255f).toInt().coerceIn(0, 255)
+                invalidate()
+            }
 
         var ringRotationDeg: Float = 0f
             set(value) {
@@ -511,7 +514,7 @@ object VikingPopupOverlayManager {
 
         private fun updateRotatedMeshVerts() {
             val phase = (ringRotationDeg / 360f) * segCount.toFloat()
-            val innerTuckPx = -dpStatic(context, 2).toFloat()
+            val innerTuckPx = -dpStatic(context, 1).toFloat() * 0.35f
             val outerSpanPx = padPx.toFloat() - innerTuckPx
 
             for (i in 0..segCount) {
@@ -552,15 +555,6 @@ object VikingPopupOverlayManager {
             }
 
             super.dispatchDraw(canvas)
-
-            val left = padPx.toFloat()
-            val top = padPx.toFloat()
-            val right = w - padPx.toFloat()
-            val bottom = h - padPx.toFloat()
-            rectWork.set(left, top, right, bottom)
-            subtleRimPaint.strokeWidth = dpStatic(context, 1).toFloat()
-            subtleRimPaint.color = Color.argb(175, 182, 134, 44)
-            canvas.drawRoundRect(rectWork, cornerPx, cornerPx, subtleRimPaint)
         }
     }
 
@@ -716,7 +710,7 @@ object VikingPopupOverlayManager {
         }
 
         if (livingRavenView == null) {
-            val auraPad = dp(ctx, 20)
+            val auraPad = dp(ctx, 24)
             val radiusPx = dp(ctx, 22).toFloat()
             val artW = dp(ctx, 136)
             val artH = dp(ctx, 170)
@@ -790,8 +784,8 @@ object VikingPopupOverlayManager {
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = 0
-                y = dp(ctx, 24)
+                x = -dp(ctx, 4)
+                y = dp(ctx, 20)
             }
 
             var downRawX = 0f
@@ -852,8 +846,8 @@ object VikingPopupOverlayManager {
         if (rv.parent == null) {
             if (lp != null) {
                 lp.gravity = Gravity.TOP or Gravity.START
-                lp.x = 0
-                lp.y = dp(ctx, 24)
+                lp.x = -dp(ctx, 4)
+                lp.y = dp(ctx, 20)
             }
             ravenBoltDrawable?.seedInitialSchedule(SystemClock.elapsedRealtime())
             rv.alpha = 0f
@@ -871,15 +865,19 @@ object VikingPopupOverlayManager {
         val loopStartMs = SystemClock.elapsedRealtime()
         val startRot = rv.ringRotationDeg
         ravenLoopAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 7000L
+            duration = 18200L
             repeatCount = ValueAnimator.INFINITE
             repeatMode = ValueAnimator.RESTART
             interpolator = LinearInterpolator()
             addUpdateListener {
                 val nowMs = SystemClock.elapsedRealtime()
                 val elapsedMs = (nowMs - loopStartMs).coerceAtLeast(0L)
-                rv.ringRotationDeg = startRot + ((elapsedMs % 7000L).toFloat() / 7000f) * 360f
-                ravenRunesShimmerDrawable?.shimmerPhase = (elapsedMs % 3800L).toFloat() / 3800f
+                // 18,200ms clockwise lap on 574dp card == exact 31.4 dp/s glide speed of 7,000ms on 220dp FloatingThorService icon!
+                rv.ringRotationDeg = startRot + ((elapsedMs % 18200L).toFloat() / 18200f) * 360f
+                // Light golden alpha pulse matching FloatingThorService (550ms half-cycle / 1100ms smooth sine breath: 0.56f .. 1.0f)
+                val pulseRad = ((elapsedMs % 1100L).toDouble() / 1100.0) * Math.PI * 2.0
+                rv.ringPulseAlpha = (0.78 + 0.22 * kotlin.math.sin(pulseRad)).toFloat()
+                ravenRunesShimmerDrawable?.shimmerPhase = (elapsedMs % 4200L).toFloat() / 4200f
                 ravenBoltDrawable?.tick(nowMs)
             }
             start()
