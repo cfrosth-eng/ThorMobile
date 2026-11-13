@@ -288,6 +288,9 @@ class FloatingThorService : Service() {
     private val flushGeneration = AtomicInteger(0)
     @Volatile private var lastFailoverTurnId: String = ""
     @Volatile private var lastFailoverSmsAtMs: Long = 0L
+    @Volatile private var userSpokeInActiveSession: Boolean = false
+    @Volatile private var lastPcmChunkArrivalMs: Long = 0L
+    @Volatile private var cellularJitterEwmaMs: Double = 25.0
 
     @Volatile private var isPlayingAudio = false
     @Volatile private var playbackBusy = false
@@ -1132,6 +1135,8 @@ class FloatingThorService : Service() {
                 offlineModeActive = false
                 valleyReconnectAttempts = 0
             turnSpeechDetected = false
+            userSpokeInActiveSession = false
+            lastPcmChunkArrivalMs = 0L
             socketDroppedDuringTurn = false
             waitingForCloudBurst = false
             currentTurnPcm.reset()
@@ -1336,6 +1341,30 @@ class FloatingThorService : Service() {
 
             try {
                 val json = org.json.JSONObject(text)
+                if (json.optString("action") == "thinking_heartbeat") {
+                    valleyReconnectAttempts = 0
+                    lastPlaybackTime = SystemClock.elapsedRealtime()
+                    mainHandler.post {
+                        if (!destroyed && !isStandby && activeSession != 0 && boltAnimator?.isRunning != true) {
+                            fireArtworkLightningCascade(durationMs = 360L)
+                        }
+                    }
+                    return
+                }
+                if (json.optString("action") == "rearm_mic") {
+                    synchronized(lock) {
+                        if (sessionId == activeSession) {
+                            endingSession = false
+                            waitingForCloudBurst = false
+                        }
+                    }
+                    if (activeSession == 0 && !destroyed && !isStandby && hasMicPermission()) {
+                        startSession(keepPreRoll = true)
+                    } else {
+                        applyVisualState()
+                    }
+                    return
+                }
                 if (json.optString("action") == "request_sms_sync") {
                         try {
                             ws.send(org.json.JSONObject().put("type", "sms_sync").put("messages", readRecentGoogleMessagesJson()).toString())
@@ -1469,8 +1498,22 @@ class FloatingThorService : Service() {
 
         override fun onMessage(ws: WebSocket, bytes: ByteString) {
             if (sessionId != activeSession) return
-            if (bytes == FLUSH_MARKER) flushPlayback()
-            else playbackQueue.add(PcmChunk(flushGeneration.get(), bytes.toByteArray()))
+            if (bytes == FLUSH_MARKER) {
+                lastPcmChunkArrivalMs = 0L
+                flushPlayback()
+            } else {
+                val nowArr = SystemClock.elapsedRealtime()
+                val prevArr = lastPcmChunkArrivalMs
+                lastPcmChunkArrivalMs = nowArr
+                if (prevArr > 0L) {
+                    val gapMs = nowArr - prevArr
+                    if (gapMs in 15L..950L) {
+                        val dev = kotlin.math.abs(gapMs.toDouble() - 260.0)
+                        cellularJitterEwmaMs = (0.78 * cellularJitterEwmaMs + 0.22 * dev).coerceIn(15.0, 260.0)
+                    }
+                }
+                playbackQueue.add(PcmChunk(flushGeneration.get(), bytes.toByteArray()))
+            }
         }
         override fun onClosing(ws: WebSocket, code: Int, reason: String) {
             try { ws.close(1000, null) } catch (_: Exception) {}
@@ -1521,11 +1564,23 @@ class FloatingThorService : Service() {
                                     openBridgeSocket(sessionId)
                                 }
                             }, retryDelayMs)
-                        } else {
-                            // True extended dead zone (>14s with zero tower reach) -> seamlessly hand preRoll to Gemma 4 E2B Local Brain
-                            valleyReconnectAttempts = 0
-                            enterOfflineLocalSession(sessionId)
+                    } else {
+                        // Extended connection loss mid-session -> notify Boss via Raven Card & hand over cleanly
+                        val notifyDrop = userSpokeInActiveSession || socketDroppedDuringTurn
+                        valleyReconnectAttempts = 0
+                        if (notifyDrop) {
+                            mainHandler.post {
+                                VikingPopupOverlayManager.showRavenCard(
+                                    context = this@FloatingThorService,
+                                    serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
+                                    title = "Voice Line Interrupted",
+                                    message = "Cloud voice link dropped in weak coverage — switched to local standby. Tap Thor whenever you want to continue.",
+                                    linksJson = null
+                                )
+                            }
                         }
+                        enterOfflineLocalSession(sessionId)
+                    }
                     }
             }
     }
@@ -1822,6 +1877,7 @@ class FloatingThorService : Service() {
                     if (!inPlaybackWindow && vocalRms >= dynSpeechThresh) {
                         if (!turnSpeechDetected) {
                             turnSpeechDetected = true
+                            userSpokeInActiveSession = true
                             currentTurnPcm.reset()
                         }
                         turnLastVoiceMs = nowMs
@@ -1835,9 +1891,9 @@ class FloatingThorService : Service() {
                     }
                     val turnBytes = currentTurnPcm.size()
                     val requiredSilenceMs = when {
-                        turnBytes < 22400 -> 1050L
-                        turnBytes <= 96000 -> 1650L
-                        else -> 1650L
+                        turnBytes < 22400 -> 1350L
+                        turnBytes <= 96000 -> 1700L
+                        else -> 1700L
                     }
                     if (turnSpeechDetected && (nowMs - turnLastVoiceMs) >= requiredSilenceMs && turnBytes >= 9600) {
                         if (target != null && !socketDroppedDuringTurn) {
@@ -1958,7 +2014,13 @@ class FloatingThorService : Service() {
                 Log.w(TAG_AUDIO, "Microphone preempted. Entering Auto-Standby.")
                 mainHandler.post {
                     if (!isStandby) toggleStandby()
-                    toast("Thor yielded microphone to Android.")
+                    VikingPopupOverlayManager.showRavenCard(
+                        context = this@FloatingThorService,
+                        serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
+                        title = "Microphone Paused",
+                        message = "Android temporarily claimed the microphone. Double-tap the red Thor ring to wake the mic back up.",
+                        linksJson = null
+                    )
                 }
             }
         }
@@ -2060,11 +2122,17 @@ class FloatingThorService : Service() {
                     }
 
                     if (awaitingUtterancePrebuffer && remainingHardwareSpeechMs() <= 0L) {
+                        val adaptiveWaitMs = (125L + (cellularJitterEwmaMs * 0.65).toLong()).coerceIn(125L, 245L)
                         val waitStart = SystemClock.elapsedRealtime()
-                        while (playbackQueue.isEmpty() && chunk.data.size < 19200 &&
-                            (SystemClock.elapsedRealtime() - waitStart) < 95L &&
+                        while ((SystemClock.elapsedRealtime() - waitStart) < adaptiveWaitMs &&
                             chunk.generation == flushGeneration.get()
                         ) {
+                            var bufferedBytes = chunk.data.size
+                            for (qChunk in playbackQueue) {
+                                bufferedBytes += qChunk.data.size
+                                if (bufferedBytes >= 23040) break
+                            }
+                            if (bufferedBytes >= 23040) break
                             Thread.sleep(12L)
                         }
                         awaitingUtterancePrebuffer = false
