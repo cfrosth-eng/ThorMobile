@@ -40,6 +40,8 @@ class RavenHeraldService : Service() {
         }
     }
 
+    private var networkSentinel: NetworkSentinel? = null
+
     override fun onCreate() {
         super.onCreate()
         createSilentChannel()
@@ -59,7 +61,22 @@ class RavenHeraldService : Service() {
             try { startForeground(RAVEN_NOTIFICATION_ID, notif) } catch (_: Exception) {}
         }
         VikingPopupOverlayManager.start(this, SERVER_URL)
-        Log.i(TAG, "Silent Raven Herald active (0% mic, Ravens reachable in Standby & Long-Press Off).")
+        val ns = NetworkSentinel(this)
+        ns.onConnectionRestored = {
+            RavenCenterActivity.flushOfflineQueueInBackground(this@RavenHeraldService)
+        }
+        ns.startMonitoring()
+        networkSentinel = ns
+        if (ns.isConnected) {
+            RavenCenterActivity.flushOfflineQueueInBackground(this)
+        }
+        Log.i(TAG, "Silent Raven Herald active (0% mic, Ravens + Offline Outbox Auto-Flush active 24/7).")
+    }
+
+    override fun onDestroy() {
+        try { networkSentinel?.stopMonitoring() } catch (_: Exception) {}
+        networkSentinel = null
+        super.onDestroy()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

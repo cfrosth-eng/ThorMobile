@@ -12,6 +12,9 @@ import android.graphics.drawable.GradientDrawable
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
 import android.text.TextUtils
@@ -163,6 +166,144 @@ class RavenCenterActivity : AppCompatActivity() {
                 ref.get()
             } catch (_: Exception) {
                 null
+            }
+        }
+
+        private val flushLock = Any()
+
+        fun encodeAttachmentBase64Static(context: Context, uri: Uri, mime: String): Pair<String, String> {
+            val cr = context.applicationContext.contentResolver
+            if (mime.startsWith("image/")) {
+                try {
+                    val rawBytes = cr.openInputStream(uri)?.use { it.readBytes() } ?: return Pair("", mime)
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, opts)
+                    val maxDim = maxOf(opts.outWidth, opts.outHeight)
+                    if (maxDim > 1800) {
+                        var sample = 1
+                        while ((maxDim / sample) > 1800) sample *= 2
+                        val decOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+                        val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decOpts)
+                        if (bmp != null) {
+                            val bos = ByteArrayOutputStream()
+                            bmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
+                            return Pair(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP), "image/jpeg")
+                        }
+                    }
+                    return Pair(Base64.encodeToString(rawBytes, Base64.NO_WRAP), mime)
+                } catch (_: Exception) {}
+            }
+            val maxBytes = 18 * 1024 * 1024
+            val bytes = cr.openInputStream(uri)?.use { input ->
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(16384)
+                var total = 0
+                while (true) {
+                    val r = input.read(buf)
+                    if (r <= 0) break
+                    if (total + r > maxBytes) break
+                    out.write(buf, 0, r)
+                    total += r
+                }
+                out.toByteArray()
+            } ?: ByteArray(0)
+            return Pair(Base64.encodeToString(bytes, Base64.NO_WRAP), mime)
+        }
+
+        fun jsonToEntityStatic(o: JSONObject): RavenMessageEntity {
+            val folder = if (o.optString("folder", "RECEIVED").equals("SENT", true)) "SENT" else "RECEIVED"
+            val linksArr = o.optJSONArray("links") ?: JSONArray()
+            return RavenMessageEntity(
+                msgId = o.optString("msg_id", "RAVEN_${System.currentTimeMillis()}"),
+                folder = folder,
+                sender = o.optString("sender", if (folder == "SENT") "Boss" else "Thor"),
+                title = o.optString("title", "Raven Message"),
+                body = o.optString("body", ""),
+                linksJson = linksArr.toString(),
+                attachmentUri = "",
+                attachmentName = o.optString("attachment_name", ""),
+                attachmentMime = o.optString("attachment_mime", ""),
+                stagedMediaId = o.optString("staged_media_id", ""),
+                stagedExpiresUnix = o.optLong("staged_expires_unix", 0L),
+                timestampMs = o.optLong("timestamp_ms", System.currentTimeMillis()),
+                timestampEt = o.optString("timestamp_et", formatEtNow()),
+                isRead = (folder == "SENT"),
+                syncStatus = "SYNCED"
+            )
+        }
+
+        fun flushPendingOfflineSync(context: Context, showOverlayOnReply: Boolean): Int {
+            val app = context.applicationContext
+            synchronized(flushLock) {
+                val dao = ThorDatabase.getDatabase(app).ravenMessageDao()
+                val pending = try { dao.getPendingOfflineMessages() } catch (_: Exception) { emptyList() }
+                if (pending.isEmpty()) return 0
+                Log.i("RavenCenterFlush", "WO-152: Flushing ${pending.size} QUEUED_OFFLINE Raven message(s) on signal restore...")
+                var flushed = 0
+                for (pm in pending) {
+                    try {
+                        var b64 = ""
+                        var mime = pm.attachmentMime
+                        if (pm.attachmentUri.isNotEmpty()) {
+                            try {
+                                val enc = encodeAttachmentBase64Static(app, Uri.parse(pm.attachmentUri), pm.attachmentMime)
+                                b64 = enc.first
+                                mime = enc.second
+                            } catch (_: Exception) {}
+                        }
+                        val req = JSONObject()
+                            .put("action", "raven_center")
+                            .put("sub_action", "send")
+                            .put("client_msg_id", pm.msgId)
+                            .put("title", pm.title)
+                            .put("message", pm.body)
+                            .put("attachment_b64", b64)
+                            .put("attachment_mime", mime)
+                            .put("attachment_name", pm.attachmentName)
+                        val r = sendLedgerWsRpcSync(req, 65L)
+                        if (r != null && r.optString("status") == "ok") {
+                            val sentObj = r.optJSONObject("sent_entry")
+                            dao.upsert(
+                                pm.copy(
+                                    stagedMediaId = sentObj?.optString("staged_media_id", pm.stagedMediaId) ?: pm.stagedMediaId,
+                                    stagedExpiresUnix = sentObj?.optLong("staged_expires_unix", pm.stagedExpiresUnix) ?: pm.stagedExpiresUnix,
+                                    syncStatus = "SYNCED"
+                                )
+                            )
+                            val recvObj = r.optJSONObject("received_entry")
+                            if (recvObj != null) {
+                                val recvEnt = jsonToEntityStatic(recvObj)
+                                dao.upsert(recvEnt)
+                                if (showOverlayOnReply) {
+                                    val linksArr = try { JSONArray(recvEnt.linksJson) } catch (_: Exception) { null }
+                                    Handler(Looper.getMainLooper()).post {
+                                        VikingPopupOverlayManager.showRavenCard(
+                                            context = app,
+                                            serverBaseUrl = CLOUD_URL,
+                                            title = recvEnt.title,
+                                            message = recvEnt.body,
+                                            linksJson = linksArr,
+                                            eventKeyOverride = recvEnt.msgId
+                                        )
+                                    }
+                                }
+                            }
+                            flushed++
+                        }
+                    } catch (e: Exception) {
+                        Log.w("RavenCenterFlush", "Deferred offline Raven ${pm.msgId}: ${e.message}")
+                    }
+                }
+                return flushed
+            }
+        }
+
+        fun flushOfflineQueueInBackground(context: Context) {
+            val app = context.applicationContext
+            bgIo.execute {
+                try {
+                    flushPendingOfflineSync(app, showOverlayOnReply = true)
+                } catch (_: Exception) {}
             }
         }
     }
@@ -519,43 +660,8 @@ class RavenCenterActivity : AppCompatActivity() {
         attachmentChipTv.visibility = View.GONE
     }
 
-    private fun encodeAttachmentBase64(uri: Uri, mime: String): Pair<String, String> {
-        if (mime.startsWith("image/")) {
-            try {
-                val rawBytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return Pair("", mime)
-                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, opts)
-                val maxDim = maxOf(opts.outWidth, opts.outHeight)
-                if (maxDim > 1800) {
-                    var sample = 1
-                    while ((maxDim / sample) > 1800) sample *= 2
-                    val decOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-                    val bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decOpts)
-                    if (bmp != null) {
-                        val bos = ByteArrayOutputStream()
-                        bmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
-                        return Pair(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP), "image/jpeg")
-                    }
-                }
-                return Pair(Base64.encodeToString(rawBytes, Base64.NO_WRAP), mime)
-            } catch (_: Exception) {}
-        }
-        val maxBytes = 18 * 1024 * 1024
-        val bytes = contentResolver.openInputStream(uri)?.use { input ->
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(16384)
-            var total = 0
-            while (true) {
-                val r = input.read(buf)
-                if (r <= 0) break
-                if (total + r > maxBytes) break
-                out.write(buf, 0, r)
-                total += r
-            }
-            out.toByteArray()
-        } ?: ByteArray(0)
-        return Pair(Base64.encodeToString(bytes, Base64.NO_WRAP), mime)
-    }
+    private fun encodeAttachmentBase64(uri: Uri, mime: String): Pair<String, String> =
+        encodeAttachmentBase64Static(applicationContext, uri, mime)
 
     private fun dispatchComposedMessage() {
         val subjRaw = composeSubjectInput.text?.toString()?.trim() ?: ""
@@ -659,58 +765,12 @@ class RavenCenterActivity : AppCompatActivity() {
         }
     }
 
-    private fun jsonToEntity(o: JSONObject): RavenMessageEntity {
-        val folder = if (o.optString("folder", "RECEIVED").equals("SENT", true)) "SENT" else "RECEIVED"
-        val linksArr = o.optJSONArray("links") ?: JSONArray()
-        return RavenMessageEntity(
-            msgId = o.optString("msg_id", "RAVEN_${System.currentTimeMillis()}"),
-            folder = folder,
-            sender = o.optString("sender", if (folder == "SENT") "Boss" else "Thor"),
-            title = o.optString("title", "Raven Message"),
-            body = o.optString("body", ""),
-            linksJson = linksArr.toString(),
-            attachmentUri = "",
-            attachmentName = o.optString("attachment_name", ""),
-            attachmentMime = o.optString("attachment_mime", ""),
-            stagedMediaId = o.optString("staged_media_id", ""),
-            stagedExpiresUnix = o.optLong("staged_expires_unix", 0L),
-            timestampMs = o.optLong("timestamp_ms", System.currentTimeMillis()),
-            timestampEt = o.optString("timestamp_et", formatEtNow()),
-            isRead = (folder == "SENT"),
-            syncStatus = "SYNCED"
-        )
-    }
+    private fun jsonToEntity(o: JSONObject): RavenMessageEntity = jsonToEntityStatic(o)
 
     private fun syncWithCloudAndFlushOfflineQueue(showToast: Boolean) {
         bgIo.execute {
+            flushPendingOfflineSync(applicationContext, showOverlayOnReply = false)
             val dao = ThorDatabase.getDatabase(applicationContext).ravenMessageDao()
-            val pending = dao.getPendingOfflineMessages()
-            for (pm in pending) {
-                var b64 = ""
-                var mime = pm.attachmentMime
-                if (pm.attachmentUri.isNotEmpty()) {
-                    try {
-                        val enc = encodeAttachmentBase64(Uri.parse(pm.attachmentUri), pm.attachmentMime)
-                        b64 = enc.first
-                        mime = enc.second
-                    } catch (_: Exception) {}
-                }
-                val req = JSONObject()
-                    .put("action", "raven_center")
-                    .put("sub_action", "send")
-                    .put("client_msg_id", pm.msgId)
-                    .put("title", pm.title)
-                    .put("message", pm.body)
-                    .put("attachment_b64", b64)
-                    .put("attachment_mime", mime)
-                    .put("attachment_name", pm.attachmentName)
-                val r = sendLedgerWsRpcSync(req, 55L)
-                if (r != null && r.optString("status") == "ok") {
-                    dao.updateSyncStatus(pm.msgId, "SYNCED")
-                    r.optJSONObject("received_entry")?.let { dao.upsert(jsonToEntity(it)) }
-                }
-            }
-
             val syncResp = sendLedgerWsRpcSync(
                 JSONObject().put("action", "raven_center").put("sub_action", "sync"),
                 15L

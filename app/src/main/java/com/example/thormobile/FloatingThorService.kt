@@ -382,8 +382,12 @@ class FloatingThorService : Service() {
                     }
                 }
             }
+            RavenCenterActivity.flushOfflineQueueInBackground(this@FloatingThorService)
         }
         networkSentinel.startMonitoring()
+        if (networkSentinel.isConnected) {
+            RavenCenterActivity.flushOfflineQueueInBackground(this)
+        }
 
         createNotificationChannel()
         try {
