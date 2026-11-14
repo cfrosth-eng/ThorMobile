@@ -27,6 +27,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -39,6 +40,7 @@ import android.widget.ImageView
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -47,14 +49,16 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 object LivingPedestalDirector {
-    private const val TAG = "LivingPedestalWO161"
+    private const val TAG = "LivingPedestalV3"
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Sampled directly from raven_gold_ring_strip.png for 100% identical metallic Norse champagne-gold!
-    private val GOLD_DARK = 0xFF7E570A.toInt()
-    private val GOLD_MID  = 0xFFCA992F.toInt()
-    private val GOLD_HI   = 0xFFFDE766.toInt()
-    private val GOLD_SPEC = 0xFFFEFBA9.toInt()
+    // Exact rich burnished 24k histogram sampled from raven_gold_ring_strip.png (zero pale lemon tint!)
+    private const val GOLD_SHADOW = 0xFF3A2203.toInt()
+    private const val GOLD_BRONZE = 0xFF5A3907.toInt()
+    private const val GOLD_RICH   = 0xFF966B12.toInt()
+    private const val GOLD_WARM   = 0xFFD4A234.toInt()
+    private const val GOLD_GLINT  = 0xFFFEF08A.toInt()
+    private const val GOLD_HOT    = 0xFFFFFBEB.toInt()
 
     @Volatile var hasUnreadRaven: Boolean = false
         private set
@@ -64,6 +68,9 @@ object LivingPedestalDirector {
         private set
     @Volatile var flightInProgress: Boolean = false
         private set
+
+    // Shared live 6:00 meniscus swell & recoil factor so the ring funnel & falling droplets move as ONE liquid!
+    @Volatile var liveConfluenceSwell: Float = 0f
 
     @Volatile private var attachedCrestView: LivingPedestalCrestView? = null
     private var flightWindowManager: WindowManager? = null
@@ -78,8 +85,7 @@ object LivingPedestalDirector {
     private var mjolnirSwapCoreBmp: Bitmap? = null
     private var mjolnirSwapHaloBmp: Bitmap? = null
     private var ravenBaseBmp: Bitmap? = null
-    private var ravenTurnBmp: Bitmap? = null
-    private var ravenBlinkBmp: Bitmap? = null
+    private var ravenEyeBlinkPatchBmp: Bitmap? = null
     private var ringStripBmp: Bitmap? = null
     private var runesGoldBmp: Bitmap? = null
     private val boltCores = arrayOfNulls<Bitmap>(4)
@@ -90,6 +96,46 @@ object LivingPedestalDirector {
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, ctx.resources.displayMetrics)
 
     fun dpInt(ctx: Context, v: Int): Int = dp(ctx, v.toFloat()).toInt()
+
+    fun getPhysicalGlassSize(ctx: Context): Pair<Int, Int> {
+        val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = wm.currentWindowMetrics.bounds
+            Pair(b.width(), b.height())
+        } else {
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(dm)
+            Pair(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    private fun buildFullGlassOverlayParams(ctx: Context): WindowManager.LayoutParams {
+        val (realW, realH) = getPhysicalGlassSize(ctx)
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        return WindowManager.LayoutParams(
+            realW, realH, type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+    }
 
     private fun decodeRaw(ctx: Context, resId: Int): Bitmap? = try {
         val opts = BitmapFactory.Options().apply {
@@ -105,13 +151,12 @@ object LivingPedestalDirector {
     @Synchronized
     fun ensureAssetsLoaded(ctx: Context) {
         val app = ctx.applicationContext
-        if (mjolnirBaseBmp != null && ravenBaseBmp != null && flyFrames[0] != null && ringStripBmp != null) return
+        if (mjolnirBaseBmp != null && ravenBaseBmp != null && ravenEyeBlinkPatchBmp != null && flyFrames[0] != null) return
         mjolnirBaseBmp = decodeRaw(app, R.drawable.mjolnir_pedestal_base_hd)
         mjolnirSwapCoreBmp = decodeRaw(app, R.drawable.mjolnir_swap_bolt_core)
         mjolnirSwapHaloBmp = decodeRaw(app, R.drawable.mjolnir_swap_bolt_halo)
         ravenBaseBmp = decodeRaw(app, R.drawable.raven_storm_base_hd)
-        ravenTurnBmp = decodeRaw(app, R.drawable.raven_perch_pose_turn) ?: ravenBaseBmp
-        ravenBlinkBmp = decodeRaw(app, R.drawable.raven_perch_pose_blink) ?: ravenBaseBmp
+        ravenEyeBlinkPatchBmp = decodeRaw(app, R.drawable.raven_eye_blink_patch)
         ringStripBmp = decodeRaw(app, R.drawable.raven_gold_ring_strip)
         runesGoldBmp = decodeRaw(app, R.drawable.raven_runes_gold_hd)
 
@@ -155,19 +200,17 @@ object LivingPedestalDirector {
         moltenStreamOverlay?.let { if (it.parent != null) return it }
         val wm = flightWindowManager ?: (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).also { flightWindowManager = it }
         val view = MoltenGoldScreenStreamView(app)
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
-        return try { wm.addView(view, lp); moltenStreamOverlay = view; view } catch (_: Exception) { null }
+        return try {
+            wm.addView(view, buildFullGlassOverlayParams(app))
+            moltenStreamOverlay = view
+            view
+        } catch (_: Exception) { null }
     }
 
     private fun detachMoltenStreamOverlay() {
         val v = moltenStreamOverlay
         moltenStreamOverlay = null
+        liveConfluenceSwell = 0f
         if (v != null && v.parent != null) {
             try { flightWindowManager?.removeView(v) } catch (_: Exception) {}
         }
@@ -199,16 +242,19 @@ object LivingPedestalDirector {
                 return@post
             }
 
-            // Ensure Mjolnir holds the pedestal during incoming approach until touchdown!
             crest.setOccupantImmediate(showRaven = false)
-            launchBezierFlight(
+            launchSplineFlight(
                 app = app,
                 mode = FlightMode.ARRIVAL,
                 onLiftoffImmediate = null,
+                onPreLandingLightningMask = {
+                    // Dissolve Mjolnir in electric lightning BEFORE flying Raven overlaps pedestal (0 hammer-through-chest!)
+                    crest.hideMjolnirForIncomingLanding()
+                    crest.triggerElectricStrikeBurst(440L)
+                },
                 onTouchdownExact = {
                     ravenCurrentlyPerched = true
                     crest.setOccupantImmediate(showRaven = true)
-                    crest.triggerElectricStrikeBurst(440L)
                 },
                 onComplete = {
                     if (hasUnreadRaven && !ravenCardUnfoldedNow) scheduleNextPatrolFlight(app)
@@ -263,15 +309,15 @@ object LivingPedestalDirector {
                 return@post
             }
 
-            launchBezierFlight(
+            launchSplineFlight(
                 app = app,
                 mode = FlightMode.DEPARTURE,
                 onLiftoffImmediate = {
-                    // Atomic t=0ms liftoff swap: Raven leaves stone immediately & Mjolnir reforms in electric lightning!
                     ravenCurrentlyPerched = false
                     crest.setOccupantImmediate(showRaven = false)
                     crest.triggerElectricStrikeBurst(480L)
                 },
+                onPreLandingLightningMask = null,
                 onTouchdownExact = null,
                 onComplete = { crest.refreshDripActivity(false) }
             )
@@ -286,23 +332,27 @@ object LivingPedestalDirector {
     private fun scheduleNextPatrolFlight(app: Context) {
         cancelPatrolSchedule()
         if (!hasUnreadRaven || ravenCardUnfoldedNow) return
-        val delayMs = Random.nextLong(13_500L, 22_000L)
+        val delayMs = Random.nextLong(14_000L, 23_000L)
         val r = Runnable {
             if (!hasUnreadRaven || ravenCardUnfoldedNow || flightInProgress || attachedCrestView == null) return@Runnable
-            launchBezierFlight(
+            launchSplineFlight(
                 app = app,
                 mode = FlightMode.PATROL,
                 onLiftoffImmediate = {
-                    // Atomic t=0ms liftoff: ZERO chance of Raven remaining on pedestal while airborne!
                     ravenCurrentlyPerched = false
                     attachedCrestView?.setOccupantImmediate(showRaven = false)
-                    attachedCrestView?.triggerElectricStrikeBurst(440L)
+                    attachedCrestView?.triggerElectricStrikeBurst(420L)
+                },
+                onPreLandingLightningMask = {
+                    if (hasUnreadRaven) {
+                        attachedCrestView?.hideMjolnirForIncomingLanding()
+                        attachedCrestView?.triggerElectricStrikeBurst(440L)
+                    }
                 },
                 onTouchdownExact = {
                     if (hasUnreadRaven) {
                         ravenCurrentlyPerched = true
                         attachedCrestView?.setOccupantImmediate(showRaven = true)
-                        attachedCrestView?.triggerElectricStrikeBurst(420L)
                     }
                 },
                 onComplete = {
@@ -315,111 +365,122 @@ object LivingPedestalDirector {
     }
 
     private enum class FlightMode { ARRIVAL, PATROL, DEPARTURE }
-    private data class BezierLeg(val p0: PointF, val p1: PointF, val p2: PointF, val p3: PointF, val isLandingFlare: Boolean = false)
 
-    /**
-     * Returns exact perch coordinates in `targetView` local canvas space (0.0px status-bar/cutout offset!).
-     */
     private fun getPerchInOverlayCoords(app: Context, targetView: View?): PointF {
         val crest = attachedCrestView
         if (crest != null && crest.isAttachedToWindow) {
-            val cLoc = IntArray(2)
-            crest.getLocationOnScreen(cLoc)
-            val oLoc = IntArray(2)
-            if (targetView != null && targetView.isAttachedToWindow) targetView.getLocationOnScreen(oLoc)
+            val cLoc = IntArray(2); crest.getLocationOnScreen(cLoc)
+            val oLoc = IntArray(2); if (targetView != null && targetView.isAttachedToWindow) targetView.getLocationOnScreen(oLoc)
             val px = (cLoc[0] - oLoc[0]) + crest.padSide + crest.cardW * 0.50f
-            val py = (cLoc[1] - oLoc[1]) + crest.padTop + crest.cardH * 0.36f
+            val py = (cLoc[1] - oLoc[1]) + crest.padTop + crest.cardH * 0.35f
             return PointF(px, py)
         }
         return PointF(dp(app, 74f), dp(app, 86f))
     }
 
     /**
-     * Builds physically logical bird flight paths:
-     * - Perched Raven ALWAYS faces RIGHT (+X).
-     * - Every Takeoff launches UP-AND-RIGHT (vx > 0, vy < 0) so the Raven springs forward in the exact direction it faces!
-     * - Every Final Landing Leg approaches from UPPER-LEFT moving LEFT-TO-RIGHT (vx > 0, vy > 0) into an aerodynamic
-     *   braking flare right onto the stone top—so the Raven NEVER flips 180 degrees and NEVER flies up from underneath!
+     * Evaluates a C1-continuous Catmull-Rom spline across `pts` (with phantom endpoints at index 0 & size-1).
+     * Guarantees 100% smooth position AND tangent velocity across the entire flight without mid-air kinks!
      */
-    private fun buildLogicalFlightLegs(app: Context, mode: FlightMode, perch: PointF): Pair<List<BezierLeg>, Long> {
-        val dm = app.resources.displayMetrics
-        val sw = dm.widthPixels.toFloat()
-        val sh = dm.heightPixels.toFloat()
+    private fun evalCatmullRom(pts: List<PointF>, uNorm: Float, outPos: PointF, outVel: PointF) {
+        val segCount = (pts.size - 3).coerceAtLeast(1)
+        val scaled = uNorm.coerceIn(0f, 0.9999f) * segCount
+        val seg = scaled.toInt().coerceIn(0, segCount - 1)
+        val t = scaled - seg
 
-        // Left-to-right final approach entry point (sweeps in from upper-left off-screen bezel if pedestal is on left, or upper-left of pedestal if dragged right)
-        val approachStart = PointF(perch.x - dp(app, 145f), max(-dp(app, 35f), perch.y - dp(app, 68f)))
-        val approachC1    = PointF(perch.x - dp(app, 92f), max(dp(app, 4f), perch.y - dp(app, 46f)))
-        val approachC2    = PointF(perch.x - dp(app, 38f), perch.y - dp(app, 14f))
+        val p0 = pts[seg]
+        val p1 = pts[seg + 1]
+        val p2 = pts[seg + 2]
+        val p3 = pts[seg + 3]
+
+        val t2 = t * t
+        val t3 = t2 * t
+        outPos.x = 0.5f * ((2f * p1.x) + (-p0.x + p2.x) * t + (2f * p0.x - 5f * p1.x + 4f * p2.x - p3.x) * t2 + (-p0.x + 3f * p1.x - 3f * p2.x + p3.x) * t3)
+        outPos.y = 0.5f * ((2f * p1.y) + (-p0.y + p2.y) * t + (2f * p0.y - 5f * p1.y + 4f * p2.y - p3.y) * t2 + (-p0.y + 3f * p1.y - 3f * p2.y + p3.y) * t3)
+
+        outVel.x = 0.5f * ((-p0.x + p2.x) + (4f * p0.x - 10f * p1.x + 8f * p2.x - 2f * p3.x) * t + (-3f * p0.x + 9f * p1.x - 9f * p2.x + 3f * p3.x) * t2)
+        outVel.y = 0.5f * ((-p0.y + p2.y) + (4f * p0.y - 10f * p1.y + 8f * p2.y - 2f * p3.y) * t + (-3f * p0.y + 9f * p1.y - 9f * p2.y + 3f * p3.y) * t2)
+    }
+
+    private fun buildSmoothSplineWaypoints(app: Context, mode: FlightMode, perch: PointF): Pair<List<PointF>, Long> {
+        val (swInt, shInt) = getPhysicalGlassSize(app)
+        val sw = swInt.toFloat()
+        val sh = shInt.toFloat()
 
         return when (mode) {
             FlightMode.ARRIVAL -> {
-                // Sweeps across upper sky, banks off left edge, and flares Left-to-Right onto the stone!
-                Pair(listOf(BezierLeg(approachStart, approachC1, approachC2, perch, isLandingFlare = true)), 1280L)
+                // Swoops in from upper-right sky, banks gracefully on the left side of screen, and flares Left-to-Right onto the stone!
+                val pStart = PointF(sw + dp(app, 70f), sh * 0.14f)
+                val w1 = PointF(sw * 0.62f, sh * 0.24f)
+                val w2 = PointF(sw * 0.16f, max(perch.y + dp(app, 95f), sh * 0.22f))
+                val w3 = PointF(max(dp(app, 18f), perch.x - dp(app, 55f)), max(dp(app, 42f), perch.y - dp(app, 28f)))
+                val phantom0 = PointF(sw + dp(app, 220f), sh * 0.08f)
+                val phantomEnd = PointF(perch.x + dp(app, 95f), perch.y)
+                Pair(listOf(phantom0, pStart, w1, w2, w3, perch, phantomEnd), 2050L)
             }
             FlightMode.DEPARTURE -> {
-                val exitPt = PointF(sw + dp(app, 120f), max(dp(app, 30f), perch.y - dp(app, 60f)))
-                val c1 = PointF(perch.x + dp(app, 115f), perch.y - dp(app, 72f))
-                val c2 = PointF(sw * 0.70f, sh * 0.24f)
-                Pair(listOf(BezierLeg(perch, c1, c2, exitPt)), 1280L)
+                val w1 = PointF(perch.x + dp(app, 125f), max(dp(app, 36f), perch.y - dp(app, 42f)))
+                val w2 = PointF(sw * 0.64f, sh * 0.19f)
+                val pEnd = PointF(sw + dp(app, 110f), sh * 0.11f)
+                val phantom0 = PointF(perch.x - dp(app, 95f), perch.y + dp(app, 18f))
+                val phantomEnd = PointF(sw + dp(app, 260f), sh * 0.05f)
+                Pair(listOf(phantom0, perch, w1, w2, pEnd, phantomEnd), 1380L)
             }
             FlightMode.PATROL -> {
+                // 3 varied, 100% ON-SCREEN figure-8 / soaring recon loops (never vanishes off-screen, always lands Left-to-Right!)
+                val phantom0 = PointF(perch.x - dp(app, 110f), perch.y + dp(app, 28f))
+                val phantomEnd = PointF(perch.x + dp(app, 110f), perch.y)
+                val preFlare = PointF(max(dp(app, 16f), perch.x - dp(app, 52f)), max(dp(app, 40f), perch.y - dp(app, 24f)))
                 when (Random.nextInt(3)) {
-                    0 -> {
-                        // Patrol A: Launches forward-right across screen, exits right bezel, wraps in from upper-left bezel Left-to-Right!
-                        val exitR = PointF(sw + dp(app, 105f), sh * 0.30f)
-                        val legOut = BezierLeg(
-                            perch,
-                            PointF(perch.x + dp(app, 115f), perch.y - dp(app, 58f)),
-                            PointF(sw * 0.68f, sh * 0.16f),
-                            exitR
-                        )
-                        val legIn = BezierLeg(approachStart, approachC1, approachC2, perch, isLandingFlare = true)
-                        Pair(listOf(legOut, legIn), 3150L)
-                    }
-                    1 -> {
-                        // Patrol B: Soars forward-right down to mid-screen, banks high across top-left off bezel, then flares Left-to-Right!
-                        val midR = PointF(sw * 0.80f, sh * 0.46f)
-                        val leg1 = BezierLeg(
-                            perch,
-                            PointF(perch.x + dp(app, 120f), perch.y - dp(app, 45f)),
-                            PointF(sw * 0.88f, sh * 0.18f),
-                            midR
-                        )
-                        val leg2 = BezierLeg(
-                            midR,
-                            PointF(sw * 0.45f, sh * 0.64f),
-                            PointF(perch.x - dp(app, 185f), perch.y + dp(app, 55f)),
-                            approachStart
-                        )
-                        val leg3 = BezierLeg(approachStart, approachC1, approachC2, perch, isLandingFlare = true)
-                        Pair(listOf(leg1, leg2, leg3), 3850L)
-                    }
-                    else -> {
-                        // Patrol C: Sweeping downward-right dive across display, exits right edge, re-enters upper-left Left-to-Right!
-                        val exitR2 = PointF(sw + dp(app, 105f), sh * 0.52f)
-                        val legOut = BezierLeg(
-                            perch,
-                            PointF(perch.x + dp(app, 105f), perch.y - dp(app, 40f)),
-                            PointF(sw * 0.56f, sh * 0.58f),
-                            exitR2
-                        )
-                        val legIn = BezierLeg(approachStart, approachC1, approachC2, perch, isLandingFlare = true)
-                        Pair(listOf(legOut, legIn), 3250L)
-                    }
+                    0 -> Pair(listOf(
+                        phantom0,
+                        perch,
+                        PointF(sw * 0.54f, max(dp(app, 55f), perch.y - dp(app, 25f))),
+                        PointF(sw * 0.86f, sh * 0.28f),
+                        PointF(sw * 0.52f, sh * 0.46f),
+                        PointF(sw * 0.14f, sh * 0.30f),
+                        preFlare,
+                        perch,
+                        phantomEnd
+                    ), 3650L)
+                    1 -> Pair(listOf(
+                        phantom0,
+                        perch,
+                        PointF(sw * 0.62f, sh * 0.18f),
+                        PointF(sw * 0.84f, sh * 0.52f),
+                        PointF(sw * 0.36f, sh * 0.60f),
+                        PointF(sw * 0.12f, sh * 0.34f),
+                        preFlare,
+                        perch,
+                        phantomEnd
+                    ), 3950L)
+                    else -> Pair(listOf(
+                        phantom0,
+                        perch,
+                        PointF(sw * 0.48f, sh * 0.30f),
+                        PointF(sw * 0.86f, sh * 0.38f),
+                        PointF(sw * 0.60f, sh * 0.16f),
+                        PointF(sw * 0.16f, sh * 0.26f),
+                        preFlare,
+                        perch,
+                        phantomEnd
+                    ), 3550L)
                 }
             }
         }
     }
 
-    private fun launchBezierFlight(
+    private fun launchSplineFlight(
         app: Context,
         mode: FlightMode,
         onLiftoffImmediate: (() -> Unit)?,
+        onPreLandingLightningMask: (() -> Unit)?,
         onTouchdownExact: (() -> Unit)?,
         onComplete: (() -> Unit)?
     ) {
         if (!Settings.canDrawOverlays(app)) {
             onLiftoffImmediate?.invoke()
+            onPreLandingLightningMask?.invoke()
             onTouchdownExact?.invoke()
             onComplete?.invoke()
             return
@@ -428,101 +489,115 @@ object LivingPedestalDirector {
 
         val wm = flightWindowManager ?: (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).also { flightWindowManager = it }
         val stageView = RavenFlightStageView(app, flyFrames)
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
 
         try {
-            wm.addView(stageView, lp)
+            wm.addView(stageView, buildFullGlassOverlayParams(app))
             activeFlightView = stageView
             flightInProgress = true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             onTouchdownExact?.invoke()
             onComplete?.invoke()
             return
         }
 
-        // Fire atomic liftoff swap BEFORE frame 1 renders so two Ravens never coexist!
         onLiftoffImmediate?.invoke()
 
-        var legsBuilt: List<BezierLeg>? = null
+        var waypoints: List<PointF>? = null
+        var preMaskFired = false
         var touchdownFired = false
-        val startElapsed = SystemClock.elapsedRealtime()
-        val estDur = if (mode == FlightMode.PATROL) 3400L else 1300L
+        val posOut = PointF()
+        val velOut = PointF()
+        val startMs = SystemClock.elapsedRealtime()
+        var lastTickMs = startMs
+        val initialPerch = getPerchInOverlayCoords(app, stageView)
+        val (initPts, totalDur) = buildSmoothSplineWaypoints(app, mode, initialPerch)
+        waypoints = initPts
 
         flightAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = estDur
+            duration = totalDur
             interpolator = LinearInterpolator()
             addUpdateListener { anim ->
                 val rawU = (anim.animatedValue as Float).coerceIn(0f, 1f)
-                val livePerch = getPerchInOverlayCoords(app, stageView)
-                val legs = legsBuilt ?: buildLogicalFlightLegs(app, mode, livePerch).first.also { legsBuilt = it }
+                val now = SystemClock.elapsedRealtime()
+                val dt = ((now - lastTickMs).coerceIn(1L, 50L)).toFloat() / 1000f
+                lastTickMs = now
 
-                val legIdx = min(legs.size - 1, (rawU * legs.size).toInt())
-                var legT = ((rawU * legs.size) - legIdx).coerceIn(0f, 1f)
-                val baseLeg = legs[legIdx]
+                // Smooth ease-in-out timing curve so liftoff accelerates naturally and landing brakes smoothly!
+                val easedU = when (mode) {
+                    FlightMode.ARRIVAL -> (1.0 - (1.0 - rawU.toDouble()).pow(1.65)).toFloat()
+                    FlightMode.DEPARTURE -> rawU.toDouble().pow(1.30).toFloat()
+                    FlightMode.PATROL -> (0.5 - 0.5 * cos(rawU.toDouble() * Math.PI)).toFloat()
+                }.coerceIn(0f, 1f)
 
-                // Aerodynamic ease-out deceleration on the landing flare leg so Huginn brakes smoothly onto the stone!
-                if (baseLeg.isLandingFlare) {
-                    legT = (1.0 - (1.0 - legT.toDouble()).pow(1.85)).toFloat().coerceIn(0f, 1f)
-                } else if (legIdx == 0 && mode != FlightMode.ARRIVAL) {
-                    legT = legT.toDouble().pow(1.25).toFloat().coerceIn(0f, 1f)
+                val pts = waypoints ?: initPts
+                evalCatmullRom(pts, easedU, posOut, velOut)
+
+                // Continuous 60fps wingbeat cycle (0..4) with soaring glide during fast dives
+                val elapsedSec = (now - startMs).toFloat() / 1000f
+                val flapRateHz = if (easedU > 0.80f && mode != FlightMode.DEPARTURE) 3.4f else 2.4f
+                val phase4 = (elapsedSec * flapRateHz * 4f) % 4f
+                val speed = hypot(velOut.x.toDouble(), velOut.y.toDouble()).toFloat().coerceAtLeast(1f)
+                val divingGlide = (velOut.y / speed > 0.30f) && easedU in 0.22f..0.72f
+
+                val seq = intArrayOf(0, 1, 2, 1)
+                val idxA: Int
+                val idxB: Int
+                val blend: Float
+                if (divingGlide) {
+                    idxA = 1; idxB = 1; blend = 0f
+                } else {
+                    val slot = phase4.toInt().coerceIn(0, 3)
+                    idxA = seq[slot]
+                    idxB = seq[(slot + 1) % 4]
+                    blend = (0.5 - 0.5 * cos((phase4 - slot) * Math.PI)).toFloat()
                 }
 
-                val p0 = if (legIdx == 0 && mode != FlightMode.ARRIVAL) livePerch else baseLeg.p0
-                val p3 = if (legIdx == legs.size - 1 && mode != FlightMode.DEPARTURE) livePerch else baseLeg.p3
-                val p1 = if (baseLeg.isLandingFlare) PointF(livePerch.x - dp(app, 92f), max(dp(app, 4f), livePerch.y - dp(app, 46f))) else baseLeg.p1
-                val p2 = if (baseLeg.isLandingFlare) PointF(livePerch.x - dp(app, 36f), livePerch.y - dp(app, 12f)) else baseLeg.p2
+                // Subtle vertical wing-lift bob synced with downstroke
+                val liftBob = if (divingGlide) 0f else sin(elapsedSec * flapRateHz * Math.PI * 2.0).toFloat() * dp(app, 2.2f)
 
-                val omt = 1f - legT
-                val bx = omt * omt * omt * p0.x + 3f * omt * omt * legT * p1.x + 3f * omt * legT * legT * p2.x + legT * legT * legT * p3.x
-                val by = omt * omt * omt * p0.y + 3f * omt * omt * legT * p1.y + 3f * omt * legT * legT * p2.y + legT * legT * legT * p3.y
-
-                val dx = 3f * omt * omt * (p1.x - p0.x) + 6f * omt * legT * (p2.x - p1.x) + 3f * legT * legT * (p3.x - p2.x)
-                val dy = 3f * omt * omt * (p1.y - p0.y) + 6f * omt * legT * (p2.y - p1.y) + 3f * legT * legT * (p3.y - p2.y)
-
-                val nowMs = SystemClock.elapsedRealtime() - startElapsed
-                val flapPeriod = if (baseLeg.isLandingFlare && legT > 0.55f) 85L else 125L
-                val speedMag = hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(1f)
-                val isGlide = !baseLeg.isLandingFlare && (dy / speedMag > 0.22f)
-                val flapSeq = intArrayOf(0, 1, 2, 1)
-                val frameIdx = if (isGlide) 1 else flapSeq[((nowMs / flapPeriod) % 4L).toInt()]
-
-                // Match exact perched Raven scale (0.64f) at liftoff & touchdown so transition is seamless!
                 val scaleDepth = when {
-                    baseLeg.isLandingFlare -> 1.02f - 0.38f * legT
-                    legIdx == 0 && mode != FlightMode.ARRIVAL -> 0.64f + 0.38f * min(1f, legT / 0.45f)
-                    else -> 1.02f
+                    mode != FlightMode.DEPARTURE && easedU > 0.78f -> 1.00f - 0.34f * ((easedU - 0.78f) / 0.22f)
+                    mode != FlightMode.ARRIVAL && easedU < 0.20f -> 0.66f + 0.34f * (easedU / 0.20f)
+                    else -> 1.00f + 0.08f * sin(easedU * Math.PI).toFloat()
                 }
 
-                // Touchdown fires ONLY at legT >= 0.94 when centered right over the stone facing RIGHT!
-                if (!touchdownFired && baseLeg.isLandingFlare && legT >= 0.94f && onTouchdownExact != null) {
+                // Fire electric lightning & hide Mjolnir at u >= 0.85 BEFORE Raven overlaps the hammer!
+                if (!preMaskFired && mode != FlightMode.DEPARTURE && easedU >= 0.85f) {
+                    preMaskFired = true
+                    onPreLandingLightningMask?.invoke()
+                }
+                if (!touchdownFired && mode != FlightMode.DEPARTURE && easedU >= 0.93f) {
                     touchdownFired = true
-                    onTouchdownExact.invoke()
+                    onTouchdownExact?.invoke()
                 }
 
                 val alphaFade = when {
-                    baseLeg.isLandingFlare && legT > 0.92f -> ((1f - legT) / 0.08f).coerceIn(0f, 1f)
-                    mode == FlightMode.DEPARTURE && rawU > 0.88f -> ((1f - rawU) / 0.12f).coerceIn(0f, 1f)
+                    mode != FlightMode.DEPARTURE && easedU > 0.91f -> ((1f - easedU) / 0.09f).coerceIn(0f, 1f)
+                    mode == FlightMode.DEPARTURE && easedU > 0.88f -> ((1f - easedU) / 0.12f).coerceIn(0f, 1f)
                     else -> 1f
                 }
 
-                // On final landing flare, lock facingRight = true and level pitch to 0 deg as talons settle!
-                val forceRight = baseLeg.isLandingFlare || (legIdx == 0 && mode != FlightMode.ARRIVAL && legT < 0.35f)
-                val flareFlatten = if (baseLeg.isLandingFlare && legT > 0.65f) (1f - (legT - 0.65f) / 0.35f) else 1f
+                val lockRight = (mode != FlightMode.DEPARTURE && easedU > 0.82f) || (mode != FlightMode.ARRIVAL && easedU < 0.14f)
+                val pitchDampen = if (mode != FlightMode.DEPARTURE && easedU > 0.80f) ((1f - easedU) / 0.20f).coerceIn(0f, 1f) else 1f
 
-                stageView.updateBirdPose(bx, by, dx, dy * flareFlatten, frameIdx, scaleDepth, alphaFade, forceRight)
+                stageView.updateSmoothPose(
+                    x = posOut.x,
+                    y = posOut.y + liftBob * pitchDampen,
+                    vx = velOut.x,
+                    vy = velOut.y * pitchDampen,
+                    dt = dt,
+                    frameA = idxA,
+                    frameB = idxB,
+                    frameBlend = blend,
+                    scale = scaleDepth,
+                    alpha = alphaFade,
+                    forceRight = lockRight
+                )
             }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
-                    if (!touchdownFired && onTouchdownExact != null) {
-                        touchdownFired = true
-                        onTouchdownExact.invoke()
-                    }
+                    if (!preMaskFired && mode != FlightMode.DEPARTURE) onPreLandingLightningMask?.invoke()
+                    if (!touchdownFired && mode != FlightMode.DEPARTURE) onTouchdownExact?.invoke()
                     stopActiveFlightOverlay()
                     onComplete?.invoke()
                 }
@@ -542,43 +617,69 @@ object LivingPedestalDirector {
         }
     }
 
+    /**
+     * 60fps Cross-Blended & Smooth-Banking Flight Renderer (0 centroid jump, 0 instant mirror snap).
+     */
     private class RavenFlightStageView(ctx: Context, private val frames: Array<Bitmap?>) : View(ctx) {
-        private val birdPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+        private val paintA = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+        private val paintB = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
         private val baseSizePx = dp(ctx, 114f)
         private val dstRect = RectF()
-        private var curX = -500f; private var curY = -500f
-        private var facingRight = true; private var pitchDeg = 0f
-        private var curFrame = 1; private var curScale = 1f; private var curAlpha = 1f
 
-        fun updateBirdPose(x: Float, y: Float, vx: Float, vy: Float, frameIdx: Int, scale: Float, alpha: Float, forceRight: Boolean) {
+        private var curX = -500f; private var curY = -500f
+        private var bankScaleX = 1f
+        private var smoothPitchDeg = 0f
+        private var idxA = 1; private var idxB = 1; private var blend = 0f
+        private var curScale = 1f; private var curAlpha = 1f
+
+        fun updateSmoothPose(
+            x: Float, y: Float, vx: Float, vy: Float, dt: Float,
+            frameA: Int, frameB: Int, frameBlend: Float,
+            scale: Float, alpha: Float, forceRight: Boolean
+        ) {
             curX = x; curY = y
-            facingRight = if (forceRight) true else if (abs(vx) > 0.5f) (vx >= 0f) else facingRight
+            val targetSign = if (forceRight) 1f else if (vx >= 0f) 1f else -1f
+            // Smooth 3D banking turn across 160ms instead of a jarring 1-frame horizontal flip!
+            bankScaleX += (targetSign - bankScaleX) * min(1f, dt * 11.5f)
+            if (abs(bankScaleX) < 0.14f) bankScaleX = if (targetSign >= 0f) 0.14f else -0.14f
+
             val absVx = abs(vx).coerceAtLeast(1f)
-            pitchDeg = Math.toDegrees(atan2(vy.toDouble(), absVx.toDouble())).toFloat().coerceIn(-28f, 28f)
-            curFrame = frameIdx.coerceIn(0, 2)
+            val targetPitch = Math.toDegrees(atan2(vy.toDouble(), absVx.toDouble())).toFloat().coerceIn(-24f, 24f)
+            smoothPitchDeg += (targetPitch - smoothPitchDeg) * min(1f, dt * 10.0f)
+
+            idxA = frameA.coerceIn(0, 2)
+            idxB = frameB.coerceIn(0, 2)
+            blend = frameBlend.coerceIn(0f, 1f)
             curScale = scale
             curAlpha = alpha.coerceIn(0f, 1f)
             invalidate()
         }
 
         override fun onDraw(canvas: Canvas) {
-            val bmp = frames.getOrNull(curFrame) ?: frames.firstOrNull { it != null } ?: return
             if (curAlpha <= 0.01f) return
+            val bmpA = frames.getOrNull(idxA) ?: return
+            val bmpB = frames.getOrNull(idxB) ?: bmpA
             val half = (baseSizePx * curScale) * 0.5f
+
             canvas.save()
             canvas.translate(curX, curY)
-            canvas.scale(if (facingRight) 1f else -1f, 1f)
-            canvas.rotate(pitchDeg)
-            birdPaint.alpha = (curAlpha * 255f).toInt().coerceIn(0, 255)
+            canvas.scale(bankScaleX, 1f)
+            canvas.rotate(smoothPitchDeg)
             dstRect.set(-half, -half, half, half)
-            canvas.drawBitmap(bmp, null, dstRect, birdPaint)
+
+            if (idxA == idxB || blend <= 0.02f) {
+                paintA.alpha = (curAlpha * 255f).toInt().coerceIn(0, 255)
+                canvas.drawBitmap(bmpA, null, dstRect, paintA)
+            } else {
+                paintA.alpha = (curAlpha * (1f - blend * 0.65f) * 255f).toInt().coerceIn(0, 255)
+                paintB.alpha = (curAlpha * blend * 255f).toInt().coerceIn(0, 255)
+                canvas.drawBitmap(bmpA, null, dstRect, paintA)
+                canvas.drawBitmap(bmpB, null, dstRect, paintB)
+            }
             canvas.restore()
         }
     }
 
-    /**
-     * Crisp De-Hazed Electric Cyan-White Hammer Lightning Drawable (Swap + Periodic Idle Mjolnir Crackle).
-     */
     private class ElectricHammerLightningDrawable : Drawable() {
         private val haloPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         private val corePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
@@ -590,8 +691,7 @@ object LivingPedestalDirector {
         override fun draw(canvas: Canvas) {
             val p = progress
             if (p < 0f || p > 1f) return
-            val b = bounds
-            if (b.isEmpty) return
+            val b = bounds; if (b.isEmpty) return
             val core = mjolnirSwapCoreBmp ?: boltCores[0] ?: return
             val halo = mjolnirSwapHaloBmp ?: boltHalos[0] ?: core
             dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
@@ -629,268 +729,301 @@ object LivingPedestalDirector {
     }
 
     /**
-     * WO-161 Precision Metallic Gold Drip & Flowing Ring-Matched Bottom Gold Stream:
-     * - Zero detached blob: droplets neck directly off the exact 6:00 outer gold frame rim!
-     * - Exact sampled champagne-gold palette (#C89D46 / #E8CA78 / #FFF6C8) + actual `raven_gold_ring_strip`
-     *   flowing outward left & right along the visible bottom edge above the navigation bar!
+     * WO-162 True Fluid 6:00 Gold Drip & Full-Glass Bottom-Pixel Growing Molten Gold Pile (y = 3088px!).
      */
     private class MoltenGoldScreenStreamView(ctx: Context) : View(ctx) {
         private data class GoldDrop(
             var x: Float = 0f, var y: Float = 0f, var vy: Float = 0f,
-            var r: Float = 0f, var neckLen: Float = 0f, var attached: Boolean = true,
-            var reachesBottom: Boolean = true, var maxY: Float = 0f, var active: Boolean = false
+            var r: Float = 0f, var volumeWeight: Float = 1f, var active: Boolean = false
         )
-        private data class SplashRipple(var x: Float = 0f, var age: Float = 0f, var amp: Float = 0f, var active: Boolean = false)
         private data class GoldMote(
             var x: Float = 0f, var y: Float = 0f, var vx: Float = 0f, var vy: Float = 0f,
-            var r: Float = 0f, var life: Float = 0f, var maxLife: Float = 0.6f, var active: Boolean = false
+            var r: Float = 0f, var life: Float = 0f, var maxLife: Float = 0.5f, var active: Boolean = false
         )
 
-        private val drops = Array(18) { GoldDrop() }
-        private val ripples = Array(8) { SplashRipple() }
-        private val motes = Array(36) { GoldMote() }
+        private val drops = Array(20) { GoldDrop() }
+        private val motes = Array(44) { GoldMote() }
 
-        private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        // 72-column viscous heightfield flush to physical bottom pixel of Note 20 Ultra (grows deeper over time!)
+        private val cols = 72
+        private val pileH = FloatArray(cols + 1)
+        private val pileVel = FloatArray(cols + 1)
+        private val tempH = FloatArray(cols + 1)
+
+        private val dropPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val rimStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
         private val glintPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val stripMeshPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+        private val pileFillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val stripPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         private val dropPath = Path()
+        private val pilePath = Path()
+        private val surfaceEdgePath = Path()
+        private val stripDst = RectF()
 
-        // Mesh for flowing raven_gold_ring_strip.png across the bottom edge (visibly moving stardust & glimmers!)
-        private val botCols = 48
-        private val botRows = 3
-        private val botVertsR = FloatArray((botCols + 1) * (botRows + 1) * 2)
-        private val botVertsL = FloatArray((botCols + 1) * (botRows + 1) * 2)
-        private val botStripBuf: Bitmap? = ringStripBmp?.let { Bitmap.createBitmap(it.width, it.height, Bitmap.Config.ARGB_8888) }
-        private val botStripCanvas: Canvas? = botStripBuf?.let { Canvas(it) }
-
-        private var spawnAccum = 0f
-        private var poolFill = 0f
-        private var scrollPhase = 0f
+        private var pendantFill = 0f     // 0.0 -> 1.0 as left & right streams feed the 6:00 tip
+        private var recoilPhase = 0f     // >0 right after pinch-off so meniscus snaps upward naturally!
+        private var texShift = 0f
         private var rimX = dp(ctx, 74f)
         private var rimY = dp(ctx, 165f)
-        private var isFlowing = false
-
-        private fun getNavBarSafeBottomY(): Float {
-            val h = height.toFloat().coerceAtLeast(resources.displayMetrics.heightPixels.toFloat())
-            // Keep visible stream right above Samsung navigation bar (~48dp) if nav bar is present, or right at bottom edge!
-            val resId = resources.getIdentifier("navigation_bar_height", "dimen", "android")
-            val navH = if (resId > 0) resources.getDimensionPixelSize(resId).toFloat() else dp(context, 42f)
-            return h - navH.coerceIn(0f, dp(context, 56f))
-        }
+        private var flowing = false
 
         fun stepPhysics(dt: Float, exactRimX: Float, exactRimY: Float, flowActive: Boolean): Boolean {
             rimX = exactRimX
             rimY = exactRimY
-            isFlowing = flowActive
-            val sw = width.toFloat().coerceAtLeast(resources.displayMetrics.widthPixels.toFloat())
-            val floorY = getNavBarSafeBottomY()
-            val gravity = dp(context, 490f)
+            flowing = flowActive
 
-            if (flowActive || poolFill > 0.02f) {
-                scrollPhase = (scrollPhase + dt * 0.24f) % 1f
-                refreshBottomStripScroll()
+            val (physW, physH) = getPhysicalGlassSize(context)
+            val sw = max(width.toFloat(), physW.toFloat())
+            val sh = max(height.toFloat(), physH.toFloat())
+            val gravity = dp(context, 540f)
+
+            texShift = (texShift + dt * 95f) % 2048f
+
+            // 1. Continuous 6:00 Liquid-Metal Meniscus Swell, Pinch-Off & Surface-Tension Recoil
+            if (recoilPhase > 0f) {
+                recoilPhase = (recoilPhase - dt * 6.5f).coerceAtLeast(0f)
             }
-
             if (flowActive) {
-                spawnAccum += dt
-                // Proportional cadence: sleek 2.5dp-3.8dp metallic droplet every ~0.58s right off the 6:00 frame rim
-                if (spawnAccum >= 0.58f) {
-                    spawnAccum = 0f
+                pendantFill += dt * 1.38f // ~0.72s per rich molten droplet
+                if (pendantFill >= 1f) {
+                    pendantFill = 0f
+                    recoilPhase = 1f
+                    // Primary rich 24k droplet snaps free from the stretched tip
                     drops.firstOrNull { !it.active }?.apply {
-                        val toBottom = Random.nextFloat() < 0.62f
                         active = true
-                        attached = true
-                        neckLen = 0f
-                        x = rimX + (Random.nextFloat() - 0.5f) * dp(context, 2.2f)
-                        y = rimY
-                        vy = dp(context, 12f)
-                        r = dp(context, if (toBottom) (Random.nextFloat() * 1.1f + 2.8f) else (Random.nextFloat() * 0.9f + 2.1f))
-                        reachesBottom = toBottom
-                        maxY = if (toBottom) floorY else (rimY + (floorY - rimY) * (0.28f + Random.nextFloat() * 0.44f))
+                        x = rimX + (Random.nextFloat() - 0.5f) * dp(context, 1.4f)
+                        y = rimY + dp(context, 10.5f)
+                        vy = dp(context, 42f)
+                        r = dp(context, Random.nextFloat() * 0.9f + 3.2f)
+                        volumeWeight = 1.0f
+                    }
+                    // Plateau-Rayleigh tiny trailing satellite micro-bead!
+                    drops.firstOrNull { !it.active }?.apply {
+                        active = true
+                        x = rimX
+                        y = rimY + dp(context, 5.2f)
+                        vy = dp(context, 18f)
+                        r = dp(context, 1.45f)
+                        volumeWeight = 0.25f
                     }
                 }
+                liveConfluenceSwell = (pendantFill - recoilPhase * 0.35f).coerceIn(0f, 1f)
             } else {
-                poolFill = (poolFill - dt * 0.16f).coerceAtLeast(0f)
+                pendantFill = (pendantFill - dt * 2.5f).coerceAtLeast(0f)
+                liveConfluenceSwell = pendantFill
             }
 
-            var anyAlive = flowActive || poolFill > 0.01f
-            val detachDist = dp(context, 11f)
-
+            // 2. Step Falling Drops & Accumulate Real Volume into Bottom Heightfield!
+            var anyDrops = false
             for (d in drops) {
                 if (!d.active) continue
-                anyAlive = true
-                if (d.attached) {
-                    // Bead swells right on the gold frame rim and stretches a thin metallic neck before snapping free!
-                    d.neckLen += dp(context, 26f) * dt
-                    d.x = rimX
-                    d.y = rimY + d.neckLen
-                    if (d.neckLen >= detachDist) {
-                        d.attached = false
-                        d.vy = dp(context, 38f)
-                    }
-                } else {
-                    d.vy += gravity * dt
-                    d.y += d.vy * dt
-                }
+                anyDrops = true
+                d.vy += gravity * dt
+                d.y += d.vy * dt
 
-                if (d.y >= d.maxY) {
+                val colIdx = ((d.x / sw) * cols).toInt().coerceIn(0, cols)
+                val localSurfaceY = sh - pileH[colIdx]
+                if (d.y >= localSurfaceY) {
                     d.active = false
-                    if (d.reachesBottom) {
-                        poolFill = (poolFill + 0.14f).coerceAtMost(1.0f)
-                        ripples.firstOrNull { !it.active }?.apply {
-                            active = true; x = d.x; age = 0f; amp = dp(context, 5.5f)
-                        }
-                        repeat(5) {
+                    // Deposit real molten gold volume centered at impact column (grows up to ~38dp mound!)
+                    val addPeak = dp(context, 1.65f) * d.volumeWeight
+                    val maxMoundPx = dp(context, 38f)
+                    for (k in max(0, colIdx - 6)..min(cols, colIdx + 6)) {
+                        val dist = (k - colIdx).toFloat()
+                        val w = exp((-dist * dist / 7.5f).toDouble()).toFloat()
+                        pileH[k] = (pileH[k] + addPeak * w).coerceAtMost(maxMoundPx)
+                        // Ripple wave impulse outward from impact crater!
+                        pileVel[k] += (if (abs(k - colIdx) <= 1) -dp(context, 28f) else dp(context, 16f) * w) * d.volumeWeight
+                    }
+                    if (d.volumeWeight >= 0.8f) {
+                        repeat(4) {
                             motes.firstOrNull { !it.active }?.apply {
-                                active = true; x = d.x; y = floorY - dp(context, 2f)
-                                vx = (Random.nextFloat() - 0.5f) * dp(context, 88f)
-                                vy = -dp(context, Random.nextFloat() * 75f + 32f)
-                                r = dp(context, Random.nextFloat() * 1.1f + 1.1f)
-                                life = 0f; maxLife = Random.nextFloat() * 0.35f + 0.30f
-                            }
-                        }
-                    } else {
-                        // Mid-air dissolve into fine champagne stardust specks!
-                        repeat(3) {
-                            motes.firstOrNull { !it.active }?.apply {
-                                active = true; x = d.x; y = d.y
-                                vx = (Random.nextFloat() - 0.5f) * dp(context, 34f)
-                                vy = dp(context, Random.nextFloat() * 24f - 8f)
-                                r = dp(context, 1.2f); life = 0f; maxLife = 0.34f
+                                active = true
+                                x = d.x; y = localSurfaceY - dp(context, 1.5f)
+                                vx = (Random.nextFloat() - 0.5f) * dp(context, 82f)
+                                vy = -dp(context, Random.nextFloat() * 68f + 28f)
+                                r = dp(context, Random.nextFloat() * 1.0f + 1.1f)
+                                life = 0f; maxLife = Random.nextFloat() * 0.32f + 0.26f
                             }
                         }
                     }
                 }
             }
 
-            for (rp in ripples) {
-                if (!rp.active) continue
-                anyAlive = true
-                rp.age += dt
-                if (rp.age >= 1.25f) rp.active = false
+            // 3. Step 1D Viscous Shallow-Water Slumping & Surface Ripples Along Bottom Bezel!
+            var maxPile = 0f
+            for (k in 0..cols) {
+                val leftH = pileH[max(0, k - 1)]
+                val rightH = pileH[min(cols, k + 1)]
+                val laplacian = (leftH + rightH - 2f * pileH[k])
+                // Wave propagation + damping
+                pileVel[k] = (pileVel[k] + laplacian * 48f * dt) * (1f - min(0.9f, 5.2f * dt))
+                // Viscous gravity slumping so the mound spreads steadily across the bottom of the screen
+                val slump = laplacian * 3.4f * dt
+                var nextH = pileH[k] + pileVel[k] * dt + slump
+                if (!flowActive) {
+                    // Gently drain below bottom bezel once Raven message is cleared!
+                    nextH -= dp(context, 4.2f) * dt
+                }
+                tempH[k] = nextH.coerceAtLeast(0f)
+                if (tempH[k] > maxPile) maxPile = tempH[k]
             }
+            for (k in 0..cols) pileH[k] = tempH[k]
 
+            // 4. Step Splash Motes
+            var anyMotes = false
             for (m in motes) {
                 if (!m.active) continue
-                anyAlive = true
+                anyMotes = true
                 m.life += dt
                 if (m.life >= m.maxLife) { m.active = false; continue }
                 m.x += m.vx * dt
                 m.y += m.vy * dt
-                m.vy += gravity * 0.22f * dt
+                m.vy += gravity * 0.28f * dt
             }
 
-            if (poolFill > 0.01f) buildFlowingBottomMesh(sw, floorY)
             invalidate()
-            return anyAlive
+            return flowActive || anyDrops || anyMotes || maxPile > 0.4f
         }
 
-        private fun refreshBottomStripScroll() {
-            val src = ringStripBmp ?: return
-            val c = botStripCanvas ?: return
-            c.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-            val w = src.width.toFloat()
-            val shift = ((scrollPhase % 1f + 1f) % 1f) * w
-            c.drawBitmap(src, shift, 0f, null)
-            c.drawBitmap(src, shift - w, 0f, null)
-        }
-
-        private fun buildFlowingBottomMesh(sw: Float, floorY: Float) {
-            val splitX = rimX.coerceIn(dp(context, 30f), sw - dp(context, 30f))
-            val baseThick = dp(context, 14f) * (0.35f + 0.65f * poolFill)
-
-            for (i in 0..botCols) {
-                val u = i.toFloat() / botCols.toFloat()
-                val rx = splitX + u * (sw - splitX)
-                val lx = splitX - u * splitX
-
-                // Outward-travelling wave + dynamic impact splash ripples!
-                var waveR = sin((u * 9.0 - scrollPhase * Math.PI * 6.0)).toFloat() * dp(context, 1.8f) * poolFill
-                var waveL = sin((u * 9.0 - scrollPhase * Math.PI * 6.0)).toFloat() * dp(context, 1.8f) * poolFill
-                for (rp in ripples) {
-                    if (!rp.active) continue
-                    val travel = rp.age * dp(context, 240f)
-                    val decay = (1f - rp.age / 1.25f).coerceIn(0f, 1f)
-                    val dR = abs(abs(rx - rp.x) - travel)
-                    if (dR < dp(context, 28f)) waveR += cos((dR / dp(context, 28f)) * Math.PI * 0.5).toFloat() * rp.amp * decay
-                    val dL = abs(abs(lx - rp.x) - travel)
-                    if (dL < dp(context, 28f)) waveL += cos((dL / dp(context, 28f)) * Math.PI * 0.5).toFloat() * rp.amp * decay
-                }
-
-                val mound = (1f - u * 0.55f) * baseThick
-                for (j in 0..botRows) {
-                    val vFrac = j.toFloat() / botRows.toFloat()
-                    val idx = (j * (botCols + 1) + i) * 2
-                    val topYR = floorY - (mound + waveR)
-                    val topYL = floorY - (mound + waveL)
-                    botVertsR[idx] = rx
-                    botVertsR[idx + 1] = topYR + (floorY + dp(context, 4f) - topYR) * vFrac
-                    botVertsL[idx] = lx
-                    botVertsL[idx + 1] = topYL + (floorY + dp(context, 4f) - topYL) * vFrac
-                }
+        private fun drawRichGoldTeardrop(canvas: Canvas, cx: Float, cy: Float, r: Float, topPinY: Float?, stretch: Float) {
+            dropPath.reset()
+            if (topPinY != null) {
+                // Continuous liquid-metal funnel bridge merging straight out of the 6:00 gold frame!
+                val funnelHalfW = dp(context, 7.5f) * (1f - 0.35f * (cy - topPinY) / dp(context, 14f)).coerceIn(0.4f, 1f)
+                val waistHalfW = (r * 0.52f).coerceAtLeast(dp(context, 1.1f))
+                val waistY = topPinY + (cy - topPinY) * 0.48f
+                dropPath.moveTo(cx - funnelHalfW, topPinY - dp(context, 2.0f))
+                dropPath.quadTo(cx - waistHalfW, waistY, cx - r, cy)
+                dropPath.arcTo(cx - r, cy - r * 0.65f, cx + r, cy + r * 1.05f, 180f, -180f, false)
+                dropPath.quadTo(cx + waistHalfW, waistY, cx + funnelHalfW, topPinY - dp(context, 2.0f))
+                dropPath.close()
+            } else {
+                val tailY = cy - r * stretch
+                dropPath.moveTo(cx, tailY)
+                dropPath.quadTo(cx + r * 1.12f, cy - r * 0.12f, cx, cy + r)
+                dropPath.quadTo(cx - r * 1.12f, cy - r * 0.12f, cx, tailY)
+                dropPath.close()
             }
+
+            // Rich 3D burnished ring-gold gradient (bronze rim -> warm 24k core -> antique gold shadow)
+            dropPaint.shader = LinearGradient(
+                cx - r * 1.1f, cy, cx + r * 1.1f, cy,
+                intArrayOf(GOLD_BRONZE, GOLD_WARM, GOLD_RICH, GOLD_BRONZE),
+                floatArrayOf(0f, 0.38f, 0.78f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawPath(dropPath, dropPaint)
+
+            // Subtle dark-bronze 0.6dp contour + crisp warm specular glint so drop matches the ring 100%!
+            rimStrokePaint.strokeWidth = dp(context, 0.65f)
+            rimStrokePaint.color = 0xAA4C3006.toInt()
+            canvas.drawPath(dropPath, rimStrokePaint)
+
+            glintPaint.color = GOLD_GLINT
+            canvas.drawCircle(cx - r * 0.28f, cy + r * 0.14f, r * 0.30f, glintPaint)
         }
 
         override fun onDraw(canvas: Canvas) {
-            // 1. Sleek Frame-Matched Champagne-Gold Droplets (ZERO detached blob!)
-            for (d in drops) {
-                if (!d.active) continue
-                val fade = if (!d.reachesBottom && d.y > d.maxY - dp(context, 55f)) ((d.maxY - d.y) / dp(context, 55f)).coerceIn(0f, 1f) else 1f
-                val aInt = (fade * 255f).toInt().coerceIn(0, 255)
+            val (physW, physH) = getPhysicalGlassSize(context)
+            val sw = max(width.toFloat(), physW.toFloat())
+            val sh = max(height.toFloat(), physH.toFloat())
 
-                dropPath.reset()
-                if (d.attached) {
-                    // Thin liquid-metal bridge emerging straight out of the 6:00 gold frame rim!
-                    val neckHalf = (d.r * (1f - 0.55f * (d.neckLen / dp(context, 11f)))).coerceAtLeast(dp(context, 0.9f))
-                    dropPath.moveTo(rimX - neckHalf, rimY - dp(context, 1.5f))
-                    dropPath.quadTo(d.x - d.r * 0.5f, (rimY + d.y) * 0.5f, d.x - d.r, d.y)
-                    dropPath.arcTo(d.x - d.r, d.y - d.r * 0.6f, d.x + d.r, d.y + d.r * 1.1f, 180f, -180f, false)
-                    dropPath.quadTo(d.x + d.r * 0.5f, (rimY + d.y) * 0.5f, rimX + neckHalf, rimY - dp(context, 1.5f))
-                    dropPath.close()
-                } else {
-                    val stretch = (1.5f + d.vy / dp(context, 480f)).coerceAtMost(2.7f)
-                    val tailY = d.y - d.r * stretch
-                    dropPath.moveTo(d.x, tailY)
-                    dropPath.quadTo(d.x + d.r * 1.15f, d.y - d.r * 0.1f, d.x, d.y + d.r)
-                    dropPath.quadTo(d.x - d.r * 1.15f, d.y - d.r * 0.1f, d.x, tailY)
-                    dropPath.close()
-                }
-
-                // Metallic 3-stop champagne-gold shader matching raven_gold_ring_strip.png!
-                bodyPaint.shader = LinearGradient(
-                    d.x - d.r, d.y, d.x + d.r, d.y,
-                    intArrayOf( withAlpha(GOLD_DARK, aInt), withAlpha(GOLD_HI, aInt), withAlpha(GOLD_MID, aInt) ),
-                    floatArrayOf(0f, 0.42f, 1f), Shader.TileMode.CLAMP
-                )
-                canvas.drawPath(dropPath, bodyPaint)
-
-                // Crisp specular white-gold glint inside droplet
-                glintPaint.color = withAlpha(GOLD_SPEC, (aInt * 0.92f).toInt())
-                canvas.drawCircle(d.x - d.r * 0.24f, d.y + d.r * 0.12f, d.r * 0.34f, glintPaint)
+            // 1. Attached Swelling / Recoiling Liquid-Gold Meniscus right on the 6:00 Frame Rim!
+            if (flowing || pendantFill > 0.04f) {
+                val recoilLift = recoilPhase * dp(context, 3.2f)
+                val neckDrop = (pendantFill * pendantFill * dp(context, 10.5f) - recoilLift).coerceAtLeast(dp(context, 1.2f))
+                val rad = dp(context, 1.8f + 1.85f * pendantFill)
+                drawRichGoldTeardrop(canvas, rimX, rimY + neckDrop, rad, topPinY = rimY, stretch = 1.4f)
             }
 
-            // 2. Champagne Stardust Motes
+            // 2. Falling Burnished 24k Droplets
+            for (d in drops) {
+                if (!d.active) continue
+                val stretch = (1.45f + d.vy / dp(context, 520f)).coerceAtMost(2.55f)
+                drawRichGoldTeardrop(canvas, d.x, d.y, d.r, topPinY = null, stretch = stretch)
+            }
+
+            // 3. Splash Motes
             for (m in motes) {
                 if (!m.active) continue
                 val sa = ((1f - m.life / m.maxLife) * 255f).toInt().coerceIn(0, 255)
-                glintPaint.color = withAlpha(GOLD_HI, sa)
+                glintPaint.color = (GOLD_WARM and 0x00FFFFFF) or (sa shl 24)
                 canvas.drawCircle(m.x, m.y, m.r, glintPaint)
             }
 
-            // 3. Flowing Ring-Matched Champagne-Gold Stream at Bottom of Screen!
-            val strip = botStripBuf ?: ringStripBmp
-            if (poolFill > 0.01f && strip != null) {
-                stripMeshPaint.alpha = (poolFill.coerceIn(0.25f, 1f) * 245f).toInt()
-                canvas.drawBitmapMesh(strip, botCols, botRows, botVertsR, 0, null, 0, stripMeshPaint)
-                canvas.drawBitmapMesh(strip, botCols, botRows, botVertsL, 0, null, 0, stripMeshPaint)
+            // 4. True Growing Molten Gold Pile Anchored Flush to Physical Bottom Pixel (y = sh = 3088)!
+            var peakH = 0f
+            for (hVal in pileH) if (hVal > peakH) peakH = hVal
+            if (peakH > 0.4f) {
+                pilePath.reset()
+                surfaceEdgePath.reset()
+                var startedEdge = false
+
+                pilePath.moveTo(0f, sh + dp(context, 3f))
+                for (k in 0..cols) {
+                    val px = (k.toFloat() / cols.toFloat()) * sw
+                    val hCol = pileH[k]
+                    val py = sh - hCol
+                    pilePath.lineTo(px, py)
+                    if (hCol > dp(context, 0.6f)) {
+                        if (!startedEdge) {
+                            surfaceEdgePath.moveTo(px, py)
+                            startedEdge = true
+                        } else {
+                            surfaceEdgePath.lineTo(px, py)
+                        }
+                    } else if (startedEdge) {
+                        surfaceEdgePath.lineTo(px, sh)
+                        startedEdge = false
+                    }
+                }
+                pilePath.lineTo(sw, sh + dp(context, 3f))
+                pilePath.close()
+
+                // Solid metallic 24k gold mass from undulating top down to the literal bottom bezel pixel!
+                pileFillPaint.shader = LinearGradient(
+                    0f, sh - peakH - dp(context, 2f), 0f, sh,
+                    intArrayOf(GOLD_WARM, GOLD_RICH, GOLD_BRONZE, GOLD_SHADOW),
+                    floatArrayOf(0f, 0.36f, 0.78f, 1f),
+                    Shader.TileMode.CLAMP
+                )
+                canvas.drawPath(pilePath, pileFillPaint)
+
+                // Overlay scrolling ring stardust texture strictly clipped inside the molten pile!
+                ringStripBmp?.let { strip ->
+                    canvas.save()
+                    canvas.clipPath(pilePath)
+                    stripPaint.alpha = 155
+                    val tileW = sw * 0.85f
+                    var startX = -(texShift % tileW)
+                    while (startX < sw) {
+                        stripDst.set(startX, sh - peakH - dp(context, 6f), startX + tileW, sh + dp(context, 6f))
+                        canvas.drawBitmap(strip, null, stripDst, stripPaint)
+                        startX += tileW
+                    }
+                    canvas.restore()
+                }
+
+                // Crisp specular molten gold crest highlight along the undulating top surface!
+                if (startedEdge || peakH > dp(context, 1.2f)) {
+                    rimStrokePaint.strokeWidth = dp(context, 1.5f)
+                    rimStrokePaint.color = GOLD_GLINT
+                    canvas.drawPath(surfaceEdgePath, rimStrokePaint)
+                }
             }
         }
-
-        private fun withAlpha(rgb: Int, a: Int): Int = (rgb and 0x00FFFFFF) or (a.coerceIn(0, 255) shl 24)
     }
 
     /**
-     * Unified Living Pedestal Crest View (Zero-Gap 12:00 Split Ring, Living Mjolnir & Living Raven).
+     * Unified Living Pedestal Crest View V3:
+     * - 60fps GPU `drawBitmapMesh` Living Raven (fluid sine/damped-spring head tilts + chest breathing + isolated eye blink!)
+     * - Converging 6:00 Liquid-Gold Funnel synced to `liveConfluenceSwell`
+     * - Deep Chiseled Ember + Lightning-Resonant Pedestal Runes
      */
     class LivingPedestalCrestView(ctx: Context) : FrameLayout(ctx) {
         val padSide = dpInt(ctx, 18)
@@ -903,8 +1036,7 @@ object LivingPedestalDirector {
         val totalWindowWidthPx: Int = cardW + padSide * 2
         val totalWindowHeightPx: Int = cardH + padTop + padBottom
 
-        private val baseImageView: ImageView
-        private val poseOverlayView: ImageView
+        private val livingArtView: LivingPedestalArtMeshView
         private val electricHammerDrawable = ElectricHammerLightningDrawable()
         private val runesDrawable: ShimmeringRuneOverlayDrawable?
         private val skyBoltsDrawable: SkyStormBoltsDrawable
@@ -923,7 +1055,7 @@ object LivingPedestalDirector {
         private val scrolledStripBmp: Bitmap? = ringStripBmp?.let { Bitmap.createBitmap(it.width, it.height, Bitmap.Config.ARGB_8888) }
         private val scrolledStripCanvas: Canvas? = scrolledStripBmp?.let { Canvas(it) }
         private val stripDrawPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-        private val ringPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply { alpha = 242 }
+        private val ringPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply { alpha = 244 }
 
         private var lastFrameMs = SystemClock.elapsedRealtime()
         private var flowPhase = 0f
@@ -933,10 +1065,8 @@ object LivingPedestalDirector {
         private var hasUnreadRavenFlag = false
         private var showingRavenOnStone = false
 
-        private var nextPerchLifeAtMs = SystemClock.elapsedRealtime() + 2200L
-        private var perchPoseRevertAtMs = 0L
-        private var nextMjolnirIdleArcAtMs = SystemClock.elapsedRealtime() + 4200L
-        private val bootShowcaseUntilMs = SystemClock.elapsedRealtime() + 28_000L
+        private var nextMjolnirIdleArcAtMs = SystemClock.elapsedRealtime() + 4500L
+        private val bootShowcaseUntilMs = SystemClock.elapsedRealtime() + 30_000L
 
         private var masterLoop: ValueAnimator? = null
         private var strikeAnimator: ValueAnimator? = null
@@ -961,20 +1091,8 @@ object LivingPedestalDirector {
                 elevation = dp(ctx, 7f)
             }
 
-            baseImageView = ImageView(ctx).apply {
-                scaleType = ImageView.ScaleType.FIT_XY
-                setImageBitmap(mjolnirBaseBmp ?: ravenBaseBmp)
-                layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
-            }
-            roundedCard.addView(baseImageView)
-
-            poseOverlayView = ImageView(ctx).apply {
-                scaleType = ImageView.ScaleType.FIT_XY
-                alpha = 0f
-                visibility = View.GONE
-                layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
-            }
-            roundedCard.addView(poseOverlayView)
+            livingArtView = LivingPedestalArtMeshView(ctx)
+            roundedCard.addView(livingArtView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
 
             runesDrawable = runesGoldBmp?.let { ShimmeringRuneOverlayDrawable(it) }
             if (runesDrawable != null) {
@@ -1013,22 +1131,18 @@ object LivingPedestalDirector {
             c.drawBitmap(src, shiftPx - w, 0f, stripDrawPaint)
         }
 
-        /**
-         * Atomic Occupant Setter: hides `poseOverlayView` immediately when switching to Mjolnir so a ghost Raven can NEVER remain visible!
-         */
+        fun hideMjolnirForIncomingLanding() {
+            // Smoothly pre-switches backdrop inside lightning flash before Raven chest crosses hammer!
+            showingRavenOnStone = true
+            livingArtView.setMode(showRaven = true, preLandingFadeIn = true)
+            invalidate()
+        }
+
         fun setOccupantImmediate(showRaven: Boolean) {
             showingRavenOnStone = showRaven
-            perchPoseRevertAtMs = 0L
-            poseOverlayView.animate().cancel()
-            poseOverlayView.alpha = 0f
-            poseOverlayView.visibility = if (showRaven) View.VISIBLE else View.GONE
-            baseImageView.scaleX = 1f
-            baseImageView.scaleY = 1f
-            baseImageView.setImageBitmap(if (showRaven) ravenBaseBmp else (mjolnirBaseBmp ?: ravenBaseBmp))
-            if (showRaven) {
-                nextPerchLifeAtMs = SystemClock.elapsedRealtime() + Random.nextLong(1600L, 3000L)
-            } else {
-                nextMjolnirIdleArcAtMs = SystemClock.elapsedRealtime() + Random.nextLong(3800L, 7200L)
+            livingArtView.setMode(showRaven = showRaven, preLandingFadeIn = false)
+            if (!showRaven) {
+                nextMjolnirIdleArcAtMs = SystemClock.elapsedRealtime() + Random.nextLong(4200L, 7800L)
             }
             invalidate()
         }
@@ -1036,6 +1150,7 @@ object LivingPedestalDirector {
         fun triggerElectricStrikeBurst(durationMs: Long = 420L, intensity: Float = 1.0f) {
             strikeAnimator?.cancel()
             skyBoltsDrawable.forceStrikeNow()
+            runesDrawable?.triggerLightningResonance()
             electricHammerDrawable.intensityScale = intensity
             strikeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
                 duration = durationMs
@@ -1058,7 +1173,7 @@ object LivingPedestalDirector {
             ringPaint.colorFilter = if (standby && !unreadRaven) {
                 PorterDuffColorFilter(Color.parseColor("#EF4444"), PorterDuff.Mode.SRC_ATOP)
             } else null
-            baseImageView.alpha = if (standby && !unreadRaven) 0.78f else 1.0f
+            livingArtView.alpha = if (standby && !unreadRaven) 0.78f else 1.0f
             invalidate()
         }
 
@@ -1072,7 +1187,7 @@ object LivingPedestalDirector {
             if (w > 20 && h > 20) {
                 buildDualFlankGeometry()
                 meshReady = true
-                updateDualCascadingMeshes()
+                updateDualCascadingMeshes(0f)
             }
         }
 
@@ -1125,19 +1240,29 @@ object LivingPedestalDirector {
             }
         }
 
-        private fun updateDualCascadingMeshes() {
+        private fun updateDualCascadingMeshes(funnelSwell: Float) {
             if (!meshReady) return
             val innerTuckPx = -dp(context, 0.5f)
             val outerSpanPx = padSide.toFloat() - innerTuckPx
+            val maxFunnelPull = dp(context, 4.8f) * (0.30f + 0.70f * funnelSwell)
+
             for (i in 0..flankSegs) {
+                val u = i.toFloat() / flankSegs.toFloat()
+                // Converge the outer ring smoothly downward right at 6:00 (u = 0.86..1.0) into the liquid drip spout!
+                val spoutBell = if (u > 0.86f) {
+                    val t = (u - 0.86f) / 0.14f
+                    t * t * (3f - 2f * t)
+                } else 0f
+
                 for (j in 0..radSteps) {
                     val rFrac = j.toFloat() / radSteps.toFloat()
                     val dist = innerTuckPx + outerSpanPx * rFrac
+                    val extraFunnelY = maxFunnelPull * spoutBell * rFrac * rFrac
                     val vIdx = (j * (flankSegs + 1) + i) * 2
                     rightMeshVerts[vIdx] = rightBx[i] + rightNx[i] * dist
-                    rightMeshVerts[vIdx + 1] = rightBy[i] + rightNy[i] * dist
+                    rightMeshVerts[vIdx + 1] = rightBy[i] + rightNy[i] * dist + extraFunnelY
                     leftMeshVerts[vIdx] = leftBx[i] + leftNx[i] * dist
-                    leftMeshVerts[vIdx + 1] = leftBy[i] + leftNy[i] * dist
+                    leftMeshVerts[vIdx + 1] = leftBy[i] + leftNy[i] * dist + extraFunnelY
                 }
             }
         }
@@ -1165,52 +1290,35 @@ object LivingPedestalDirector {
                         flowPhase = (flowPhase + (dt / 7.2f) * speedMult) % 1f
                         refreshScrolledStripBitmap()
                         val pulseRad = ((elapsed % 1100L).toDouble() / 1100.0) * Math.PI * 2.0
-                        ringPaint.alpha = ((0.80 + 0.20 * sin(pulseRad)) * 255.0).toInt().coerceIn(155, 255)
+                        ringPaint.alpha = ((0.82 + 0.18 * sin(pulseRad)) * 255.0).toInt().coerceIn(165, 255)
                     } else {
                         ringPaint.alpha = if (isStandbyMode) 195 else 228
                     }
 
-                    // Exact relative screen coordinates -> 0.0px gap between 6:00 gold frame rim & falling droplets!
+                    updateDualCascadingMeshes(if (flowActive) liveConfluenceSwell else 0f)
+
                     if (isAttachedToWindow) {
                         val mv = if (flowActive || moltenStreamOverlay != null) ensureMoltenStreamOverlay(context) else null
                         if (mv != null) {
                             val cLoc = IntArray(2); getLocationOnScreen(cLoc)
                             val mLoc = IntArray(2); if (mv.isAttachedToWindow) mv.getLocationOnScreen(mLoc)
                             val exactRimX = (cLoc[0] - mLoc[0]) + padSide + cardW * 0.50f
-                            // Gold ring strip's bright outer ridge sits at +padSide * 0.52f below cardH!
                             val exactRimY = (cLoc[1] - mLoc[1]) + padTop + cardH + padSide * 0.52f
                             val keep = mv.stepPhysics(dt, exactRimX, exactRimY, flowActive)
                             if (!keep && !flowActive) detachMoltenStreamOverlay()
                         }
                     }
 
-                    runesDrawable?.shimmerPhase = (elapsed % 3800L).toFloat() / 3800f
+                    livingArtView.stepLivingMotion(dt, now, elapsed)
+                    runesDrawable?.tick(dt, elapsed)
+
                     if (!isStandbyMode || hasUnreadRavenFlag) {
                         skyBoltsDrawable.tick(now)
                     }
 
-                    // Alive micro-animations strictly guarded by occupant state!
-                    if (showingRavenOnStone && !flightInProgress) {
-                        if (perchPoseRevertAtMs > 0L && now >= perchPoseRevertAtMs) {
-                            perchPoseRevertAtMs = 0L
-                            poseOverlayView.animate().alpha(0f).setDuration(170L).start()
-                        } else if (now >= nextPerchLifeAtMs) {
-                            if (Random.nextFloat() < 0.52f) {
-                                poseOverlayView.setImageBitmap(ravenBlinkBmp)
-                                poseOverlayView.animate().alpha(1f).setDuration(65L).start()
-                                perchPoseRevertAtMs = now + 175L
-                                nextPerchLifeAtMs = now + Random.nextLong(1800L, 3600L)
-                            } else {
-                                poseOverlayView.setImageBitmap(ravenTurnBmp)
-                                poseOverlayView.animate().alpha(1f).setDuration(210L).start()
-                                perchPoseRevertAtMs = now + Random.nextLong(950L, 1750L)
-                                nextPerchLifeAtMs = perchPoseRevertAtMs + Random.nextLong(1800L, 3800L)
-                            }
-                        }
-                    } else if (!showingRavenOnStone && !isStandbyMode && now >= nextMjolnirIdleArcAtMs) {
-                        // Living Mjolnir: subtle crisp electric crackle across hammer head every 4.5-8.5s!
+                    if (!showingRavenOnStone && !isStandbyMode && now >= nextMjolnirIdleArcAtMs) {
                         nextMjolnirIdleArcAtMs = now + Random.nextLong(4600L, 8400L)
-                        triggerElectricStrikeBurst(durationMs = 290L, intensity = 0.72f)
+                        triggerElectricStrikeBurst(durationMs = 280L, intensity = 0.72f)
                     }
 
                     invalidate()
@@ -1234,31 +1342,216 @@ object LivingPedestalDirector {
         }
     }
 
+    /**
+     * 60fps Sub-Pixel Living Raven Mesh + Synchronized Isolated Eye-Blink Renderer (0.000px cloud/stone jump!).
+     */
+    private class LivingPedestalArtMeshView(ctx: Context) : View(ctx) {
+        private val mCols = 20
+        private val mRows = 24
+        private val verts = FloatArray((mCols + 1) * (mRows + 1) * 2)
+        private val artPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+        private val blinkPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        private val dstRect = RectF()
+
+        private var showRaven = false
+        private var curTiltRad = 0f; private var targetTiltRad = 0f
+        private var curLookX = 0f;   private var targetLookX = 0f
+        private var curLookY = 0f;   private var targetLookY = 0f
+        private var nextPoseGoalAtMs = SystemClock.elapsedRealtime() + 1800L
+
+        private var blinkAlpha = 0f
+        private var blinkStartMs = 0L
+        private var blinkDurMs = 190L
+        private var nextBlinkAtMs = SystemClock.elapsedRealtime() + 2100L
+        private var pendingSecondBlink = false
+
+        fun setMode(showRaven: Boolean, preLandingFadeIn: Boolean) {
+            this.showRaven = showRaven
+            blinkAlpha = 0f
+            blinkStartMs = 0L
+            if (!showRaven) {
+                curTiltRad = 0f; targetTiltRad = 0f
+                curLookX = 0f; targetLookX = 0f; curLookY = 0f; targetLookY = 0f
+            } else if (preLandingFadeIn) {
+                // Slight forward settle recoil as talons touch stone!
+                curLookY = dp(context, 1.8f); targetLookY = 0f
+                curTiltRad = 0.04f; targetTiltRad = 0f
+                nextPoseGoalAtMs = SystemClock.elapsedRealtime() + 1400L
+            }
+            invalidate()
+        }
+
+        fun stepLivingMotion(dt: Float, nowMs: Long, elapsedMs: Long) {
+            if (!showRaven) return
+            val w = width.toFloat(); val h = height.toFloat()
+            if (w <= 4f || h <= 4f) return
+
+            // 1. Smooth Damped-Spring Head Tilt & Inquisitive Look Goals (0 frame-cuts!)
+            if (nowMs >= nextPoseGoalAtMs) {
+                when (Random.nextInt(4)) {
+                    0 -> { targetTiltRad = 0.082f;  targetLookX = dp(context, 2.2f);  targetLookY = dp(context, 1.4f) }  // Inquisitive cock down-right
+                    1 -> { targetTiltRad = -0.058f; targetLookX = dp(context, 1.1f);  targetLookY = -dp(context, 1.6f) } // Alert sentinel head lift
+                    2 -> { targetTiltRad = 0.045f;  targetLookX = -dp(context, 1.4f); targetLookY = dp(context, 0.5f) }  // Subtle tuck
+                    else -> { targetTiltRad = 0f;   targetLookX = 0f;                 targetLookY = 0f }                 // Calm neutral
+                }
+                nextPoseGoalAtMs = nowMs + Random.nextLong(1900L, 3800L)
+            }
+            val spring = min(1f, dt * 3.8f)
+            curTiltRad += (targetTiltRad - curTiltRad) * spring
+            curLookX += (targetLookX - curLookX) * spring
+            curLookY += (targetLookY - curLookY) * spring
+
+            // 2. Crisp Natural Avian Single & Double Eyelid Blink (strictly on 40px eye patch!)
+            if (blinkStartMs > 0L) {
+                val bEl = nowMs - blinkStartMs
+                if (bEl >= blinkDurMs) {
+                    blinkStartMs = 0L
+                    blinkAlpha = 0f
+                    if (pendingSecondBlink) {
+                        pendingSecondBlink = false
+                        nextBlinkAtMs = nowMs + 130L
+                    } else {
+                        nextBlinkAtMs = nowMs + Random.nextLong(2200L, 4800L)
+                    }
+                } else {
+                    blinkAlpha = sin((bEl.toDouble() / blinkDurMs.toDouble()) * Math.PI).toFloat().coerceIn(0f, 1f)
+                }
+            } else if (nowMs >= nextBlinkAtMs) {
+                blinkStartMs = nowMs
+                blinkDurMs = 185L
+                pendingSecondBlink = Random.nextFloat() < 0.28f
+            }
+
+            // 3. Build 20x24 Continuous Mesh: Head pivots smoothly around neck (0.44w, 0.30h), chest breathes, stone & borders = 0.0px!
+            val breath = sin((elapsedMs.toDouble() / 3200.0) * Math.PI * 2.0).toFloat()
+            val pivotX = w * 0.44f
+            val pivotY = h * 0.30f
+            val cosT = cos(curTiltRad.toDouble()).toFloat()
+            val sinT = sin(curTiltRad.toDouble()).toFloat()
+
+            for (r in 0..mRows) {
+                val ny = r.toFloat() / mRows.toFloat()
+                val baseY = ny * h
+                // Strictly lock card edges (0, 1) and stone pedestal (ny >= 0.55) to 0.000px!
+                val borderGuardY = (min(ny / 0.08f, (0.55f - ny) / 0.09f)).coerceIn(0f, 1f)
+                for (c in 0..mCols) {
+                    val nx = c.toFloat() / mCols.toFloat()
+                    val baseX = nx * w
+                    val borderGuardX = (min(nx / 0.10f, (1f - nx) / 0.10f)).coerceIn(0f, 1f)
+                    val guard = borderGuardX * borderGuardY
+
+                    var dx = 0f
+                    var dy = 0f
+                    if (guard > 0.001f) {
+                        // Smooth Gaussian head envelope centered on Raven head/beak (0.46w, 0.20h)
+                        val hdx = (nx - 0.46f) / 0.19f
+                        val hdy = (ny - 0.20f) / 0.14f
+                        val wHead = exp((-0.5f * (hdx * hdx + hdy * hdy)).toDouble()).toFloat() * guard
+
+                        val rx = baseX - pivotX
+                        val ry = baseY - pivotY
+                        val rotDx = (rx * cosT - ry * sinT) - rx
+                        val rotDy = (rx * sinT + ry * cosT) - ry
+
+                        // Smooth chest ribcage breath centered at (0.48w, 0.40h)
+                        val cdx = (nx - 0.48f) / 0.16f
+                        val cdy = (ny - 0.40f) / 0.11f
+                        val wChest = exp((-0.5f * (cdx * cdx + cdy * cdy)).toDouble()).toFloat() * guard
+
+                        dx = (rotDx + curLookX) * wHead + breath * dp(context, 1.05f) * wChest
+                        dy = (rotDy + curLookY) * wHead - breath * dp(context, 0.55f) * wChest
+                    }
+
+                    val idx = (r * (mCols + 1) + c) * 2
+                    verts[idx] = baseX + dx
+                    verts[idx + 1] = baseY + dy
+                }
+            }
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat(); val h = height.toFloat()
+            if (w <= 4f || h <= 4f) return
+            if (!showRaven) {
+                val mBmp = mjolnirBaseBmp ?: ravenBaseBmp ?: return
+                dstRect.set(0f, 0f, w, h)
+                canvas.drawBitmap(mBmp, null, dstRect, artPaint)
+                return
+            }
+            val rBmp = ravenBaseBmp ?: return
+            canvas.drawBitmapMesh(rBmp, mCols, mRows, verts, 0, null, 0, artPaint)
+            if (blinkAlpha > 0.02f) {
+                ravenEyeBlinkPatchBmp?.let { eyeBmp ->
+                    blinkPaint.alpha = (blinkAlpha * 255f).toInt().coerceIn(0, 255)
+                    canvas.drawBitmapMesh(eyeBmp, mCols, mRows, verts, 0, null, 0, blinkPaint)
+                }
+            }
+        }
+    }
+
+    /**
+     * Deep Chiseled Ember + Dual Specular Sweep + Lightning-Resonance Pedestal Runes Drawable.
+     */
     private class ShimmeringRuneOverlayDrawable(private val runesBitmap: Bitmap) : Drawable() {
         private val normRect = RectF(0.32031f, 0.61129f, 0.62813f, 0.89530f)
-        private val basePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply { alpha = 248 }
-        private val maskPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { alpha = 255 }
+        private val shadowPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = PorterDuffColorFilter(0xCC2A1502.toInt(), PorterDuff.Mode.SRC_IN)
+        }
+        private val basePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+        private val maskPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP) }
         private val dstRect = RectF()
-        var shimmerPhase: Float = 0f
+        private val shadowRect = RectF()
+        private var shimmerPhase = 0f
+        private var emberBreath = 0f
+        private var strikeFlash = 0f
+
+        fun triggerLightningResonance() {
+            strikeFlash = 1.0f
+            invalidateSelf()
+        }
+
+        fun tick(dt: Float, elapsedMs: Long) {
+            shimmerPhase = (elapsedMs % 3400L).toFloat() / 3400f
+            emberBreath = (0.5 + 0.5 * sin((elapsedMs.toDouble() / 2200.0) * Math.PI * 2.0)).toFloat()
+            if (strikeFlash > 0f) strikeFlash = (strikeFlash - dt * 2.6f).coerceAtLeast(0f)
+            invalidateSelf()
+        }
 
         override fun draw(canvas: Canvas) {
             val b = bounds; if (b.isEmpty) return
             val bw = b.width().toFloat(); val bh = b.height().toFloat()
             dstRect.set(b.left + normRect.left * bw, b.top + normRect.top * bh, b.left + normRect.right * bw, b.top + normRect.bottom * bh)
+
+            // 1. Carved stone depth offset shadow so runes look physically chiseled into the rock!
+            val offPx = max(1f, bw * 0.008f)
+            shadowRect.set(dstRect.left + offPx, dstRect.top + offPx, dstRect.right + offPx, dstRect.bottom + offPx)
+            canvas.drawBitmap(runesBitmap, null, shadowRect, shadowPaint)
+
+            // 2. Warm breathing molten-gold rune base
+            basePaint.alpha = (225 + 30 * emberBreath).toInt().coerceIn(0, 255)
             canvas.drawBitmap(runesBitmap, null, dstRect, basePaint)
+
+            // 3. Travelling 24k specular glint + electric lightning resonance masked strictly inside rune strokes
             val rw = dstRect.width(); val rh = dstRect.height()
             val lid = canvas.saveLayer(dstRect, null)
             canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
-            val p1 = (shimmerPhase % 1f + 1f) % 1f
-            val sx = dstRect.left - rw * 0.65f + (rw * 2.30f) * p1
-            val sy = dstRect.top - rh * 0.25f + (rh * 0.70f) * p1
+
+            val sx = dstRect.left - rw * 0.55f + (rw * 2.10f) * shimmerPhase
+            val sy = dstRect.top - rh * 0.20f + (rh * 0.65f) * shimmerPhase
             sweepPaint.shader = LinearGradient(
-                sx, sy, sx + rw * 0.44f, sy + rh * 0.30f,
-                intArrayOf(0x00B6862C, 0x66F1C833, 0xEEFFF791.toInt(), 0xFFFFFBEB.toInt(), 0xEEFFF791.toInt(), 0x66F1C833, 0x00B6862C),
-                floatArrayOf(0f, 0.24f, 0.44f, 0.50f, 0.56f, 0.76f, 1f), Shader.TileMode.CLAMP
+                sx, sy, sx + rw * 0.42f, sy + rh * 0.28f,
+                intArrayOf(0x00966B12, 0x88D4A234.toInt(), 0xFFFFF08A.toInt(), 0xFFFFFBEB.toInt(), 0xFFFFF08A.toInt(), 0x88D4A234.toInt(), 0x00966B12),
+                floatArrayOf(0f, 0.22f, 0.44f, 0.50f, 0.56f, 0.78f, 1f), Shader.TileMode.CLAMP
             )
             canvas.drawRect(dstRect, sweepPaint)
+
+            if (strikeFlash > 0.02f) {
+                sweepPaint.shader = null
+                sweepPaint.color = Color.argb((strikeFlash * 225f).toInt(), 255, 251, 235)
+                canvas.drawRect(dstRect, sweepPaint)
+            }
             canvas.restoreToCount(lid)
         }
 

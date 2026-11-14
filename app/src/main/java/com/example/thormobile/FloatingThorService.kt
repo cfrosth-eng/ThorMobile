@@ -651,6 +651,16 @@ class FloatingThorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "com.example.thormobile.DEMO_SILENT_RAVEN") {
+            VikingPopupOverlayManager.showRavenCard(
+                context = this,
+                serverBaseUrl = "https://thor-api-443941171993.us-east4.run.app",
+                title = "Huginn Patrol — Fluid V3 Check",
+                message = "60fps mesh Raven, continuous C1 spline flight, rich 24k 6:00 funnel drip, and full-bottom growing molten gold pile active in silent mode, Boss.",
+                eventKeyOverride = "RAVEN_SILENT_${System.currentTimeMillis()}"
+            )
+            return START_STICKY
+        }
         if (intent?.action == ACTION_THOR_RESUME_MIC) {
             if (!destroyed && !userRequestedStop && !isStandby && canAutoResumeMic && hasMicPermission()) {
                 Log.i(TAG_AUDIO, "WO-139: Autonomous Thor Mic Re-Open triggered to deliver pending reply.")
