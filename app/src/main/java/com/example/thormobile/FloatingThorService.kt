@@ -436,7 +436,7 @@ class FloatingThorService : Service() {
                     fireArtworkLightningCascade(durationMs = 450L)
                     handleOverlayTap()
                 } else {
-                    toast("Thor is resting. Double-tap pedestal to wake.")
+                    LivingPedestalDirector.pulseMutedRunesFeedback()
                 }
                 return true
             }
@@ -629,7 +629,7 @@ class FloatingThorService : Service() {
             mainHandler.post {
                 applyVisualState()
                 fireArtworkLightningCascade(durationMs = 450L)
-                toast("Microphone Locked. Thor is listening.")
+                // WO-164: Gold pedestal runes indicate Mic ON (no bottom toast)
             }
             synchronized(lock) { ensureCapture() }
             mainHandler.post { refreshNotification() }
@@ -644,7 +644,7 @@ class FloatingThorService : Service() {
             stopCaptureAndReleaseMic()
             mainHandler.post {
                 applyVisualState()
-                toast(if (LivingPedestalDirector.hasUnreadRaven) "Standby Mute: Mic Off (Raven & animations stay active for silent inspection)." else "Standby Mode: Microphone Free for Other Apps.")
+                // WO-164: Crimson pedestal runes indicate Mic OFF (no bottom toast)
                 refreshNotification()
             }
         }
@@ -1067,7 +1067,7 @@ class FloatingThorService : Service() {
                 flushPlayback()
                 try { webSocket?.send("INTERRUPT") } catch (_: Exception) {}
             } else {
-                toast("Listening... (Double-tap to hang up)")
+                // WO-164: Silent active listening
             }
         } else if (hasMicPermission()) {
             startSession(keepPreRoll = false)
