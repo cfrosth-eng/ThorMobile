@@ -85,8 +85,8 @@ class FloatingThorService : Service() {
         private const val BRIDGE_URL = "wss://thor-api-443941171993.us-east4.run.app"
         // Single-Cloud Architecture (V25.2): Direct connection to primary thor-api only
         private const val END_SESSION_TEXT = "END_SESSION"
-        private const val END_DRAIN_MAX_MS = 16_000L
-        private const val END_DRAIN_TAIL_MS = 420L
+        private const val END_DRAIN_MAX_MS = 28_000L
+        private const val END_DRAIN_TAIL_MS = 850L
         private const val MIC_SETTLE_DELAY_MS = 25L
         private const val ASSET_DIR = "wakeword"
         private const val WAKE_THRESHOLD = 0.8f
@@ -1288,14 +1288,22 @@ class FloatingThorService : Service() {
         var quietChecks = 0
         mainHandler.post(object : Runnable {
             override fun run() {
-                if (sessionId != activeSession) return
-                val quiet = playbackQueue.isEmpty() && !playbackBusy && remainingHardwareSpeechMs() <= 0L
+                if (sessionId != activeSession || !endingSession) return
+                val nowEl = SystemClock.elapsedRealtime()
+                val sinceLastChunk = if (lastPcmChunkArrivalMs > 0L) (nowEl - lastPcmChunkArrivalMs) else 9999L
+                val quiet = !awaitingThorReply &&
+                    playbackQueue.isEmpty() &&
+                    !playbackBusy &&
+                    remainingHardwareSpeechMs() <= 0L &&
+                    sinceLastChunk >= 650L
                 quietChecks = if (quiet) quietChecks + 1 else 0
                 when {
-                    quietChecks >= 3 -> mainHandler.postDelayed({
-                        if (sessionId == activeSession) stopStreamingAudio()
+                    quietChecks >= 6 -> mainHandler.postDelayed({
+                        if (sessionId == activeSession && endingSession && !playbackBusy && playbackQueue.isEmpty()) {
+                            stopStreamingAudio()
+                        }
                     }, END_DRAIN_TAIL_MS)
-                    SystemClock.elapsedRealtime() >= deadline -> stopStreamingAudio()
+                    nowEl >= deadline -> stopStreamingAudio()
                     else -> mainHandler.postDelayed(this, 100)
                 }
             }
@@ -1348,6 +1356,9 @@ class FloatingThorService : Service() {
                 }
                 preRoll.drain { ws.send(it.toByteString(0, it.size)) }
                 socketReady = true
+                socketDroppedDuringTurn = false
+                waitingForCloudBurst = false
+                valleyReconnectAttempts = 0
                 val lat = lastKnownLat
                 val lon = lastKnownLon
                 if (lat != null && lon != null) {
@@ -1845,14 +1856,14 @@ class FloatingThorService : Service() {
                 if (playbackBusy || playbackQueue.isNotEmpty() || remHwMs > 0L) {
                     lastHardwareSpeechActiveMs = nowPlaybackMs
                 }
-                val inPlaybackWindow = playbackBusy || playbackQueue.isNotEmpty() || remHwMs > 0L || (nowPlaybackMs - lastHardwareSpeechActiveMs < 420L)
-                val canBargeNow = playbackQueue.isNotEmpty() || remHwMs > 240L
+                val postPlaybackEchoTailMs = if (cachedExternalAudioOut) 1150L else 680L
+                val inPlaybackWindow = playbackBusy || playbackQueue.isNotEmpty() || remHwMs > 0L || (nowPlaybackMs - lastHardwareSpeechActiveMs < postPlaybackEchoTailMs)
+                val canBargeNow = playbackQueue.isNotEmpty() || remHwMs > 320L
 
                 if (inPlaybackWindow) {
-                    // Calibrate live speaker echo on first 350ms & volume-key presses; never blindly flush AudioTrack on speaker bleed!
-                    val inCalibOrVolGrace = (nowPlaybackMs < volChangedCooldownUntilMs) || (nowPlaybackMs - playbackStartedAtMs < 350L)
+                    val inCalibOrVolGrace = (nowPlaybackMs < volChangedCooldownUntilMs) || (nowPlaybackMs - playbackStartedAtMs < 420L)
                     val bargeTrig = if (cachedExternalAudioOut) {
-                        kotlin.math.max(420.0, echoBaselineRms * 1.65 + 220.0)
+                        kotlin.math.max(780.0, echoBaselineRms * 1.85 + 340.0)
                     } else {
                         kotlin.math.max(960.0 + volRatio * 600.0, echoBaselineRms * 1.90 + 400.0)
                     }
@@ -1991,7 +2002,16 @@ class FloatingThorService : Service() {
                             val turnSnapshot = currentTurnPcm.toByteArray()
                             val snapSession = activeSession
                             mainHandler.postDelayed({
-                                if (waitingForCloudBurst && snapSession == activeSession && !socketReady && !offlineModeActive) {
+                                if (waitingForCloudBurst && snapSession == activeSession && socketReady && !offlineModeActive) {
+                                    waitingForCloudBurst = false
+                                    socketDroppedDuringTurn = false
+                                    awaitingThorReply = true
+                                    awaitingReplySinceMs = SystemClock.elapsedRealtime()
+                                    try { webSocket?.send(turnSnapshot.toByteString(0, turnSnapshot.size)) } catch (_: Exception) {}
+                                    try { webSocket?.send("END_OF_TURN") } catch (_: Exception) {}
+                                    turnSpeechDetected = false
+                                    currentTurnPcm.reset()
+                                } else if (waitingForCloudBurst && snapSession == activeSession && !socketReady && !offlineModeActive) {
                                     waitingForCloudBurst = false
                                     turnSpeechDetected = false
                                     currentTurnPcm.reset()
@@ -2319,7 +2339,7 @@ class FloatingThorService : Service() {
 
     private fun buildNotification(sessionActive: Boolean, wakeReady: Boolean): Notification {
         val text = when {
-            sessionActive -> "In conversation. Double-tap icon or pause 8s to hang up."
+            sessionActive -> "In conversation. Double-tap icon or pause 28s to hang up."
             isStandby -> "Standby Mode (Mic Free). Double-tap icon to wake."
             wakeReady -> "Listening for 'Thor' (or Single-Tap icon to talk)."
             else -> "Single-Tap icon to talk, Double-Tap to free mic."
