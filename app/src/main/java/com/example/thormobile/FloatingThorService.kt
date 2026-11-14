@@ -411,8 +411,8 @@ class FloatingThorService : Service() {
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = posPrefs.getInt(keyPedX, defaultX)
-        params.y = posPrefs.getInt(keyPedY, defaultY)
+        params.x = defaultX
+        params.y = defaultY
         windowManager.addView(floatingView, params)
 
         applyVisualState()
@@ -651,6 +651,11 @@ class FloatingThorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "com.example.thormobile.DEMO_SILENT_STANDBY") {
+            if (!isStandby) toggleStandby()
+            VikingPopupOverlayManager.showRavenCard(this, "https://thor-api-443941171993.us-east4.run.app", "Huginn Patrol — V4 Polish", "Mic muted in Standby so you can watch in peace, Boss. Double-tap pedestal tomorrow to wake mic.", eventKeyOverride = "RAVEN_V4_${System.currentTimeMillis()}")
+            return START_STICKY
+        }
         if (intent?.action == "com.example.thormobile.DEMO_SILENT_RAVEN") {
             VikingPopupOverlayManager.showRavenCard(
                 context = this,

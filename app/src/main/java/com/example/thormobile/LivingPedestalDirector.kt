@@ -86,6 +86,8 @@ object LivingPedestalDirector {
     private var mjolnirSwapHaloBmp: Bitmap? = null
     private var ravenBaseBmp: Bitmap? = null
     private var ravenEyeBlinkPatchBmp: Bitmap? = null
+    private var ravenFgOccluderBmp: Bitmap? = null
+    private var mjolnirFgOccluderBmp: Bitmap? = null
     private var ringStripBmp: Bitmap? = null
     private var runesGoldBmp: Bitmap? = null
     private val boltCores = arrayOfNulls<Bitmap>(4)
@@ -157,6 +159,8 @@ object LivingPedestalDirector {
         mjolnirSwapHaloBmp = decodeRaw(app, R.drawable.mjolnir_swap_bolt_halo)
         ravenBaseBmp = decodeRaw(app, R.drawable.raven_storm_base_hd)
         ravenEyeBlinkPatchBmp = decodeRaw(app, R.drawable.raven_eye_blink_patch)
+        ravenFgOccluderBmp = decodeRaw(app, R.drawable.raven_fg_occluder)
+        mjolnirFgOccluderBmp = decodeRaw(app, R.drawable.mjolnir_fg_occluder)
         ringStripBmp = decodeRaw(app, R.drawable.raven_gold_ring_strip)
         runesGoldBmp = decodeRaw(app, R.drawable.raven_runes_gold_hd)
 
@@ -249,8 +253,7 @@ object LivingPedestalDirector {
                 onLiftoffImmediate = null,
                 onPreLandingLightningMask = {
                     // Dissolve Mjolnir in electric lightning BEFORE flying Raven overlaps pedestal (0 hammer-through-chest!)
-                    crest.hideMjolnirForIncomingLanding()
-                    crest.triggerElectricStrikeBurst(440L)
+                    crest.triggerElectricStrikeBurst(240L)
                 },
                 onTouchdownExact = {
                     ravenCurrentlyPerched = true
@@ -345,8 +348,7 @@ object LivingPedestalDirector {
                 },
                 onPreLandingLightningMask = {
                     if (hasUnreadRaven) {
-                        attachedCrestView?.hideMjolnirForIncomingLanding()
-                        attachedCrestView?.triggerElectricStrikeBurst(440L)
+                        attachedCrestView?.triggerElectricStrikeBurst(240L)
                     }
                 },
                 onTouchdownExact = {
@@ -512,6 +514,15 @@ object LivingPedestalDirector {
         val initialPerch = getPerchInOverlayCoords(app, stageView)
         val (initPts, totalDur) = buildSmoothSplineWaypoints(app, mode, initialPerch)
         waypoints = initPts
+        val arcSamples = 240
+        val arcCum = FloatArray(arcSamples + 1)
+        val tmpP = PointF(); val tmpV = PointF(); var prevX = 0f; var prevY = 0f
+        for (s in 0..arcSamples) {
+            evalCatmullRom(initPts, s.toFloat() / arcSamples.toFloat(), tmpP, tmpV)
+            if (s > 0) arcCum[s] = arcCum[s - 1] + hypot((tmpP.x - prevX).toDouble(), (tmpP.y - prevY).toDouble()).toFloat()
+            prevX = tmpP.x; prevY = tmpP.y
+        }
+        val totalArc = arcCum[arcSamples].coerceAtLeast(1f)
 
         flightAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = totalDur
@@ -529,8 +540,14 @@ object LivingPedestalDirector {
                     FlightMode.PATROL -> (0.5 - 0.5 * cos(rawU.toDouble() * Math.PI)).toFloat()
                 }.coerceIn(0f, 1f)
 
+                val targetDist = easedU * totalArc
+                var lo = 0; var hi = arcSamples
+                while (lo < hi) { val mid = (lo + hi) ushr 1; if (arcCum[mid] < targetDist) lo = mid + 1 else hi = mid }
+                val sIdx = lo.coerceIn(1, arcSamples)
+                val segSpan = (arcCum[sIdx] - arcCum[sIdx - 1]).coerceAtLeast(1e-3f)
+                val arcU = ((sIdx - 1) + (targetDist - arcCum[sIdx - 1]) / segSpan) / arcSamples.toFloat()
                 val pts = waypoints ?: initPts
-                evalCatmullRom(pts, easedU, posOut, velOut)
+                evalCatmullRom(pts, arcU.coerceIn(0f, 0.9999f), posOut, velOut)
 
                 // Continuous 60fps wingbeat cycle (0..4) with soaring glide during fast dives
                 val elapsedSec = (now - startMs).toFloat() / 1000f
@@ -561,21 +578,15 @@ object LivingPedestalDirector {
                     else -> 1.00f + 0.08f * sin(easedU * Math.PI).toFloat()
                 }
 
-                // Fire electric lightning & hide Mjolnir at u >= 0.85 BEFORE Raven overlaps the hammer!
-                if (!preMaskFired && mode != FlightMode.DEPARTURE && easedU >= 0.85f) {
+                if (!preMaskFired && mode != FlightMode.DEPARTURE && easedU >= 0.80f) {
                     preMaskFired = true
                     onPreLandingLightningMask?.invoke()
                 }
-                if (!touchdownFired && mode != FlightMode.DEPARTURE && easedU >= 0.93f) {
+                if (!touchdownFired && mode != FlightMode.DEPARTURE && easedU >= 0.985f) {
                     touchdownFired = true
                     onTouchdownExact?.invoke()
                 }
-
-                val alphaFade = when {
-                    mode != FlightMode.DEPARTURE && easedU > 0.91f -> ((1f - easedU) / 0.09f).coerceIn(0f, 1f)
-                    mode == FlightMode.DEPARTURE && easedU > 0.88f -> ((1f - easedU) / 0.12f).coerceIn(0f, 1f)
-                    else -> 1f
-                }
+                val alphaFade = 1f
 
                 val lockRight = (mode != FlightMode.DEPARTURE && easedU > 0.82f) || (mode != FlightMode.ARRIVAL && easedU < 0.14f)
                 val pitchDampen = if (mode != FlightMode.DEPARTURE && easedU > 0.80f) ((1f - easedU) / 0.20f).coerceIn(0f, 1f) else 1f
@@ -667,15 +678,8 @@ object LivingPedestalDirector {
             canvas.rotate(smoothPitchDeg)
             dstRect.set(-half, -half, half, half)
 
-            if (idxA == idxB || blend <= 0.02f) {
-                paintA.alpha = (curAlpha * 255f).toInt().coerceIn(0, 255)
-                canvas.drawBitmap(bmpA, null, dstRect, paintA)
-            } else {
-                paintA.alpha = (curAlpha * (1f - blend * 0.65f) * 255f).toInt().coerceIn(0, 255)
-                paintB.alpha = (curAlpha * blend * 255f).toInt().coerceIn(0, 255)
-                canvas.drawBitmap(bmpA, null, dstRect, paintA)
-                canvas.drawBitmap(bmpB, null, dstRect, paintB)
-            }
+            paintA.alpha = 255
+            canvas.drawBitmap(if (blend < 0.5f) bmpA else bmpB, null, dstRect, paintA)
             canvas.restore()
         }
     }
@@ -690,7 +694,7 @@ object LivingPedestalDirector {
 
         override fun draw(canvas: Canvas) {
             val p = progress
-            if (p < 0f || p > 1f) return
+            if (ravenCurrentlyPerched || p < 0f || p > 1f) return
             val b = bounds; if (b.isEmpty) return
             val core = mjolnirSwapCoreBmp ?: boltCores[0] ?: return
             val halo = mjolnirSwapHaloBmp ?: boltHalos[0] ?: core
@@ -778,7 +782,8 @@ object LivingPedestalDirector {
 
             val (physW, physH) = getPhysicalGlassSize(context)
             val sw = max(width.toFloat(), physW.toFloat())
-            val sh = max(height.toFloat(), physH.toFloat())
+            val wLoc = IntArray(2); getLocationOnScreen(wLoc)
+            val sh = (physH - wLoc[1]).toFloat().coerceAtLeast(200f)
             val gravity = dp(context, 540f)
 
             texShift = (texShift + dt * 95f) % 2048f
@@ -788,7 +793,7 @@ object LivingPedestalDirector {
                 recoilPhase = (recoilPhase - dt * 6.5f).coerceAtLeast(0f)
             }
             if (flowActive) {
-                pendantFill += dt * 1.38f // ~0.72s per rich molten droplet
+                pendantFill += dt * 0.92f
                 if (pendantFill >= 1f) {
                     pendantFill = 0f
                     recoilPhase = 1f
@@ -798,7 +803,7 @@ object LivingPedestalDirector {
                         x = rimX + (Random.nextFloat() - 0.5f) * dp(context, 1.4f)
                         y = rimY + dp(context, 10.5f)
                         vy = dp(context, 42f)
-                        r = dp(context, Random.nextFloat() * 0.9f + 3.2f)
+                        r = dp(context, Random.nextFloat() * 1.2f + 4.5f)
                         volumeWeight = 1.0f
                     }
                     // Plateau-Rayleigh tiny trailing satellite micro-bead!
@@ -830,8 +835,8 @@ object LivingPedestalDirector {
                 if (d.y >= localSurfaceY) {
                     d.active = false
                     // Deposit real molten gold volume centered at impact column (grows up to ~38dp mound!)
-                    val addPeak = dp(context, 1.65f) * d.volumeWeight
-                    val maxMoundPx = dp(context, 38f)
+                    val addPeak = dp(context, 5.2f) * d.volumeWeight
+                    val maxMoundPx = dp(context, 64f)
                     for (k in max(0, colIdx - 6)..min(cols, colIdx + 6)) {
                         val dist = (k - colIdx).toFloat()
                         val w = exp((-dist * dist / 7.5f).toDouble()).toFloat()
@@ -894,7 +899,7 @@ object LivingPedestalDirector {
             dropPath.reset()
             if (topPinY != null) {
                 // Continuous liquid-metal funnel bridge merging straight out of the 6:00 gold frame!
-                val funnelHalfW = dp(context, 7.5f) * (1f - 0.35f * (cy - topPinY) / dp(context, 14f)).coerceIn(0.4f, 1f)
+                val funnelHalfW = dp(context, 13.5f) * (1f - 0.30f * (cy - topPinY) / dp(context, 18f)).coerceIn(0.45f, 1f)
                 val waistHalfW = (r * 0.52f).coerceAtLeast(dp(context, 1.1f))
                 val waistY = topPinY + (cy - topPinY) * 0.48f
                 dropPath.moveTo(cx - funnelHalfW, topPinY - dp(context, 2.0f))
@@ -931,13 +936,14 @@ object LivingPedestalDirector {
         override fun onDraw(canvas: Canvas) {
             val (physW, physH) = getPhysicalGlassSize(context)
             val sw = max(width.toFloat(), physW.toFloat())
-            val sh = max(height.toFloat(), physH.toFloat())
+            val wLoc = IntArray(2); getLocationOnScreen(wLoc)
+            val sh = (physH - wLoc[1]).toFloat().coerceAtLeast(200f)
 
             // 1. Attached Swelling / Recoiling Liquid-Gold Meniscus right on the 6:00 Frame Rim!
             if (flowing || pendantFill > 0.04f) {
                 val recoilLift = recoilPhase * dp(context, 3.2f)
-                val neckDrop = (pendantFill * pendantFill * dp(context, 10.5f) - recoilLift).coerceAtLeast(dp(context, 1.2f))
-                val rad = dp(context, 1.8f + 1.85f * pendantFill)
+                val neckDrop = (pendantFill * pendantFill * dp(context, 13.5f) - recoilLift).coerceAtLeast(dp(context, 2.0f))
+                val rad = dp(context, 3.1f + 4.8f * pendantFill)
                 drawRichGoldTeardrop(canvas, rimX, rimY + neckDrop, rad, topPinY = rimY, stretch = 1.4f)
             }
 
@@ -1480,11 +1486,12 @@ object LivingPedestalDirector {
                 return
             }
             val rBmp = ravenBaseBmp ?: return
-            canvas.drawBitmapMesh(rBmp, mCols, mRows, verts, 0, null, 0, artPaint)
+            dstRect.set(0f, 0f, w, h)
+            canvas.drawBitmap(rBmp, null, dstRect, artPaint)
             if (blinkAlpha > 0.02f) {
                 ravenEyeBlinkPatchBmp?.let { eyeBmp ->
                     blinkPaint.alpha = (blinkAlpha * 255f).toInt().coerceIn(0, 255)
-                    canvas.drawBitmapMesh(eyeBmp, mCols, mRows, verts, 0, null, 0, blinkPaint)
+                    canvas.drawBitmap(eyeBmp, null, dstRect, blinkPaint)
                 }
             }
         }
@@ -1607,9 +1614,13 @@ object LivingPedestalDirector {
             invalidateSelf()
         }
 
+        private val occPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) }
+        private val fullRect = RectF()
         override fun draw(canvas: Canvas) {
             val b = bounds; if (b.isEmpty) return
             val bw = b.width().toFloat(); val bh = b.height().toFloat()
+            fullRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+            val lid = canvas.saveLayer(fullRect, null)
             val nowMs = SystemClock.elapsedRealtime()
             for (i in 0 until 4) {
                 val st = startMs[i]; if (st <= 0L) continue
@@ -1627,6 +1638,10 @@ object LivingPedestalDirector {
                 canvas.drawBitmap(core, null, dstRect, corePaint)
                 canvas.restore()
             }
+            (if (ravenCurrentlyPerched) ravenFgOccluderBmp else mjolnirFgOccluderBmp)?.let { occ ->
+                canvas.drawBitmap(occ, null, fullRect, occPaint)
+            }
+            canvas.restoreToCount(lid)
         }
 
         override fun setAlpha(alpha: Int) { corePaint.alpha = alpha }
