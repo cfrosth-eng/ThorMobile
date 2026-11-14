@@ -45,7 +45,7 @@ object ObdLinkAutoWatchdog {
                 cloudWatchdogMode = m
             }
             val pCmd = liveObj.optString("pending_cmd", "").uppercase().trim()
-            if (pCmd == "CLEAR_DTCS" || pCmd == "FULL_SCAN") {
+            if (pCmd == "CLEAR_DTCS" || pCmd == "FULL_SCAN" || pCmd == "ROAD_TEST_30S") {
                 pendingServerCmd = pCmd
             }
         } catch (_: Exception) {}
@@ -116,12 +116,204 @@ object ObdLinkAutoWatchdog {
         return fullSummary
     }
 
+    private fun execute30SecRoadTestFlightRecorder(
+        serverBaseUrl: String,
+        outs: OutputStream,
+        ins: InputStream,
+        detectedVin: String,
+        isHemiV8: Boolean,
+        unsupportedMode22: MutableSet<String>
+    ) {
+        Log.i(TAG, "WO-150: Starting 30-Second High-Speed Road-Test Flight Recorder...")
+        val maxCyl = if (isHemiV8) 8 else 6
+        val preCyl = IntArray(maxCyl + 1)
+        for (c in 1..maxCyl) {
+            val mid = "A" + (c + 1)
+            preCyl[c] = extractMode06MisfireCount(sendAtCommand(outs, ins, "06$mid", 950L), mid)
+        }
+
+        val tStart = System.currentTimeMillis()
+        var frames = 0
+        var minRpm = 9999.0
+        var maxRpm = 0.0
+        var steadyCruiseRpmJitter = 0.0
+        var prevRpm = -1.0
+        var prevMph = -1
+        var prevTps = -1.0
+        var maxTccSlip = 0.0
+        var maxTransF = 0.0
+        var minRailPsi = 9999.0
+        var maxRailPsi = 0.0
+        var maxAbsStft = 0.0
+        var maxKrDeg = 0.0
+        var mafGlitchesInTest = 0
+        var lastSnapshot = ""
+
+        while (running && (System.currentTimeMillis() - tStart) < 30_000L) {
+            val rpm = decodeRpmOrNull(sendAtCommand(outs, ins, "010C", 500L)) ?: 0.0
+            val mph = ((decodeSingleByteOrNull(sendAtCommand(outs, ins, "010D", 450L), "410D") ?: 0) * 0.621371).toInt()
+            val tps = decodePctByte(sendAtCommand(outs, ins, "0111", 450L), "4111")
+            val load = decodePctByte(sendAtCommand(outs, ins, "0104", 450L), "4104")
+            val mapK = decodeSingleByteOrNull(sendAtCommand(outs, ins, "010B", 450L), "410B") ?: 0
+            val st1 = decodeFuelTrimPct(sendAtCommand(outs, ins, "0106", 450L), "4106")
+            val lt1 = decodeFuelTrimPct(sendAtCommand(outs, ins, "0107", 450L), "4107")
+            val st2 = decodeFuelTrimPct(sendAtCommand(outs, ins, "0108", 450L), "4108")
+            val lt2 = decodeFuelTrimPct(sendAtCommand(outs, ins, "0109", 450L), "4109")
+            val maf = decodeMafGpsOrNull(sendAtCommand(outs, ins, "0110", 450L))
+            if (maf != null && maf <= 0.05 && rpm >= 500.0 && mapK >= 20) mafGlitchesInTest++
+
+            val railRaw = sendAtCommand(outs, ins, "0123", 450L)
+            val railPsi = decodeGdiFuelRailPsiOrNull(railRaw)
+            if (railPsi != null && railPsi > 40.0) {
+                minRailPsi = min(minRailPsi, railPsi)
+                maxRailPsi = max(maxRailPsi, railPsi)
+            }
+
+            if (!isHemiV8 && frames % 3 == 0) {
+                val enh = pollGmEnhancedMode22Safe(outs, ins, unsupportedMode22)
+                enh.transTempF?.let { maxTransF = max(maxTransF, it) }
+                enh.tccSlipRpm?.let { maxTccSlip = max(maxTccSlip, abs(it)) }
+                enh.knockRetardDeg?.let { maxKrDeg = max(maxKrDeg, it) }
+            }
+
+            if (rpm > 0.0) {
+                minRpm = min(minRpm, rpm)
+                maxRpm = max(maxRpm, rpm)
+            }
+            maxAbsStft = max(maxAbsStft, max(abs(st1), abs(st2)))
+            if (prevRpm > 0.0 && mph in 32..72 && abs(mph - prevMph) <= 1 && abs(tps - prevTps) <= 2.2) {
+                steadyCruiseRpmJitter = max(steadyCruiseRpmJitter, abs(rpm - prevRpm))
+            }
+            prevRpm = rpm
+            prevMph = mph
+            prevTps = tps
+            frames++
+            lastSnapshot = "RPM: ${rpm.toInt()} | Speed: ${mph}MPH | TPS: ${tps.toInt()}% | Load: ${load.toInt()}% | MAP: ${mapK}kPa | B1: ST ${st1}%/LT ${lt1}% | B2: ST ${st2}%/LT ${lt2}% | MAF: ${maf ?: 0.0}g/s"
+        }
+
+        val cylDeltas = ArrayList<String>()
+        for (c in 1..maxCyl) {
+            val mid = "A" + (c + 1)
+            val post = extractMode06MisfireCount(sendAtCommand(outs, ins, "06$mid", 950L), mid)
+            val delta = max(0, post - preCyl[c])
+            if (delta > 0 || post > 0) {
+                cylDeltas.add("Cyl$c:+${delta}(tot:$post)")
+            }
+        }
+        val m07 = decodeDtcList(sendAtCommand(outs, ins, "07", 1800L), "47")
+        val railSummary = if (maxRailPsi > 0.0 && minRailPsi < 9000.0) "${minRailPsi.toInt()}-${maxRailPsi.toInt()}PSI" else "N/A"
+        val recorderDigest = "$lastSnapshot | 30sFrames:$frames | RPMRange:${if (minRpm < 9000) minRpm.toInt() else 0}-${maxRpm.toInt()} | CruiseRPMJitter:${steadyCruiseRpmJitter.toInt()}RPM | TCCSlipPeak:${maxTccSlip.toInt()}RPM | TransTemp:${if (maxTransF > 0) "${maxTransF.toInt()}F" else "N/A"} | RailPSI:$railSummary | PeakSTFT:${maxAbsStft}% | KR:${maxKrDeg}deg | MAFGlitches:$mafGlitchesInTest | MisfireDelta:${if (cylDeltas.isEmpty()) "0" else cylDeltas.joinToString(",")} | Pending07:${if (m07.isEmpty()) "None" else m07.joinToString(",")}"
+
+        val trigLabel = "Road-Test 30s Flight Recorder Complete"
+        reportToThor(serverBaseUrl, detectedVin, trigLabel, recorderDigest, saveToDb = true)
+        ackServerCmd(serverBaseUrl, "$trigLabel -> $recorderDigest")
+    }
+
+    private data class GmEnhancedSnapshot(
+        val transTempF: Double? = null,
+        val tccSlipRpm: Double? = null,
+        val camErrDeg: Double? = null,
+        val knockRetardDeg: Double? = null
+    )
+
+    private fun pollGmEnhancedMode22Safe(
+        outs: OutputStream,
+        ins: InputStream,
+        unsupported: MutableSet<String>
+    ): GmEnhancedSnapshot {
+        var transF: Double? = null
+        var tccSlip: Double? = null
+        var camErr: Double? = null
+        var krDeg: Double? = null
+        try {
+            // 1. Query 6T70 TCM (0x7E2) for Transmission Fluid Temp (221940) & TCC Slip Speed (221992)
+            if (!unsupported.contains("7E2_ALL")) {
+                sendAtCommand(outs, ins, "ATSH 7E2", 350L)
+                if (!unsupported.contains("221940")) {
+                    val rawTft = sendAtCommand(outs, ins, "221940", 700L)
+                    if (hasValidEcuHex(rawTft, "621940")) {
+                        val b = extractDataBytes(rawTft, "621940")
+                        if (b.isNotEmpty()) {
+                            val c = (b[0] - 40).toDouble()
+                            val f = round(((c * 9.0 / 5.0) + 32.0) * 10.0) / 10.0
+                            if (f in -20.0..320.0) transF = f
+                        }
+                    } else if (rawTft.uppercase().contains("7F22") || rawTft.uppercase().contains("NO DATA")) {
+                        unsupported.add("221940")
+                    }
+                }
+                if (!unsupported.contains("221992")) {
+                    val rawSlip = sendAtCommand(outs, ins, "221992", 700L)
+                    if (hasValidEcuHex(rawSlip, "621992")) {
+                        val b = extractDataBytes(rawSlip, "621992")
+                        if (b.size >= 2) {
+                            val signedRaw = ((b[0] shl 8) or b[1]).toShort().toInt()
+                            val scaled = round((signedRaw / 8.0) * 10.0) / 10.0
+                            if (abs(scaled) <= 2500.0) tccSlip = scaled
+                        }
+                    } else if (rawSlip.uppercase().contains("7F22") || rawSlip.uppercase().contains("NO DATA")) {
+                        unsupported.add("221992")
+                    }
+                }
+                if (unsupported.contains("221940") && unsupported.contains("221992")) {
+                    unsupported.add("7E2_ALL")
+                }
+            }
+
+            // 2. Query 3.6L LFX E39A ECM (0x7E0) for Knock Retard & Cam Phaser Error
+            if (!unsupported.contains("7E0_ALL")) {
+                sendAtCommand(outs, ins, "ATSH 7E0", 350L)
+                if (!unsupported.contains("2211A6")) {
+                    val rawKr = sendAtCommand(outs, ins, "2211A6", 650L)
+                    if (hasValidEcuHex(rawKr, "6211A6")) {
+                        val b = extractDataBytes(rawKr, "6211A6")
+                        if (b.isNotEmpty()) {
+                            krDeg = round(((b[0] * 22.5) / 256.0) * 10.0) / 10.0
+                        }
+                    } else if (rawKr.uppercase().contains("7F22") || rawKr.uppercase().contains("NO DATA")) {
+                        unsupported.add("2211A6")
+                    }
+                }
+                if (!unsupported.contains("221602")) {
+                    val rawCam = sendAtCommand(outs, ins, "221602", 650L)
+                    if (hasValidEcuHex(rawCam, "621602")) {
+                        val b = extractDataBytes(rawCam, "621602")
+                        if (b.size >= 2) {
+                            val signedCam = ((b[0] shl 8) or b[1]).toShort().toInt()
+                            val deg = round((signedCam / 64.0) * 10.0) / 10.0
+                            if (abs(deg) <= 45.0) camErr = abs(deg)
+                        }
+                    } else if (rawCam.uppercase().contains("7F22") || rawCam.uppercase().contains("NO DATA")) {
+                        unsupported.add("221602")
+                    }
+                }
+                if (unsupported.contains("2211A6") && unsupported.contains("221602")) {
+                    unsupported.add("7E0_ALL")
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            // MANDATORY: Always restore standard J1979 functional broadcast header (7DF)
+            try { sendAtCommand(outs, ins, "ATSH 7DF", 350L) } catch (_: Exception) {}
+        }
+        return GmEnhancedSnapshot(transF, tccSlip, camErr, krDeg)
+    }
+
+    private fun decodeGdiFuelRailPsiOrNull(raw: String): Double? {
+        if (!hasValidEcuHex(raw, "4123")) return null
+        val b = extractDataBytes(raw, "4123")
+        if (b.size < 2) return null
+        val kpa = ((b[0] * 256) + b[1]) * 10.0
+        return round((kpa * 0.145038) * 10.0) / 10.0
+    }
+
+
     @SuppressLint("MissingPermission")
     fun startAutonomousWatchdog(serverBaseUrl: String) {
         pingWatchdogNow(serverBaseUrl)
         if (running) return
         running = true
-        Log.i(TAG, "Starting Bulletproof OBDLink MX+ Master Diagnostic Watchdog (V18.3)...")
+        Log.i(TAG, "Starting Bulletproof OBDLink MX+ Master Diagnostic Watchdog (V19.0)...")
         thread(start = true, isDaemon = true, name = "ObdLinkEdgeMicroAgent") {
             while (running) {
                 var socket: BluetoothSocket? = null
@@ -180,6 +372,22 @@ object ObdLinkAutoWatchdog {
                         var lastGoodMafGps = 0.0
                         var consecutiveZeroMafTicks = 0
                         var transientMafDropoutsThisDrive = 0
+                        var railPsi = 0.0
+                        var evapPurgePct = 0.0
+                        var transTempF: Double? = null
+                        var tccSlipRpm: Double? = null
+                        var camErrDeg: Double? = null
+                        var knockRetardDeg: Double? = null
+                        val unsupportedMode22 = HashSet<String>()
+                        val knownDtcsThisDrive = HashSet<String>()
+                        val driveStartMs = System.currentTimeMillis()
+                        var trimCreepStreak = 0
+                        var shudderStreak = 0
+                        var camErrStreak = 0
+                        var voltDropStreak = 0
+                        var prevCruiseRpm = -1.0
+                        var prevCruiseMph = -1
+                        var prevCruiseTps = -1.0
                         var loadPct = 0.0
                         var tpsPct = 0.0
                         var pcmVolts = 14.2
@@ -257,9 +465,18 @@ object ObdLinkAutoWatchdog {
                                 timingAdv = decodeTimingAdvance(sendAtCommand(outs, ins, "010E", 900L))
                                 val oilRaw = sendAtCommand(outs, ins, "015C", 900L)
                                 oilTempF = if (hasValidEcuHex(oilRaw, "415C")) decodeTempF(oilRaw, "415C") else coolantF
-                                val baroKpa = decodeSingleByteOrNull(sendAtCommand(outs, ins, "0133", 900L), "4133")
-                                if (baroKpa != null && baroKpa > 50) baroPsi = round((baroKpa * 0.145038) * 10.0) / 10.0
-                            }
+                                    val baroKpa = decodeSingleByteOrNull(sendAtCommand(outs, ins, "0133", 900L), "4133")
+                                    if (baroKpa != null && baroKpa > 50) baroPsi = round((baroKpa * 0.145038) * 10.0) / 10.0
+                                    decodeGdiFuelRailPsiOrNull(sendAtCommand(outs, ins, "0123", 750L))?.let { railPsi = it }
+                                    evapPurgePct = decodePctByte(sendAtCommand(outs, ins, "012E", 750L), "412E")
+                                }
+                                if (!isHemiV8 && cycle % 6 == 0 && rpm > 0.0) {
+                                    val enh = pollGmEnhancedMode22Safe(outs, ins, unsupportedMode22)
+                                    if (enh.transTempF != null) transTempF = enh.transTempF
+                                    if (enh.tccSlipRpm != null) tccSlipRpm = enh.tccSlipRpm
+                                    if (enh.camErrDeg != null) camErrDeg = enh.camErrDeg
+                                    if (enh.knockRetardDeg != null) knockRetardDeg = enh.knockRetardDeg
+                                }
 
                             maxCoolantF = max(maxCoolantF, coolantF)
                             maxAbsLtft1 = max(maxAbsLtft1, abs(ltft1))
@@ -269,7 +486,13 @@ object ObdLinkAutoWatchdog {
                             val frame = "RPM: ${rpm.toInt()} | Speed: ${speedMph}MPH | Coolant: ${coolantF.toInt()}F | Oil: ${oilTempF.toInt()}F | IAT: ${iatF.toInt()}F" +
                                 " | Batt: ${volts}V (PCM: ${pcmVolts}V, CrankMin: ${minCrankVolts}V)" +
                                 " | B1 Trim: ST ${stft1}% / LT ${ltft1}% | B2 Trim: ST ${stft2}% / LT ${ltft2}%" +
-                                " | MAF: ${mafGps}g/s (Glitches:${transientMafDropoutsThisDrive}) | MAP: ${mapKpa}kPa | Baro: ${baroPsi}psi | Load: ${loadPct.toInt()}% | TPS: ${tpsPct.toInt()}% | Timing: ${timingAdv}deg"
+                                " | MAF: ${mafGps}g/s (Glitches:${transientMafDropoutsThisDrive}) | MAP: ${mapKpa}kPa | Baro: ${baroPsi}psi | Load: ${loadPct.toInt()}% | TPS: ${tpsPct.toInt()}% | Timing: ${timingAdv}deg" +
+                                (if (railPsi > 20.0) " | Rail: ${railPsi.toInt()}PSI" else "") +
+                                " | EVAP: ${evapPurgePct.toInt()}%" +
+                                (if (transTempF != null) " | Trans: ${transTempF!!.toInt()}F" else "") +
+                                (if (tccSlipRpm != null) " | TCCSlip: ${tccSlipRpm}RPM" else "") +
+                                (if (camErrDeg != null) " | CamErr: ${camErrDeg}deg" else "") +
+                                (if (knockRetardDeg != null) " | KR: ${knockRetardDeg}deg" else "")
                             lastValidFrame = frame
 
                             synchronized(ringBuffer) {
@@ -293,6 +516,11 @@ object ObdLinkAutoWatchdog {
                                     serverBaseUrl, outs, ins, detectedVin, isHemiV8, frame,
                                     "On-Demand Full Scan"
                                 )
+                            } else if (pendingServerCmd == "ROAD_TEST_30S") {
+                                pendingServerCmd = ""
+                                execute30SecRoadTestFlightRecorder(
+                                    serverBaseUrl, outs, ins, detectedVin, isHemiV8, unsupportedMode22
+                                )
                             }
 
                             if (!startupSnapshotSent) {
@@ -311,28 +539,118 @@ object ObdLinkAutoWatchdog {
                                 )
                             }
 
+                            // === WO-150 2-TIER PRE-CODE EARLY WARNING & INSTANT MID-DRIVE DTC WATCHDOG ===
                             val coolLimit = if (speedMph >= 50) 226.0 else 235.0
                             if (coolantF >= coolLimit && reportedFaultsThisDrive.add("HIGH_COOLANT")) {
-                                reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Speed-Aware Thermal Alert (${coolantF.toInt()}F at $speedMph MPH)", frame, saveToDb = true)
+                                reportToThor(serverBaseUrl, detectedVin, "Pre-Code Alert: Speed-Aware Thermal Drift (${coolantF.toInt()}F at $speedMph MPH)", frame, saveToDb = true)
                             }
-                            if (consecutiveZeroMafTicks == 0 && abs(ltft1) >= 8.5 && reportedFaultsThisDrive.add("LTFT1_DRIFT")) {
-                                reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Bank 1 Long-Term Fuel Trim Drift (LTFT1: $ltft1%, STFT1: $stft1%)", frame, saveToDb = true)
-                            }
-                            if (consecutiveZeroMafTicks == 0 && abs(ltft2) >= 8.5 && reportedFaultsThisDrive.add("LTFT2_DRIFT")) {
-                                reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Bank 2 Long-Term Fuel Trim Drift (LTFT2: $ltft2%, STFT2: $stft2%)", frame, saveToDb = true)
-                            }
-                            if (abs(ltft1 - ltft2) >= 7.5 && reportedFaultsThisDrive.add("BANK_IMBALANCE")) {
-                                reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Bank 1 vs Bank 2 Fuel Trim Imbalance (B1: $ltft1% vs B2: $ltft2%)", frame, saveToDb = true)
-                            }
-                            if (rpm >= 600.0 && (volts < 12.2 || volts > 15.3) && reportedFaultsThisDrive.add("CHARGING_VOLTS")) {
-                                reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Charging System Voltage Alert (Pin16: ${volts}V, PCM: ${pcmVolts}V)", frame, saveToDb = true)
+                            val driveMinutes = (System.currentTimeMillis() - driveStartMs) / 60_000.0
+                            if (driveMinutes >= 12.0 && speedMph >= 35 && coolantF in 80.0..173.0 && reportedFaultsThisDrive.add("STUCK_OPEN_THERMOSTAT")) {
+                                reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Slow Warmup / Possible Stuck-Open Thermostat (${coolantF.toInt()}F after ${driveMinutes.toInt()}m driving)", frame, saveToDb = true)
                             }
 
-                            if (cycle > 0 && cycle % 60 == 0 && rpm > 0.0) {
-                                executeFullDtcAndMode06Scan(
-                                    serverBaseUrl, outs, ins, detectedVin, isHemiV8, frame,
-                                    "Periodic Sweep"
-                                )
+                            // Debounced Pre-Code Fuel Trim Creep (catches vacuum/MAF/injector/purge drift well before GM's +23% P0171/P0174 CEL!)
+                            val totalTrimB1 = stft1 + ltft1
+                            val totalTrimB2 = stft2 + ltft2
+                            if (consecutiveZeroMafTicks == 0 && rpm >= 550.0 && (abs(ltft1) >= 8.5 || abs(ltft2) >= 8.5 || abs(totalTrimB1) >= 14.5 || abs(totalTrimB2) >= 14.5)) {
+                                trimCreepStreak++
+                                if (trimCreepStreak >= 4 && reportedFaultsThisDrive.add("PRE_CODE_FUEL_TRIM")) {
+                                    reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Sustained Fuel Trim Drift (B1 LT:${ltft1}%/ST:${stft1}%, B2 LT:${ltft2}%/ST:${stft2}%)", frame, saveToDb = true)
+                                }
+                            } else {
+                                trimCreepStreak = 0
+                            }
+                            if (consecutiveZeroMafTicks == 0 && abs(ltft1 - ltft2) >= 7.5 && reportedFaultsThisDrive.add("BANK_IMBALANCE")) {
+                                reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Bank 1 vs Bank 2 Fuel Trim Imbalance (B1: $ltft1% vs B2: $ltft2%)", frame, saveToDb = true)
+                            }
+
+                            // Pre-Code Loose-MAF Connector Contact Bounce Trend (3+ transient 0.0g/s glitches in one drive)
+                            if (transientMafDropoutsThisDrive >= 3 && reportedFaultsThisDrive.add("PRE_CODE_MAF_GLITCH_TREND")) {
+                                reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Intermittent MAF Connector Dropout (${transientMafDropoutsThisDrive} brief 0.0g/s bounces under vibration)", frame, saveToDb = true)
+                            }
+
+                            // Pre-Code 6T70 Torque Converter Clutch (TCC) Shudder / Slip & Trans Temp Watch
+                            if (transTempF != null && transTempF!! >= 222.0 && reportedFaultsThisDrive.add("PRE_CODE_TRANS_TEMP")) {
+                                reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Elevated Transmission Fluid Temp (${transTempF!!.toInt()}F)", frame, saveToDb = true)
+                            }
+                            val steadyLightCruise = (speedMph in 35..68 && prevCruiseMph > 0 && abs(speedMph - prevCruiseMph) <= 1 && prevCruiseTps >= 0.0 && abs(tpsPct - prevCruiseTps) <= 2.2 && loadPct in 24.0..72.0)
+                            val rpmOscillation = if (steadyLightCruise && prevCruiseRpm > 0.0) abs(rpm - prevCruiseRpm) else 0.0
+                            val slipAnomaly = (tccSlipRpm != null && steadyLightCruise && abs(tccSlipRpm!!) in 30.0..180.0) || (steadyLightCruise && rpmOscillation in 38.0..135.0)
+                            if (slipAnomaly) {
+                                shudderStreak++
+                                if (shudderStreak >= 3 && reportedFaultsThisDrive.add("PRE_CODE_TCC_SHUDDER")) {
+                                    reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Cruise Torque-Converter Slip / Shudder Signature (RPMDelta:${rpmOscillation.toInt()}, TCCSlip:${tccSlipRpm ?: "N/A"} at ${speedMph}MPH)", frame, saveToDb = true)
+                                }
+                            } else if (!steadyLightCruise) {
+                                shudderStreak = max(0, shudderStreak - 1)
+                            }
+                            prevCruiseRpm = rpm
+                            prevCruiseMph = speedMph
+                            prevCruiseTps = tpsPct
+
+                            // Pre-Code Cam Phaser / Timing Chain Correlation Drift
+                            if (camErrDeg != null && camErrDeg!! >= 4.0) {
+                                camErrStreak++
+                                if (camErrStreak >= 3 && reportedFaultsThisDrive.add("PRE_CODE_CAM_DRIFT")) {
+                                    reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Camshaft Phaser / Timing Correlation Drift (${camErrDeg}deg)", frame, saveToDb = true)
+                                }
+                            } else {
+                                camErrStreak = 0
+                            }
+
+                            // Pre-Code Battery Cranking Sag, Charging & Harness Ground-Drop Check
+                            if (minCrankVolts in 7.2..10.05 && reportedFaultsThisDrive.add("PRE_CODE_WEAK_CRANK_CCA")) {
+                                reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Weak Starter Cranking Voltage Dip (${minCrankVolts}V - Battery CCA Aging)", frame, saveToDb = true)
+                            }
+                            if (rpm >= 600.0 && (volts < 12.6 || volts > 15.25) && reportedFaultsThisDrive.add("CHARGING_VOLTS")) {
+                                reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Charging System Voltage Anomaly (Pin16: ${volts}V, PCM: ${pcmVolts}V)", frame, saveToDb = true)
+                            }
+                            if (rpm >= 600.0 && pcmVolts > 8.0 && abs(volts - pcmVolts) >= 0.60) {
+                                voltDropStreak++
+                                if (voltDropStreak >= 3 && reportedFaultsThisDrive.add("PRE_CODE_GROUND_DROP")) {
+                                    reportToThor(serverBaseUrl, detectedVin, "Pre-Code Early Warning: Chassis/Harness Voltage Drop (OBD Pin16 ${volts}V vs PCM ${pcmVolts}V)", frame, saveToDb = true)
+                                }
+                            } else {
+                                voltDropStreak = 0
+                            }
+
+                            // Fast Mid-Drive Pending-DTC (Mode $07) + Stored (0101/03) + Sub-Threshold Mode $06 Misfire Sweep (~every 18-20s)
+                            if (cycle > 0 && cycle % 15 == 0 && rpm > 0.0) {
+                                val m0101 = sendAtCommand(outs, ins, "0101", 900L)
+                                val b01 = extractDataBytes(m0101, "4101")
+                                val milOn = b01.isNotEmpty() && ((b01[0] and 0x80) != 0)
+                                val dtcCnt = if (b01.isNotEmpty()) (b01[0] and 0x7F) else 0
+                                val pending07 = decodeDtcList(sendAtCommand(outs, ins, "07", 1500L), "47")
+                                val newPending = pending07.filter { knownDtcsThisDrive.add("P07_$it") }
+
+                                if (milOn || dtcCnt > 0 || newPending.isNotEmpty()) {
+                                    val m03 = decodeDtcList(sendAtCommand(outs, ins, "03", 1600L), "43")
+                                    val newStored = m03.filter { knownDtcsThisDrive.add("S03_$it") }
+                                    if (newStored.isNotEmpty() || newPending.isNotEmpty()) {
+                                        executeFullDtcAndMode06Scan(
+                                            serverBaseUrl, outs, ins, detectedVin, isHemiV8, frame,
+                                            "Mid-Drive ECU Code Trigger (Stored:${if (m03.isEmpty()) "None" else m03.joinToString(",")} | PendingFirstStrike:${if (pending07.isEmpty()) "None" else pending07.joinToString(",")})"
+                                        )
+                                    }
+                                } else if (cycle % 30 == 0) {
+                                    // Check Mode $06 TID $0B for 3+ pre-DTC cylinder misfires even when 0 codes are stored/pending!
+                                    val maxCyl = if (isHemiV8) 8 else 6
+                                    val preDtcMisfires = ArrayList<String>()
+                                    for (cyl in 1..maxCyl) {
+                                        val midHex = "A" + (cyl + 1)
+                                        val cnt = extractMode06MisfireCount(sendAtCommand(outs, ins, "06$midHex", 1000L), midHex)
+                                        if (cnt >= 3) preDtcMisfires.add("Cyl$cyl:$cnt")
+                                    }
+                                    if (preDtcMisfires.isNotEmpty() && reportedFaultsThisDrive.add("PRE_CODE_MISFIRE_${preDtcMisfires.joinToString("_")}")) {
+                                        reportToThor(
+                                            serverBaseUrl,
+                                            detectedVin,
+                                            "Pre-Code Early Warning: Sub-Threshold Mode 06 Cylinder Misfires (${preDtcMisfires.joinToString(", ")}) with 0 CEL",
+                                            frame,
+                                            saveToDb = true
+                                        )
+                                    }
+                                }
                             }
 
                             cycle++
@@ -633,7 +951,7 @@ object ObdLinkAutoWatchdog {
                     n.contains("OBDLINK") || n.contains("MX+") || n.contains("OBD")
                 }
                 val pairedName = obdDev?.name ?: "NOT_PAIRED"
-                val statusFrame = "PhoneWatchdog: V18.3 ACTIVE | Bluetooth: ${if (btOn) "ON" else "OFF"} | PairedAdapter: $pairedName | Mode: ${cloudWatchdogMode.uppercase()}"
+                val statusFrame = "PhoneWatchdog: V19.0 ACTIVE | Bluetooth: ${if (btOn) "ON" else "OFF"} | PairedAdapter: $pairedName | Mode: ${cloudWatchdogMode.uppercase()}"
                 reportToThor(serverBaseUrl, "PHONE_OBD_WATCHDOG_PING", "On-Demand Phone Watchdog Status Ping", statusFrame, saveToDb = false)
             } catch (e: Exception) {
                 reportToThor(serverBaseUrl, "PHONE_OBD_WATCHDOG_PING", "On-Demand Phone Watchdog Status Ping", "Ping note: ${e.message}", saveToDb = false)
