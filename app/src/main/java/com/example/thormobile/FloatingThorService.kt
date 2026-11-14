@@ -329,32 +329,13 @@ class FloatingThorService : Service() {
         override fun run() {
             if (destroyed) return
             val now = SystemClock.elapsedRealtime()
-
-            when {
-                isStandby -> {
-                    boltAnimator?.cancel()
-                    artworkBoltDrawable?.strikeProgress = -1f
-                    mainHandler.postDelayed(this, 500L)
-                }
-                playbackBusy || remainingHardwareSpeechMs() > 0L || (now - lastHardwareSpeechActiveMs < 350L) -> {
-                    if (boltAnimator?.isRunning != true) {
-                        fireArtworkLightningCascade(durationMs = 380L)
-                    }
-                    mainHandler.postDelayed(this, 110L)
-                }
-                activeSession != 0 || endingSession || playbackBusy || remainingHardwareSpeechMs() > 0L -> {
-                    if (now >= nextIdleStrikeAt && boltAnimator?.isRunning != true) {
-                        fireArtworkLightningCascade(durationMs = 480L)
-                        nextIdleStrikeAt = now + Random.nextLong(1400L, 2500L)
-                    }
-                    mainHandler.postDelayed(this, 180L)
-                }
-                else -> {
-                    boltAnimator?.cancel()
-                    artworkBoltDrawable?.strikeProgress = -1f
-                    mainHandler.postDelayed(this, 600L)
-                }
-            }
+            val speaking = playbackBusy || remainingHardwareSpeechMs() > 0L || (now - lastHardwareSpeechActiveMs < 350L)
+            LivingPedestalDirector.updateServiceAudioVisualState(
+                isStandby = isStandby,
+                sessionActive = (activeSession != 0 || endingSession),
+                speakingActive = speaking
+            )
+            mainHandler.postDelayed(this, if (speaking || activeSession != 0) 140L else 420L)
         }
     }
 
@@ -404,14 +385,8 @@ class FloatingThorService : Service() {
         }
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        floatingView = LayoutInflater.from(this).inflate(R.layout.layout_floating_thor, null)
-        glowRingView = floatingView.findViewById(R.id.thor_glow_ring)
-        hammerImageView = floatingView.findViewById(R.id.thor_icon_image)
-        lightningUpperView = floatingView.findViewById(R.id.thor_lightning_upper)
-        lightningLowerView = floatingView.findViewById(R.id.thor_lightning_lower)
-        badgeCardView = floatingView.findViewById(R.id.thor_badge_card)
-
-        buildActualArtworkLightningLayer()
+        val pedestalView = LivingPedestalDirector.createAndAttachPedestalView(this)
+        floatingView = pedestalView
 
         val layoutFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -421,28 +396,27 @@ class FloatingThorService : Service() {
         }
 
         val metrics = resources.displayMetrics
-        val iconPx = (120 * metrics.density).toInt()
         val touchSlopPx = (10 * metrics.density).toInt().coerceAtLeast(10)
-        val defaultX = (metrics.widthPixels - iconPx - (10 * metrics.density).toInt()).coerceAtLeast(0)
-        val defaultY = (metrics.heightPixels * 0.36f).toInt()
+        val defaultX = -(4 * metrics.density).toInt()
+        val defaultY = (20 * metrics.density).toInt()
         val posPrefs = getSharedPreferences(OVERLAY_PREFS, MODE_PRIVATE)
+        val keyPedX = "pedestal_v153_pos_x"
+        val keyPedY = "pedestal_v153_pos_y"
 
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            pedestalView.totalWindowWidthPx,
+            pedestalView.totalWindowHeightPx,
             layoutFlag,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = posPrefs.getInt(KEY_POS_X, defaultX)
-        params.y = posPrefs.getInt(KEY_POS_Y, defaultY)
+        params.x = posPrefs.getInt(keyPedX, defaultX)
+        params.y = posPrefs.getInt(keyPedY, defaultY)
         windowManager.addView(floatingView, params)
 
         applyVisualState()
         loadWakeWordAsync()
-        nextIdleStrikeAt = SystemClock.elapsedRealtime() + 1800L
-        mainHandler.postDelayed({ fireArtworkLightningCascade(durationMs = 500L) }, 350L)
         mainHandler.post(stormTicker)
 
         var initialX = 0
@@ -454,11 +428,15 @@ class FloatingThorService : Service() {
 
         val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                if (LivingPedestalDirector.hasUnreadRaven) {
+                    VikingPopupOverlayManager.openPendingRavenFromPedestal()
+                    return true
+                }
                 if (!isStandby) {
                     fireArtworkLightningCascade(durationMs = 450L)
                     handleOverlayTap()
                 } else {
-                    toast("Thor is resting. Double-tap to wake.")
+                    toast("Thor is resting. Double-tap pedestal to wake.")
                 }
                 return true
             }
@@ -503,8 +481,8 @@ class FloatingThorService : Service() {
                 MotionEvent.ACTION_UP -> {
                     if (isDragging) {
                         posPrefs.edit()
-                            .putInt(KEY_POS_X, params.x)
-                            .putInt(KEY_POS_Y, params.y)
+                            .putInt(keyPedX, params.x)
+                            .putInt(keyPedY, params.y)
                             .apply()
                     }
                 }
@@ -628,70 +606,19 @@ class FloatingThorService : Service() {
 
     private fun fireArtworkLightningCascade(durationMs: Long) {
         if (destroyed || isStandby) return
-        val drawable = artworkBoltDrawable ?: return
-
-        boltAnimator?.cancel()
-        boltAnimator = ValueAnimator.ofFloat(0.0f, 1.30f).apply {
-            duration = durationMs
-            interpolator = LinearInterpolator()
-            addUpdateListener { anim ->
-                drawable.strikeProgress = anim.animatedValue as Float
-            }
-            start()
-        }
+        LivingPedestalDirector.triggerLightningPulse()
     }
 
     private fun applyVisualState() {
         mainHandler.post {
             if (destroyed) return@post
-            pulseAnimator?.cancel()
-            pulseAnimator = null
-            ringRotateAnimator?.cancel()
-            ringRotateAnimator = null
-
-            val ring = glowRingView ?: return@post
-
-            when {
-                isStandby -> {
-                    ring.setColorFilter(Color.RED, PorterDuff.Mode.SRC_IN)
-                    ring.rotation = 0f
-                    hammerImageView?.alpha = 0.70f
-                    boltAnimator?.cancel()
-                    artworkBoltDrawable?.strikeProgress = -1f
-                    pulseAnimator = ObjectAnimator.ofFloat(ring, View.ALPHA, 0.25f, 0.95f).apply {
-                        duration = 1000L
-                        repeatCount = ValueAnimator.INFINITE
-                        repeatMode = ValueAnimator.REVERSE
-                        start()
-                    }
-                }
-                activeSession != 0 -> {
-                    ring.colorFilter = null
-                    hammerImageView?.alpha = 1.0f
-                    pulseAnimator = ObjectAnimator.ofFloat(ring, View.ALPHA, 0.45f, 1.0f).apply {
-                        duration = 550L
-                        repeatCount = ValueAnimator.INFINITE
-                        repeatMode = ValueAnimator.REVERSE
-                        start()
-                    }
-                    ringRotateAnimator = ObjectAnimator.ofFloat(ring, View.ROTATION, ring.rotation, ring.rotation + 360f).apply {
-                        duration = 7000L
-                        interpolator = LinearInterpolator()
-                        repeatCount = ValueAnimator.INFINITE
-                        repeatMode = ValueAnimator.RESTART
-                        start()
-                    }
-                }
-                else -> {
-                    // WO-129: Conversation closed (activeSession == 0) -> calm, still golden ring awaiting 'Thor' wake word
-                    ring.colorFilter = null
-                    ring.rotation = 0f
-                    ring.alpha = 0.85f
-                    hammerImageView?.alpha = 0.92f
-                    boltAnimator?.cancel()
-                    artworkBoltDrawable?.strikeProgress = -1f
-                }
-            }
+            val now = SystemClock.elapsedRealtime()
+            val speaking = playbackBusy || remainingHardwareSpeechMs() > 0L || (now - lastHardwareSpeechActiveMs < 350L)
+            LivingPedestalDirector.updateServiceAudioVisualState(
+                isStandby = isStandby,
+                sessionActive = (activeSession != 0 || endingSession),
+                speakingActive = speaking
+            )
         }
     }
 
@@ -2408,6 +2335,7 @@ class FloatingThorService : Service() {
         detector = null
         try { detectorModels?.close() } catch (e: Exception) {}
         detectorModels = null
+        LivingPedestalDirector.detachFromService()
         if (::floatingView.isInitialized) {
             try { windowManager.removeView(floatingView) } catch (e: Exception) {}
         }

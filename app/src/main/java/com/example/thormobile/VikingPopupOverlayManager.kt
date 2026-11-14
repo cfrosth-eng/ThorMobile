@@ -678,10 +678,22 @@ object VikingPopupOverlayManager {
         mainHandler.post {
             try {
                 hideVikingShield()
-                showLivingRavenEmblem(cleanBase)
+                if (LivingPedestalDirector.isPedestalAttached()) {
+                    hideLivingRavenEmblem()
+                    LivingPedestalDirector.onRavenDispatched(context, rKey, lastRavenTitle, cleanBase)
+                } else {
+                    showLivingRavenEmblem(cleanBase)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Living Raven arrival note: ${e.message}")
             }
+        }
+    }
+
+    fun openPendingRavenFromPedestal() {
+        mainHandler.post {
+            LivingPedestalDirector.onRavenCardUnfolded()
+            openUnfoldedRavenMessageCard(lastRavenCleanBase)
         }
     }
 
@@ -1443,7 +1455,11 @@ object VikingPopupOverlayManager {
             ravenThumbCard?.visibility = View.VISIBLE
             ravenThumbCard?.setOnClickListener {
                 hideVikingShield()
-                showLivingRavenEmblem(cleanBase)
+                if (LivingPedestalDirector.isPedestalAttached()) {
+                    LivingPedestalDirector.onRavenCardFoldedBackToPedestal(ctx)
+                } else {
+                    showLivingRavenEmblem(cleanBase)
+                }
             }
             runeHeaderView?.gravity = Gravity.START
         } else {
@@ -1462,18 +1478,27 @@ object VikingPopupOverlayManager {
                 undoBtn?.visibility = View.VISIBLE
                 undoBtn?.setOnClickListener {
                     hideVikingShield()
-                    showLivingRavenEmblem(cleanBase)
+                    if (LivingPedestalDirector.isPedestalAttached()) {
+                        LivingPedestalDirector.onRavenCardFoldedBackToPedestal(ctx)
+                    } else {
+                        showLivingRavenEmblem(cleanBase)
+                    }
                 }
-                approveBtn?.text = "⚡ GOT IT"
+                approveBtn?.text = "\u26A1 GOT IT"
                 approveBtn?.alpha = 1.0f
                 approveBtn?.visibility = View.VISIBLE
                 approveBtn?.setOnClickListener {
-                    dismissedStagedKey = currentEventKey
+                    val keyRead = currentEventKey
+                    dismissedStagedKey = keyRead
                     lastRavenKey = ""
+                    thread(start = true, isDaemon = true) {
+                        try { ThorDatabase.getDatabase(ctx.applicationContext).ravenMessageDao().markRead(keyRead) } catch (_: Exception) {}
+                    }
                     triggerServerActionBg(cleanBase, "dismiss_reply")
                     hideVikingShield()
                     hideLivingRavenEmblem()
                     hideRecallBadge()
+                    LivingPedestalDirector.dismissUnreadRavenWithTakeoff(ctx)
                 }
                 declineBtn?.visibility = View.GONE
             }
@@ -1803,7 +1828,11 @@ object VikingPopupOverlayManager {
                     if (abs(dx) > deliberateSwipePx) {
                         if (currentEventKey.startsWith("RAVEN_") || currentEventKey.endsWith("_REPLY")) {
                             hideVikingShield()
-                            showLivingRavenEmblem(cleanBase)
+                            if (LivingPedestalDirector.isPedestalAttached()) {
+                                LivingPedestalDirector.onRavenCardFoldedBackToPedestal(ctx)
+                            } else {
+                                showLivingRavenEmblem(cleanBase)
+                            }
                         } else {
                             dismissedStagedKey = currentEventKey
                             hideVikingShield()
