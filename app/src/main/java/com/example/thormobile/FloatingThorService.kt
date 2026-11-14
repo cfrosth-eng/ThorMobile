@@ -644,7 +644,7 @@ class FloatingThorService : Service() {
             stopCaptureAndReleaseMic()
             mainHandler.post {
                 applyVisualState()
-                toast("Standby Mode: Microphone Free for Gemini/Other Apps.")
+                toast(if (LivingPedestalDirector.hasUnreadRaven) "Standby Mute: Mic Off (Raven & animations stay active for silent inspection)." else "Standby Mode: Microphone Free for Other Apps.")
                 refreshNotification()
             }
         }
