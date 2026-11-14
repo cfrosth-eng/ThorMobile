@@ -177,6 +177,9 @@ object ObdLinkAutoWatchdog {
                         var cycle = 0
                         var iatF = 75.0
                         var mafGps = 0.0
+                        var lastGoodMafGps = 0.0
+                        var consecutiveZeroMafTicks = 0
+                        var transientMafDropoutsThisDrive = 0
                         var loadPct = 0.0
                         var tpsPct = 0.0
                         var pcmVolts = 14.2
@@ -222,7 +225,32 @@ object ObdLinkAutoWatchdog {
                             if (cycle % 2 == 0) {
                                 loadPct = decodePctByte(sendAtCommand(outs, ins, "0104", 900L), "4104")
                                 iatF = decodeTempF(sendAtCommand(outs, ins, "010F", 900L), "410F")
-                                mafGps = decodeMafGps(sendAtCommand(outs, ins, "0110", 900L))
+                                val rawMafResp = sendAtCommand(outs, ins, "0110", 900L)
+                                val parsedMaf = decodeMafGpsOrNull(rawMafResp)
+                                if (parsedMaf == null) {
+                                    mafGps = lastGoodMafGps
+                                } else if (parsedMaf <= 0.05 && rpm >= 500.0 && mapKpa >= 20) {
+                                    consecutiveZeroMafTicks++
+                                    if (consecutiveZeroMafTicks < 3) {
+                                        transientMafDropoutsThisDrive++
+                                        mafGps = if (lastGoodMafGps > 0.5) lastGoodMafGps else 3.5
+                                    } else {
+                                        mafGps = 0.0
+                                        if (reportedFaultsThisDrive.add("SUSTAINED_MAF_DROPOUT")) {
+                                            reportToThor(
+                                                serverBaseUrl,
+                                                detectedVin,
+                                                "DTC Alert: Sustained MAF Sensor Dropout (0.0 g/s for $consecutiveZeroMafTicks consecutive reads at ${rpm.toInt()} RPM)",
+                                                lastValidFrame,
+                                                saveToDb = true
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    consecutiveZeroMafTicks = 0
+                                    mafGps = parsedMaf
+                                    if (parsedMaf > 0.2) lastGoodMafGps = parsedMaf
+                                }
                                 tpsPct = decodePctByte(sendAtCommand(outs, ins, "0111", 900L), "4111")
                                 val vMod = decodeControlModuleVolts(sendAtCommand(outs, ins, "0142", 900L))
                                 if (vMod > 5.0) pcmVolts = vMod
@@ -241,7 +269,7 @@ object ObdLinkAutoWatchdog {
                             val frame = "RPM: ${rpm.toInt()} | Speed: ${speedMph}MPH | Coolant: ${coolantF.toInt()}F | Oil: ${oilTempF.toInt()}F | IAT: ${iatF.toInt()}F" +
                                 " | Batt: ${volts}V (PCM: ${pcmVolts}V, CrankMin: ${minCrankVolts}V)" +
                                 " | B1 Trim: ST ${stft1}% / LT ${ltft1}% | B2 Trim: ST ${stft2}% / LT ${ltft2}%" +
-                                " | MAF: ${mafGps}g/s | MAP: ${mapKpa}kPa | Baro: ${baroPsi}psi | Load: ${loadPct.toInt()}% | TPS: ${tpsPct.toInt()}% | Timing: ${timingAdv}deg"
+                                " | MAF: ${mafGps}g/s (Glitches:${transientMafDropoutsThisDrive}) | MAP: ${mapKpa}kPa | Baro: ${baroPsi}psi | Load: ${loadPct.toInt()}% | TPS: ${tpsPct.toInt()}% | Timing: ${timingAdv}deg"
                             lastValidFrame = frame
 
                             synchronized(ringBuffer) {
@@ -287,10 +315,10 @@ object ObdLinkAutoWatchdog {
                             if (coolantF >= coolLimit && reportedFaultsThisDrive.add("HIGH_COOLANT")) {
                                 reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Speed-Aware Thermal Alert (${coolantF.toInt()}F at $speedMph MPH)", frame, saveToDb = true)
                             }
-                            if (abs(ltft1) >= 8.5 && reportedFaultsThisDrive.add("LTFT1_DRIFT")) {
+                            if (consecutiveZeroMafTicks == 0 && abs(ltft1) >= 8.5 && reportedFaultsThisDrive.add("LTFT1_DRIFT")) {
                                 reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Bank 1 Long-Term Fuel Trim Drift (LTFT1: $ltft1%, STFT1: $stft1%)", frame, saveToDb = true)
                             }
-                            if (abs(ltft2) >= 8.5 && reportedFaultsThisDrive.add("LTFT2_DRIFT")) {
+                            if (consecutiveZeroMafTicks == 0 && abs(ltft2) >= 8.5 && reportedFaultsThisDrive.add("LTFT2_DRIFT")) {
                                 reportToThor(serverBaseUrl, detectedVin, "DTC Alert: Bank 2 Long-Term Fuel Trim Drift (LTFT2: $ltft2%, STFT2: $stft2%)", frame, saveToDb = true)
                             }
                             if (abs(ltft1 - ltft2) >= 7.5 && reportedFaultsThisDrive.add("BANK_IMBALANCE")) {
@@ -401,9 +429,10 @@ object ObdLinkAutoWatchdog {
         return if (b.isNotEmpty()) round((b[0] * 100.0 / 255.0) * 10.0) / 10.0 else 0.0
     }
 
-    private fun decodeMafGps(raw: String): Double {
+    private fun decodeMafGpsOrNull(raw: String): Double? {
+        if (!hasValidEcuHex(raw, "4110")) return null
         val b = extractDataBytes(raw, "4110")
-        return if (b.size >= 2) round((((b[0] * 256) + b[1]) / 100.0) * 10.0) / 10.0 else 0.0
+        return if (b.size >= 2) round((((b[0] * 256) + b[1]) / 100.0) * 10.0) / 10.0 else null
     }
 
     private fun decodeControlModuleVolts(raw: String): Double {
@@ -449,47 +478,84 @@ object ObdLinkAutoWatchdog {
         return sb.toString().replace(">", "").trim()
     }
 
-    private fun decodeDtcList(raw: String, modeHex: String): List<String> {
+    fun decodeDtcList(raw: String, modeHex: String): List<String> {
         val u = raw.uppercase()
         if (u.isEmpty() || u.contains("NO DATA") || u.contains("UNABLE") || u.contains("ERROR")) return emptyList()
-        val hexClean = stripIsoTpFraming(raw)
         val mHex = modeHex.uppercase()
-        val idx = hexClean.indexOf(mHex)
-        if (idx < 0 || idx + 2 >= hexClean.length) return emptyList()
-
-        val afterModeHex = hexClean.substring(idx + 2)
-        val bytes = ArrayList<Int>()
-        var p = 0
-        while (p + 1 < afterModeHex.length) {
-            val b = afterModeHex.substring(p, p + 2).toIntOrNull(16)
-            if (b != null) bytes.add(b)
-            p += 2
-        }
-        if (bytes.size < 2) return emptyList()
-
-        val startOffset = if (bytes.size % 2 == 1 || (bytes[0] in 1..10 && bytes.size >= 3 && bytes[1] <= 0x3F)) 1 else 0
         val result = ArrayList<String>()
-        var i = startOffset
-        while (i + 1 < bytes.size) {
-            val b1 = bytes[i]
-            val b2 = bytes[i + 1]
-            if (b1 != 0 || b2 != 0) {
-                val sysChar = when ((b1 shr 6) and 0x03) {
-                    0 -> 'P'
-                    1 -> 'C'
-                    2 -> 'B'
-                    else -> 'U'
+
+        val rawLines = u.replace(CR_STR, LF_STR).split(LF_STR)
+        val ecuPayloads = ArrayList<String>()
+        var currentMulti = StringBuilder()
+
+        for (rawLn in rawLines) {
+            val ln = rawLn.trim()
+            if (ln.isEmpty() || ln.contains("SEARCHING") || ln.contains("STOPPED")) continue
+            if (ln.length == 3 && ln.all { it.isDigit() || it in 'A'..'F' }) {
+                if (currentMulti.isNotEmpty()) {
+                    ecuPayloads.add(currentMulti.toString())
+                    currentMulti = StringBuilder()
                 }
-                val d1 = ((b1 shr 4) and 0x03).toString(16).uppercase()
-                val d2 = (b1 and 0x0F).toString(16).uppercase()
-                val d3 = ((b2 shr 4) and 0x0F).toString(16).uppercase()
-                val d4 = (b2 and 0x0F).toString(16).uppercase()
-                val code = "$sysChar$d1$d2$d3$d4"
-                if (code != "P0000" && !result.contains(code)) {
-                    result.add(code)
-                }
+                continue
             }
-            i += 2
+            val colonIdx = ln.indexOf(':')
+            if (colonIdx in 1..2) {
+                val seq = ln.substring(0, colonIdx).trim()
+                val hexPart = ln.substring(colonIdx + 1).filter { it.isDigit() || it in 'A'..'F' }
+                if (seq == "0" && currentMulti.isNotEmpty()) {
+                    ecuPayloads.add(currentMulti.toString())
+                    currentMulti = StringBuilder()
+                }
+                currentMulti.append(hexPart)
+            } else {
+                if (currentMulti.isNotEmpty()) {
+                    ecuPayloads.add(currentMulti.toString())
+                    currentMulti = StringBuilder()
+                }
+                val hexPart = ln.filter { it.isDigit() || it in 'A'..'F' }
+                if (hexPart.isNotEmpty()) ecuPayloads.add(hexPart)
+            }
+        }
+        if (currentMulti.isNotEmpty()) ecuPayloads.add(currentMulti.toString())
+
+        for (ecuHex in ecuPayloads) {
+            val idx = ecuHex.indexOf(mHex)
+            if (idx < 0 || idx + 4 > ecuHex.length) continue
+            val afterMode = ecuHex.substring(idx + 2)
+            val bytes = ArrayList<Int>()
+            var p = 0
+            while (p + 1 < afterMode.length) {
+                afterMode.substring(p, p + 2).toIntOrNull(16)?.let { bytes.add(it) }
+                p += 2
+            }
+            if (bytes.isEmpty() || bytes[0] == 0) continue
+            val expectedCount = bytes[0]
+            val useCountByte = (bytes.size >= 1 + expectedCount * 2) || (bytes.size % 2 == 1)
+            var i = if (useCountByte) 1 else 0
+            var parsedForEcu = 0
+            while (i + 1 < bytes.size) {
+                if (useCountByte && parsedForEcu >= expectedCount) break
+                val b1 = bytes[i]
+                val b2 = bytes[i + 1]
+                if (b1 != 0 || b2 != 0) {
+                    val sysChar = when ((b1 shr 6) and 0x03) {
+                        0 -> 'P'
+                        1 -> 'C'
+                        2 -> 'B'
+                        else -> 'U'
+                    }
+                    val d1 = ((b1 shr 4) and 0x03).toString(16).uppercase()
+                    val d2 = (b1 and 0x0F).toString(16).uppercase()
+                    val d3 = ((b2 shr 4) and 0x0F).toString(16).uppercase()
+                    val d4 = (b2 and 0x0F).toString(16).uppercase()
+                    val code = "$sysChar$d1$d2$d3$d4"
+                    if (code != "P0000" && !result.contains(code)) {
+                        result.add(code)
+                    }
+                    parsedForEcu++
+                }
+                i += 2
+            }
         }
         return result
     }
@@ -504,15 +570,29 @@ object ObdLinkAutoWatchdog {
             " | Perm(0A): " + (if (c0A.isEmpty()) "None" else c0A.joinToString(", "))
     }
 
-    private fun extractMode06MisfireCount(raw: String, midHex: String): Int {
+    fun extractMode06MisfireCount(raw: String, midHex: String): Int {
+        // ISO-15031-5 CAN Mode $06: Byte0=46, Byte1=MID, Byte2=TID(0B=Latest, 0C=Avg), Byte3=UASID(0x24), Byte4..5=Value
         val hexClean = stripIsoTpFraming(raw)
-        val marker = "46" + midHex.uppercase()
-        val idx = hexClean.indexOf(marker)
-        if (idx < 0 || idx + 12 > hexClean.length) return 0
-        val vHi = hexClean.substring(idx + 6, idx + 8).toIntOrNull(16) ?: 0
-        val vLo = hexClean.substring(idx + 8, idx + 10).toIntOrNull(16) ?: 0
-        val cnt = (vHi * 256) + vLo
-        return if (cnt in 1..65000) cnt else 0
+        val mUp = midHex.uppercase()
+        val marker = "46$mUp"
+        var searchFrom = 0
+        var latestDriveCount = 0
+        while (true) {
+            val idx = hexClean.indexOf(marker, searchFrom)
+            if (idx < 0 || idx + 12 > hexClean.length) break
+            val tid = hexClean.substring(idx + 4, idx + 6).toIntOrNull(16) ?: -1
+            val vHi = hexClean.substring(idx + 8, idx + 10).toIntOrNull(16) ?: 0
+            val vLo = hexClean.substring(idx + 10, idx + 12).toIntOrNull(16) ?: 0
+            val value = (vHi * 256) + vLo
+            if (tid == 0x0B && value in 1..65000) {
+                return value
+            }
+            if (tid == 0x0C && value in 1..65000 && latestDriveCount == 0) {
+                latestDriveCount = value
+            }
+            searchFrom = idx + 4
+        }
+        return latestDriveCount
     }
 
     private fun reportToThor(
