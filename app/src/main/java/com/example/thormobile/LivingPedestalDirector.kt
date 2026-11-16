@@ -9,7 +9,9 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
+import android.graphics.BitmapShader
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
@@ -96,6 +98,7 @@ object LivingPedestalDirector {
     private var wetRimLeftBmp: Bitmap? = null
     private var wetRimRightBmp: Bitmap? = null
     private var ringStripBmp: Bitmap? = null
+    private var moltenCoreTileBmp: Bitmap? = null
     private var runesGoldBmp: Bitmap? = null
 
     private val boltCores = arrayOfNulls<Bitmap>(4)
@@ -162,6 +165,20 @@ object LivingPedestalDirector {
         wetRimLeftBmp = decodeRaw(app, R.drawable.raven_wet_rim_left)
         wetRimRightBmp = decodeRaw(app, R.drawable.raven_wet_rim_right)
         ringStripBmp = decodeRaw(app, R.drawable.raven_gold_ring_strip)?.apply { setHasMipMap(true) }
+        ringStripBmp?.let { src ->
+            // Extract ONLY dense speck-free liquid gold core (rows 12..64) & mirror vertically -> seamless 1:1 isotropic shader tile!
+            val y0 = (src.height * 0.06f).toInt().coerceIn(0, src.height - 2)
+            val bandH = (src.height * 0.23f).toInt().coerceAtLeast(16)
+            val slice = Bitmap.createBitmap(src, 0, y0, src.width, bandH.coerceAtMost(src.height - y0))
+            val tileW = 512; val halfH = 56
+            val scaled = Bitmap.createScaledBitmap(slice, tileW, halfH, true)
+            val seamless = Bitmap.createBitmap(tileW, halfH * 2, Bitmap.Config.ARGB_8888)
+            val tc = Canvas(seamless)
+            tc.drawBitmap(scaled, 0f, 0f, null)
+            tc.save(); tc.translate(0f, (halfH * 2).toFloat()); tc.scale(1f, -1f)
+            tc.drawBitmap(scaled, 0f, 0f, null); tc.restore()
+            moltenCoreTileBmp = seamless
+        }
         runesGoldBmp = decodeRaw(app, R.drawable.raven_runes_gold_hd)
 
         val cIds = intArrayOf(R.drawable.raven_bolt_0_core, R.drawable.raven_bolt_1_core, R.drawable.raven_bolt_2_core, R.drawable.raven_bolt_3_core)
@@ -363,7 +380,7 @@ object LivingPedestalDirector {
         }
 
         var wpIdx = 0; var passedLeftGate = false; var preLandingArcFired = false
-        val startMs = SystemClock.elapsedRealtime(); var lastMs = startMs
+        val startMs = SystemClock.elapsedRealtime(); var lastMs = startMs; var stageEnteredMs = startMs
         var prevPerchX = startPerch.x; var prevPerchY = startPerch.y; var wingPhase = 0f
 
         flightAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
@@ -372,11 +389,12 @@ object LivingPedestalDirector {
                 val now = SystemClock.elapsedRealtime()
                 val dt = ((now - lastMs).coerceIn(1L, 45L)).toFloat() / 1000f
                 lastMs = now; val elapsedMs = now - startMs
+                val stageElapsedMs = now - stageEnteredMs
 
                 val livePerch = getPerchInOverlayCoords(app, stageView)
                 val pedSpeed = hypot((livePerch.x - prevPerchX).toDouble(), (livePerch.y - prevPerchY).toDouble()).toFloat() / max(dt, 0.008f)
                 prevPerchX = livePerch.x; prevPerchY = livePerch.y
-                if (pedSpeed > dp(app, 210f)) passedLeftGate = false
+                if (pedSpeed > dp(app, 240f)) { passedLeftGate = false; stageEnteredMs = now }
 
                 val homingPhase = (wpIdx >= cruiseWps.size) && (mode != FlightMode.DEPARTURE)
                 val targetX: Float; val targetY: Float
@@ -384,25 +402,34 @@ object LivingPedestalDirector {
                 if (!homingPhase) {
                     val wp = cruiseWps[min(wpIdx, cruiseWps.size - 1)]
                     targetX = wp.x; targetY = wp.y
-                    if (mode != FlightMode.DEPARTURE && hypot((wp.x - bx).toDouble(), (wp.y - by).toDouble()) < dp(app, 86f)) wpIdx++
-                    if (mode == FlightMode.DEPARTURE && bx > sw + dp(app, 95f)) {
+                    // Anti-Orbit Guarantee: wide 102dp capture OR 1850ms stage watchdog advances cleanly!
+                    if (mode != FlightMode.DEPARTURE && (hypot((wp.x - bx).toDouble(), (wp.y - by).toDouble()) < dp(app, 102f) || stageElapsedMs > 1850L)) {
+                        wpIdx++; stageEnteredMs = now
+                    }
+                    if (mode == FlightMode.DEPARTURE && (bx > sw + dp(app, 95f) || elapsedMs > 3200L)) {
                         stopActiveFlightOverlay(); onComplete?.invoke(); return@addUpdateListener
                     }
                 } else {
-                    val gateX = livePerch.x - dp(app, 92f)
-                    val gateY = (livePerch.y - dp(app, 24f)).coerceIn(dp(app, 36f), sh - dp(app, 90f))
+                    // Keep approach gate strictly ON-SCREEN (>= 32dp) so top-left pedestal never puts gate off-glass!
+                    val gateX = max(dp(app, 32f), livePerch.x - dp(app, 80f))
+                    val gateY = (livePerch.y - dp(app, 20f)).coerceIn(dp(app, 40f), sh - dp(app, 90f))
                     if (!passedLeftGate) {
                         targetX = gateX; targetY = gateY
-                        if (hypot((gateX - bx).toDouble(), (gateY - by).toDouble()) < dp(app, 42f) || (bx < livePerch.x - dp(app, 35f) && cos(headingRad.toDouble()) > 0.45)) passedLeftGate = true
-                    } else { targetX = livePerch.x; targetY = livePerch.y }
+                        if (hypot((gateX - bx).toDouble(), (gateY - by).toDouble()) < dp(app, 68f) ||
+                            (stageElapsedMs > 1450L && pedSpeed < dp(app, 60f)) ||
+                            (bx < livePerch.x - dp(app, 25f) && cos(headingRad.toDouble()) > 0.35)) {
+                            passedLeftGate = true; stageEnteredMs = now
+                        }
+                    } else {
+                        targetX = livePerch.x; targetY = livePerch.y
+                    }
 
                     val distStone = hypot((livePerch.x - bx).toDouble(), (livePerch.y - by).toDouble()).toFloat()
-                    // Fire cyan Mjolnir discharge at 78dp out (~240ms before touchdown) so Boss sees Mjolnir blaze right before Huginn lands!
                     if (!preLandingArcFired && passedLeftGate && distStone <= dp(app, 78f)) {
                         preLandingArcFired = true
-                        attachedCrestView?.triggerElectricStrikeBurst(360L, 1.0f)
+                        attachedCrestView?.triggerElectricStrikeBurst(420L, 1.0f)
                     }
-                    if (passedLeftGate && distStone <= dp(app, 18f) && pedSpeed < dp(app, 105f)) {
+                    if (passedLeftGate && (distStone <= dp(app, 20f) || (stageElapsedMs > 2200L && pedSpeed < dp(app, 50f))) && pedSpeed < dp(app, 105f)) {
                         setPedestalOccupant(if (hasUnreadRaven) PedestalOccupant.RAVEN else PedestalOccupant.MJOLNIR)
                         attachedCrestView?.pulseRunesResonance()
                         stopActiveFlightOverlay(); onComplete?.invoke(); return@addUpdateListener
@@ -414,17 +441,25 @@ object LivingPedestalDirector {
                 while (angDiff > Math.PI) angDiff -= (Math.PI * 2.0).toFloat()
                 while (angDiff < -Math.PI) angDiff += (Math.PI * 2.0).toFloat()
 
+                val distToTarget = hypot((targetX - bx).toDouble(), (targetY - by).toDouble()).toFloat()
                 val distStone = hypot((livePerch.x - bx).toDouble(), (livePerch.y - by).toDouble()).toFloat()
-                val maxTurnRate = if (homingPhase && passedLeftGate) 7.5f else 3.9f
+
+                // High agility near waypoints & stone + aerodynamic turn-braking -> turn radius ~20dp (ZERO center orbiting!)
+                val maxTurnRate = when {
+                    homingPhase && passedLeftGate -> 13.5f
+                    distToTarget < dp(app, 150f)  -> 8.8f
+                    else                          -> 4.8f
+                }
                 headingRad += angDiff.coerceIn(-maxTurnRate * dt, maxTurnRate * dt)
 
+                val turnBrake = 1f - 0.45f * (abs(angDiff) / 1.8f).coerceIn(0f, 1f)
                 val targetSpd = when {
                     mode == FlightMode.DEPARTURE -> dp(app, 520f)
-                    !homingPhase -> dp(app, 425f)
-                    !passedLeftGate -> max(dp(app, 360f), min(dp(app, 620f), pedSpeed * 1.15f))
-                    else -> max(dp(app, 95f) + (distStone / dp(app, 120f)).coerceIn(0f, 1f) * dp(app, 290f), min(dp(app, 580f), pedSpeed * 1.15f))
+                    !homingPhase -> dp(app, 415f) * turnBrake
+                    !passedLeftGate -> max(dp(app, 320f) * turnBrake, min(dp(app, 620f), pedSpeed * 1.15f))
+                    else -> max(dp(app, 110f) + (distStone / dp(app, 120f)).coerceIn(0f, 1f) * dp(app, 280f), min(dp(app, 580f), pedSpeed * 1.15f))
                 }
-                speedPx += (targetSpd - speedPx) * min(1f, dt * 5.5f)
+                speedPx += (targetSpd - speedPx) * min(1f, dt * 6.5f)
 
                 val vx = cos(headingRad.toDouble()).toFloat() * speedPx
                 val vy = sin(headingRad.toDouble()).toFloat() * speedPx
@@ -557,25 +592,26 @@ object LivingPedestalDirector {
 
         private val globs = Array(112) { GoldGlob() }
         private val cols = 64
-        private val meshRows = 3
         private val h = FloatArray(cols + 1)
         private val uVel = FloatArray(cols + 1)
         private val nuBuf = FloatArray(cols + 1)
         private val tmpH = FloatArray(cols + 1)
         private val flux = FloatArray(cols + 1)
-        private val poolMeshVerts = FloatArray((cols + 1) * (meshRows + 1) * 2)
 
         private val globPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val glintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = GOLD_GLINT }
         private val baseBodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val meshPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply { alpha = 155 }
+        private val veinShaderMatrix = Matrix()
+        private val veinShader: BitmapShader? = moltenCoreTileBmp?.let { BitmapShader(it, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT) }
+        private val veinPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+            alpha = 135
+            shader = veinShader
+        }
         private val darkLipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
         private val specLipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
         private val dropPath = Path()
         private val pilePath = Path()
         private val surfaceSmoothPath = Path()
-        private val scrolledPoolBmp: Bitmap? = ringStripBmp?.let { Bitmap.createBitmap(it.width, it.height, Bitmap.Config.ARGB_8888) }
-        private val scrolledPoolCanvas: Canvas? = scrolledPoolBmp?.let { Canvas(it) }
 
         private var sensorMgr: SensorManager? = null
         private var rawSinTilt = 0f
@@ -750,26 +786,12 @@ object LivingPedestalDirector {
                 avgVel += uVel[i]
             }
 
-            if (maxPile > 0.4f) {
-                val src = ringStripBmp
-                if (src != null && scrolledPoolCanvas != null) {
-                    val wBmp = src.width.toFloat()
-                    uvShiftPx = ((uvShiftPx - (avgVel / cols.toFloat()) * dt * 0.55f) % wBmp + wBmp) % wBmp
-                    scrolledPoolCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    scrolledPoolCanvas.drawBitmap(src, -uvShiftPx, 0f, null)
-                    scrolledPoolCanvas.drawBitmap(src, wBmp - uvShiftPx, 0f, null)
-                }
-                val glassBot = sh + dp(context, 14f)
-                for (r in 0..meshRows) {
-                    val rf = r.toFloat() / meshRows.toFloat()
-                    for (c in 0..cols) {
-                        val px = (c.toFloat() / cols.toFloat()) * sw
-                        val topY = sh - h[c]
-                        val idx = (r * (cols + 1) + c) * 2
-                        poolMeshVerts[idx] = px
-                        poolMeshVerts[idx + 1] = topY + (glassBot - topY) * rf
-                    }
-                }
+            if (maxPile > 0.4f && veinShader != null) {
+                uvShiftPx = (uvShiftPx + (avgVel / cols.toFloat()) * dt * 0.65f) % 4096f
+                // 1:1 Isotropic Liquid Gold Vein Matrix -> ZERO vertical stretching even on 45+ deg steep tilts!
+                veinShaderMatrix.reset()
+                veinShaderMatrix.postTranslate(uvShiftPx, sh - meanH)
+                veinShader.setLocalMatrix(veinShaderMatrix)
             }
             invalidate()
             return flowActive || anyGlobs || maxPile > 0.4f
@@ -830,8 +852,8 @@ object LivingPedestalDirector {
                 baseBodyPaint.shader = LinearGradient(0f, sh - peakH - dp(context, 2f), 0f, glassBot, intArrayOf(GOLD_WARM, GOLD_RICH, GOLD_BRONZE, GOLD_SHADOW), floatArrayOf(0f, 0.38f, 0.78f, 1f), Shader.TileMode.CLAMP)
                 canvas.drawRect(0f, sh - peakH - dp(context, 4f), sw, glassBot, baseBodyPaint)
 
-                (scrolledPoolBmp ?: ringStripBmp)?.let { tex ->
-                    canvas.drawBitmapMesh(tex, cols, meshRows, poolMeshVerts, 0, null, 0, meshPaint)
+                if (veinShader != null) {
+                    canvas.drawRect(0f, sh - peakH - dp(context, 4f), sw, glassBot, veinPaint)
                 }
 
                 darkLipPaint.strokeWidth = dp(context, 3.4f); darkLipPaint.color = 0x883A2203.toInt()
