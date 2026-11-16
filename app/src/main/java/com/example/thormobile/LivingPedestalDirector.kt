@@ -327,10 +327,11 @@ object LivingPedestalDirector {
             bx = sw + dp(app, 55f); by = sh * (0.12f + Random.nextFloat() * 0.14f)
             headingRad = Math.toRadians(165.0).toFloat(); speedPx = dp(app, 420f)
         } else {
-            bx = startPerch.x; by = startPerch.y
+            bx = startPerch.x + dp(app, 10f); by = startPerch.y - dp(app, 8f)
             headingRad = Math.toRadians((-18.0 - Random.nextDouble() * 14.0)).toFloat()
-            speedPx = dp(app, 330f)
-            setPedestalOccupant(PedestalOccupant.EMPTY_STONE)
+            speedPx = dp(app, 350f)
+            setPedestalOccupant(PedestalOccupant.MJOLNIR)
+            attachedCrestView?.triggerElectricStrikeBurst(320L, 1.0f, 0)
         }
 
         val cruiseWps = ArrayList<PointF>()
@@ -360,7 +361,6 @@ object LivingPedestalDirector {
         }
 
         var wpIdx = 0; var passedLeftGate = false
-        var liftoffHammerMaterialized = (mode == FlightMode.ARRIVAL); var approachHammerDissolved = false
         val startMs = SystemClock.elapsedRealtime(); var lastMs = startMs
         var prevPerchX = startPerch.x; var prevPerchY = startPerch.y; var wingPhase = 0f
 
@@ -370,14 +370,6 @@ object LivingPedestalDirector {
                 val now = SystemClock.elapsedRealtime()
                 val dt = ((now - lastMs).coerceIn(1L, 45L)).toFloat() / 1000f
                 lastMs = now; val elapsedMs = now - startMs
-
-                if (!liftoffHammerMaterialized && elapsedMs >= 250L) {
-                    liftoffHammerMaterialized = true
-                    attachedCrestView?.triggerElectricStrikeBurst(460L, 1.0f, 0)
-                    mainHandler.postDelayed({
-                        if (flightInProgress && currentOccupant == PedestalOccupant.EMPTY_STONE) setPedestalOccupant(PedestalOccupant.MJOLNIR)
-                    }, 85L)
-                }
 
                 val livePerch = getPerchInOverlayCoords(app, stageView)
                 val pedSpeed = hypot((livePerch.x - prevPerchX).toDouble(), (livePerch.y - prevPerchY).toDouble()).toFloat() / max(dt, 0.008f)
@@ -403,14 +395,8 @@ object LivingPedestalDirector {
                     } else { targetX = livePerch.x; targetY = livePerch.y }
 
                     val distStone = hypot((livePerch.x - bx).toDouble(), (livePerch.y - by).toDouble()).toFloat()
-                    if (!approachHammerDissolved && passedLeftGate && distStone < dp(app, 88f) && pedSpeed < dp(app, 120f)) {
-                        approachHammerDissolved = true
-                        attachedCrestView?.triggerElectricStrikeBurst(340L, 1.0f, 0)
-                        mainHandler.postDelayed({
-                            if (flightInProgress && hasUnreadRaven) setPedestalOccupant(PedestalOccupant.EMPTY_STONE)
-                        }, 80L)
-                    }
-                    if (passedLeftGate && distStone <= dp(app, 11f) && pedSpeed < dp(app, 90f)) {
+                    if (passedLeftGate && distStone <= dp(app, 18f) && pedSpeed < dp(app, 105f)) {
+                        attachedCrestView?.triggerElectricStrikeBurst(260L, 1.0f, 0)
                         setPedestalOccupant(if (hasUnreadRaven) PedestalOccupant.RAVEN else PedestalOccupant.MJOLNIR)
                         attachedCrestView?.pulseRunesResonance()
                         stopActiveFlightOverlay(); onComplete?.invoke(); return@addUpdateListener
@@ -517,17 +503,13 @@ object LivingPedestalDirector {
             val core = mjolnirSwapCoreBmp ?: boltCores[0] ?: return
             val halo = mjolnirSwapHaloBmp ?: boltHalos[0] ?: core
             dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
-            val w = dstRect.width(); val h = dstRect.height()
-
-            val cLeft = if (sectorMode == 2) dstRect.left + w * 0.42f else dstRect.left
-            val cRight = if (sectorMode == 1) dstRect.left + w * 0.58f else dstRect.right
-
+            val h = dstRect.height()
             if (p <= 0.42f) {
                 val step = (((p / 0.42f) * 8f).toInt() + 1) / 8f
                 val frontY = dstRect.top + h * step.coerceIn(0.15f, 1f)
                 haloPaint.alpha = (245 * intensityScale).toInt().coerceIn(0, 255)
                 corePaint.alpha = (255 * intensityScale).toInt().coerceIn(0, 255)
-                canvas.save(); canvas.clipRect(cLeft, dstRect.top, cRight, frontY)
+                canvas.save(); canvas.clipRect(dstRect.left, dstRect.top, dstRect.right, frontY)
                 canvas.drawBitmap(halo, null, dstRect, haloPaint)
                 canvas.drawBitmap(core, null, dstRect, corePaint)
                 canvas.drawBitmap(core, null, dstRect, corePaint)
@@ -536,20 +518,15 @@ object LivingPedestalDirector {
                 val crackle = if (p in 0.56f..0.61f) 0.50f else 1.0f
                 haloPaint.alpha = (255 * crackle * intensityScale).toInt().coerceIn(0, 255)
                 corePaint.alpha = (255 * crackle * intensityScale).toInt().coerceIn(0, 255)
-                canvas.save(); canvas.clipRect(cLeft, dstRect.top, cRight, dstRect.bottom)
                 canvas.drawBitmap(halo, null, dstRect, haloPaint)
                 canvas.drawBitmap(core, null, dstRect, corePaint)
                 if (crackle > 0.9f) canvas.drawBitmap(core, null, dstRect, corePaint)
-                canvas.restore()
             } else {
                 val fade = ((1f - p) / 0.24f).coerceIn(0f, 1f)
-                val tailTop = dstRect.top + h * (1f - fade) * 0.45f
                 haloPaint.alpha = (245 * fade * intensityScale).toInt().coerceIn(0, 255)
                 corePaint.alpha = (255 * fade * intensityScale).toInt().coerceIn(0, 255)
-                canvas.save(); canvas.clipRect(cLeft, tailTop, cRight, dstRect.bottom)
                 canvas.drawBitmap(halo, null, dstRect, haloPaint)
                 canvas.drawBitmap(core, null, dstRect, corePaint)
-                canvas.restore()
             }
         }
 
@@ -564,7 +541,7 @@ object LivingPedestalDirector {
     private class MoltenGoldScreenStreamView(ctx: Context) : View(ctx), SensorEventListener {
         private data class GoldGlob(var x: Float = 0f, var y: Float = 0f, var vx: Float = 0f, var vy: Float = 0f, var r: Float = 0f, var weight: Float = 1f, var isTaffy: Boolean = false, var active: Boolean = false)
 
-        private val globs = Array(64) { GoldGlob() }
+        private val globs = Array(96) { GoldGlob() }
         private val cols = 72
         private val meshRows = 3
         private val h = FloatArray(cols + 1)
@@ -637,8 +614,8 @@ object LivingPedestalDirector {
             for (g in globs) {
                 if (!g.active) continue
                 anyGlobs = true
-                g.vx += smoothSinTilt * dp(context, 155f) * dt
-                g.vy += dp(context, if (g.isTaffy) 780f else 620f) * dt
+                g.vx += smoothSinTilt * dp(context, 145f) * dt
+                g.vy += dp(context, 560f) * dt
                 g.x = (g.x + g.vx * dt).coerceIn(dp(context, 6f), sw - dp(context, 6f))
                 g.y += g.vy * dt
 
@@ -646,23 +623,27 @@ object LivingPedestalDirector {
                 val surfY = sh - h[ci]
                 if (g.y >= surfY) {
                     g.active = false
-                    val addPeak = dp(context, if (g.isTaffy) 1.0f else 7.8f) * g.weight
+                    val addPeak = dp(context, if (g.isTaffy) 0.95f else 8.2f) * g.weight
                     val maxCap = dp(context, 128f)
                     for (k in max(0, ci - 5)..min(cols, ci + 5)) {
                         val d = (k - ci).toFloat()
-                        val w = exp((-d * d / 8.5f).toDouble()).toFloat()
-                        h[k] = (h[k] + addPeak * w).coerceAtMost(maxCap)
-                        uVel[k] += (if (k < ci) -dp(context, 48f) else dp(context, 48f)) * w * g.weight
+                        val w = exp((-d * d / 8.0f).toDouble()).toFloat()
+                        val craterMul = if (!g.isTaffy && abs(k - ci) <= 1) 0.48f else 1.16f
+                        h[k] = (h[k] + addPeak * w * craterMul).coerceAtMost(maxCap)
+                        uVel[k] += (if (k < ci) -dp(context, 102f) else if (k > ci) dp(context, 102f) else 0f) * w * g.weight
                     }
                     if (!g.isTaffy && g.weight >= 0.75f) {
-                        for (s in 0 until 5) {
+                        for (s in 0 until 10) {
                             globs.firstOrNull { !it.active }?.apply {
                                 active = true; isTaffy = true
                                 val side = if (s % 2 == 0) 1f else -1f
-                                x = g.x + side * dp(context, 3.2f); y = surfY - dp(context, 2.5f)
-                                vx = side * dp(context, 48f + Random.nextFloat() * 52f) + smoothSinTilt * dp(context, 38f)
-                                vy = -dp(context, 88f + Random.nextFloat() * 58f)
-                                r = dp(context, 2.2f + Random.nextFloat() * 1.2f); weight = 0.28f
+                                val spread = 0.25f + Random.nextFloat() * 0.98f
+                                x = g.x + side * dp(context, 2.8f)
+                                y = surfY - dp(context, 3.2f)
+                                vx = side * spread * dp(context, 168f) + smoothSinTilt * dp(context, 42f)
+                                vy = -dp(context, 175f + Random.nextFloat() * 160f)
+                                r = dp(context, 2.4f + Random.nextFloat() * 1.5f)
+                                weight = 0.28f
                             }
                         }
                     }
@@ -707,7 +688,7 @@ object LivingPedestalDirector {
             var maxPile = 0f
             for (i in 0..cols) {
                 val l = tmpH[max(0, i - 1)]; val c = tmpH[i]; val r = tmpH[min(cols, i + 1)]
-                h[i] = 0.20f * l + 0.60f * c + 0.20f * r
+                h[i] = 0.065f * l + 0.870f * c + 0.065f * r
                 if (h[i] > maxPile) maxPile = h[i]
             }
 
@@ -803,7 +784,7 @@ object LivingPedestalDirector {
      * - Exact Original 24k Gold Ring Strip + Crisp Individual Sparkling Gold-Dust Specks Outside the Gold Ring!
      */
     class LivingPedestalCrestView(ctx: Context) : FrameLayout(ctx) {
-        val padSide = dpInt(ctx, 20); val padTop = dpInt(ctx, 20); val padBottom = dpInt(ctx, 34)
+        val padSide = dpInt(ctx, 18); val padTop = dpInt(ctx, 18); val padBottom = dpInt(ctx, 34)
         val cardW = dpInt(ctx, 112); val cardH = dpInt(ctx, 140)
         private val cornerR = dp(ctx, 20f)
         val totalWindowWidthPx: Int = cardW + padSide * 2
@@ -822,18 +803,6 @@ object LivingPedestalDirector {
         private val rightMeshVerts = FloatArray((flankSegs + 1) * (radSteps + 1) * 2)
         private val leftMeshVerts = FloatArray((flankSegs + 1) * (radSteps + 1) * 2)
         private var meshReady = false
-
-        // 84 Individual Sparkling 24k Gold-Dust Specks Outside the Gold Ring (NEVER smear or flow into a band!)
-        private val dustCount = 84
-        private val dustFlank = BooleanArray(dustCount) { it % 2 == 0 }
-        private val dustU = FloatArray(dustCount) { Random.nextFloat() }
-        private val dustOutDp = FloatArray(dustCount) { 4.2f + Random.nextFloat() * 12.2f }
-        private val dustRadDp = FloatArray(dustCount) { 0.55f + Random.nextFloat() * 1.15f }
-        private val dustTwinklePhase = FloatArray(dustCount) { Random.nextFloat() * 6.283f }
-        private val dustTwinkleHz = FloatArray(dustCount) { 1.4f + Random.nextFloat() * 2.6f }
-        private val dustDriftRate = FloatArray(dustCount) { 0.012f + Random.nextFloat() * 0.024f }
-        private val dustCorePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val dustHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
         private val scrolledStripBmp: Bitmap? = ringStripBmp?.let { Bitmap.createBitmap(it.width, it.height, Bitmap.Config.ARGB_8888) }
         private val scrolledStripCanvas: Canvas? = scrolledStripBmp?.let { Canvas(it) }
@@ -970,9 +939,8 @@ object LivingPedestalDirector {
         private fun updateDualCascadingMeshes(swell: Float) {
             if (!meshReady) return
             val innerTuck = -dp(context, 0.5f)
-            // Keep scrolling molten gold focused in a crisp 11.5dp border channel so outer gold-dust specks stay distinct!
-            val outerSpan = dp(context, 11.5f) - innerTuck
-            val pull = dp(context, 4.8f) * (0.28f + 0.72f * swell)
+            val outerSpan = padSide.toFloat() - innerTuck
+            val pull = dp(context, 5.2f) * (0.28f + 0.72f * swell)
             for (i in 0..flankSegs) {
                 val u = i.toFloat() / flankSegs.toFloat()
                 val bell = if (u > 0.85f) { val t = (u - 0.85f) / 0.15f; t * t * (3f - 2f * t) } else 0f
@@ -999,15 +967,9 @@ object LivingPedestalDirector {
                     val flowActive = (!isStandbyMode || hasUnreadRavenFlag) &&
                         (isSessionOpen || isSpeakingNow || hasUnreadRavenFlag || now < bootShowcaseUntilMs)
 
-                    // Gently drift & twinkle individual 24k Gold-Dust Specks outside the gold ring!
-                    for (k in 0 until dustCount) {
-                        dustTwinklePhase[k] = (dustTwinklePhase[k] + dt * dustTwinkleHz[k]) % 62.83f
-                        if (flowActive) dustU[k] = (dustU[k] + dt * dustDriftRate[k]) % 1f
-                    }
-
                     if (recoilPhase > 0f) recoilPhase = (recoilPhase - dt * 6.5f).coerceAtLeast(0f)
                     if (flowActive) {
-                        flowPhase = (flowPhase + (dt / 10.5f) * (if (isSpeakingNow) 1.25f else 1.0f)) % 1f
+                        flowPhase = (flowPhase + (dt / 7.2f) * (if (isSpeakingNow) 1.24f else 1.0f)) % 1f
                         refreshScrolledStripBitmap()
                         ringPaint.alpha = ((0.84 + 0.16 * sin(((elapsed % 1100L).toDouble() / 1100.0) * Math.PI * 2.0)) * 255.0).toInt().coerceIn(175, 255)
                         pendantFill += dt * 0.96f
@@ -1017,7 +979,7 @@ object LivingPedestalDirector {
                                 val cLoc = IntArray(2); getLocationOnScreen(cLoc)
                                 ensureMoltenStreamOverlay(context)?.spawnDetachedDropFromPedestal(
                                     cLoc[0] + padSide + cardW * 0.50f,
-                                    cLoc[1] + padTop + cardH + dp(context, 7.5f) + dp(context, 12.0f)
+                                    cLoc[1] + padTop + cardH + padSide * 0.48f + dp(context, 12.0f)
                                 )
                             }
                         }
@@ -1055,33 +1017,9 @@ object LivingPedestalDirector {
             if (strip != null && meshReady) {
                 canvas.drawBitmapMesh(strip, flankSegs, radSteps, rightMeshVerts, 0, null, 0, ringPaint)
                 canvas.drawBitmapMesh(strip, flankSegs, radSteps, leftMeshVerts, 0, null, 0, ringPaint)
-
-                // Crisp Individual 24k Gold-Dust Specks Outside the Gold Ring!
-                for (k in 0 until dustCount) {
-                    val segF = dustU[k] * flankSegs.toFloat()
-                    val i0 = segF.toInt().coerceIn(0, flankSegs - 1)
-                    val frac = segF - i0
-                    val bx = if (dustFlank[k]) rightBx[i0] + (rightBx[i0 + 1] - rightBx[i0]) * frac else leftBx[i0] + (leftBx[i0 + 1] - leftBx[i0]) * frac
-                    val by = if (dustFlank[k]) rightBy[i0] + (rightBy[i0 + 1] - rightBy[i0]) * frac else leftBy[i0] + (leftBy[i0 + 1] - leftBy[i0]) * frac
-                    val nx = if (dustFlank[k]) rightNx[i0] else leftNx[i0]
-                    val ny = if (dustFlank[k]) rightNy[i0] else leftNy[i0]
-
-                    val outPx = dp(context, dustOutDp[k])
-                    val sx = bx + nx * outPx
-                    val sy = by + ny * outPx
-                    val tw = (0.5f + 0.5f * sin(dustTwinklePhase[k].toDouble()).toFloat())
-                    val alphaCore = (65 + (190f * tw * tw).toInt()).coerceIn(0, 255)
-                    val radPx = dp(context, dustRadDp[k]) * (0.75f + 0.35f * tw)
-
-                    dustHaloPaint.color = (GOLD_WARM and 0x00FFFFFF) or ((alphaCore / 3) shl 24)
-                    canvas.drawCircle(sx, sy, radPx * 2.1f, dustHaloPaint)
-                    dustCorePaint.color = (GOLD_GLINT and 0x00FFFFFF) or (alphaCore shl 24)
-                    canvas.drawCircle(sx, sy, radPx, dustCorePaint)
-                }
             }
-
             if (pendantFill > 0.03f || recoilPhase > 0.05f) {
-                val cx = padSide + cardW * 0.50f; val rimY = padTop + cardH + dp(context, 7.2f)
+                val cx = padSide + cardW * 0.50f; val rimY = padTop + cardH + padSide * 0.48f
                 val dropDist = (pendantFill * pendantFill * dp(context, 12.0f) - recoilPhase * dp(context, 2.8f)).coerceAtLeast(dp(context, 1.6f))
                 val cy = rimY + dropDist; val r = dp(context, 2.6f + 3.8f * pendantFill)
                 val rootW = dp(context, 6.2f); val pinchW = (r * (0.62f - 0.34f * pendantFill)).coerceAtLeast(dp(context, 1.15f))
