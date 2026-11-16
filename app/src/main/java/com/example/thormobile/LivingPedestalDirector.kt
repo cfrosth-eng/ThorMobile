@@ -98,7 +98,7 @@ object LivingPedestalDirector {
     private var wetRimLeftBmp: Bitmap? = null
     private var wetRimRightBmp: Bitmap? = null
     private var ringStripBmp: Bitmap? = null
-    private var moltenCoreTileBmp: Bitmap? = null
+    private var moltenSpeckTileBmp: Bitmap? = null
     private var runesGoldBmp: Bitmap? = null
 
     private val boltCores = arrayOfNulls<Bitmap>(4)
@@ -165,20 +165,7 @@ object LivingPedestalDirector {
         wetRimLeftBmp = decodeRaw(app, R.drawable.raven_wet_rim_left)
         wetRimRightBmp = decodeRaw(app, R.drawable.raven_wet_rim_right)
         ringStripBmp = decodeRaw(app, R.drawable.raven_gold_ring_strip)?.apply { setHasMipMap(true) }
-        ringStripBmp?.let { src ->
-            // Extract ONLY dense speck-free liquid gold core (rows 12..64) & mirror vertically -> seamless 1:1 isotropic shader tile!
-            val y0 = (src.height * 0.06f).toInt().coerceIn(0, src.height - 2)
-            val bandH = (src.height * 0.23f).toInt().coerceAtLeast(16)
-            val slice = Bitmap.createBitmap(src, 0, y0, src.width, bandH.coerceAtMost(src.height - y0))
-            val tileW = 512; val halfH = 56
-            val scaled = Bitmap.createScaledBitmap(slice, tileW, halfH, true)
-            val seamless = Bitmap.createBitmap(tileW, halfH * 2, Bitmap.Config.ARGB_8888)
-            val tc = Canvas(seamless)
-            tc.drawBitmap(scaled, 0f, 0f, null)
-            tc.save(); tc.translate(0f, (halfH * 2).toFloat()); tc.scale(1f, -1f)
-            tc.drawBitmap(scaled, 0f, 0f, null); tc.restore()
-            moltenCoreTileBmp = seamless
-        }
+        moltenSpeckTileBmp = decodeRaw(app, R.drawable.molten_speck_pool_tile)?.apply { setHasMipMap(true) }
         runesGoldBmp = decodeRaw(app, R.drawable.raven_runes_gold_hd)
 
         val cIds = intArrayOf(R.drawable.raven_bolt_0_core, R.drawable.raven_bolt_1_core, R.drawable.raven_bolt_2_core, R.drawable.raven_bolt_3_core)
@@ -592,21 +579,27 @@ object LivingPedestalDirector {
 
         private val globs = Array(112) { GoldGlob() }
         private val cols = 64
+        private val topMeshRows = 3
         private val h = FloatArray(cols + 1)
         private val uVel = FloatArray(cols + 1)
         private val nuBuf = FloatArray(cols + 1)
         private val tmpH = FloatArray(cols + 1)
         private val flux = FloatArray(cols + 1)
+        private val topBandVerts = FloatArray((cols + 1) * (topMeshRows + 1) * 2)
 
         private val globPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val glintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = GOLD_GLINT }
         private val baseBodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val veinShaderMatrix = Matrix()
-        private val veinShader: BitmapShader? = moltenCoreTileBmp?.let { BitmapShader(it, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT) }
-        private val veinPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
-            alpha = 135
-            shader = veinShader
+        private val speckShaderMatrix = Matrix()
+        private val speckDeepShader: BitmapShader? = moltenSpeckTileBmp?.let { BitmapShader(it, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT) }
+        private val speckDeepPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+            alpha = 210
+            shader = speckDeepShader
         }
+        private val topMeshPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply { alpha = 178 }
+        private val scrolledTopBmp: Bitmap? = ringStripBmp?.let { Bitmap.createBitmap(it.width, it.height, Bitmap.Config.ARGB_8888).apply { setHasMipMap(true) } }
+        private val scrolledTopCanvas: Canvas? = scrolledTopBmp?.let { Canvas(it) }
+
         private val darkLipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
         private val specLipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
         private val dropPath = Path()
@@ -616,7 +609,7 @@ object LivingPedestalDirector {
         private var sensorMgr: SensorManager? = null
         private var rawSinTilt = 0f
         private var smoothSinTilt = 0f
-        private var uvShiftPx = 0f
+        private var flowOffsetPx = 0f
         private var lastWallSplashMs = 0L
 
         override fun onAttachedToWindow() {
@@ -786,12 +779,37 @@ object LivingPedestalDirector {
                 avgVel += uVel[i]
             }
 
-            if (maxPile > 0.4f && veinShader != null) {
-                uvShiftPx = (uvShiftPx + (avgVel / cols.toFloat()) * dt * 0.65f) % 4096f
-                // 1:1 Isotropic Liquid Gold Vein Matrix -> ZERO vertical stretching even on 45+ deg steep tilts!
-                veinShaderMatrix.reset()
-                veinShaderMatrix.postTranslate(uvShiftPx, sh - meanH)
-                veinShader.setLocalMatrix(veinShaderMatrix)
+            if (maxPile > 0.4f) {
+                flowOffsetPx += (avgVel / cols.toFloat()) * dt * 0.65f
+                if (flowOffsetPx > 100_000f || flowOffsetPx < -100_000f) flowOffsetPx %= 1536f
+
+                // 1. Deep Sub-Layer: 1:1 Isotropic Sparkling Gold-Speck Shader (ZERO vertical stretch even on 45+ deg tilt!)
+                if (speckDeepShader != null) {
+                    speckShaderMatrix.reset()
+                    speckShaderMatrix.postTranslate(flowOffsetPx, sh - dp(context, 48f))
+                    speckDeepShader.setLocalMatrix(speckShaderMatrix)
+                }
+
+                // 2. Top Surface Layer: Constant 54dp Wave-Following Gold-Speck Mesh (bends with waves, NEVER stretches vertically!)
+                val src = ringStripBmp
+                if (src != null && scrolledTopCanvas != null) {
+                    val wBmp = src.width.toFloat()
+                    val sx = ((flowOffsetPx % wBmp) + wBmp) % wBmp
+                    scrolledTopCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    scrolledTopCanvas.drawBitmap(src, sx, 0f, null)
+                    scrolledTopCanvas.drawBitmap(src, sx - wBmp, 0f, null)
+                }
+                val constBandPx = dp(context, 54f)
+                for (r in 0..topMeshRows) {
+                    val rf = r.toFloat() / topMeshRows.toFloat()
+                    for (c in 0..cols) {
+                        val px = (c.toFloat() / cols.toFloat()) * sw
+                        val topY = sh - h[c]
+                        val idx = (r * (cols + 1) + c) * 2
+                        topBandVerts[idx] = px
+                        topBandVerts[idx + 1] = topY + constBandPx * rf
+                    }
+                }
             }
             invalidate()
             return flowActive || anyGlobs || maxPile > 0.4f
@@ -852,8 +870,11 @@ object LivingPedestalDirector {
                 baseBodyPaint.shader = LinearGradient(0f, sh - peakH - dp(context, 2f), 0f, glassBot, intArrayOf(GOLD_WARM, GOLD_RICH, GOLD_BRONZE, GOLD_SHADOW), floatArrayOf(0f, 0.38f, 0.78f, 1f), Shader.TileMode.CLAMP)
                 canvas.drawRect(0f, sh - peakH - dp(context, 4f), sw, glassBot, baseBodyPaint)
 
-                if (veinShader != null) {
-                    canvas.drawRect(0f, sh - peakH - dp(context, 4f), sw, glassBot, veinPaint)
+                if (speckDeepShader != null) {
+                    canvas.drawRect(0f, sh - peakH - dp(context, 4f), sw, glassBot, speckDeepPaint)
+                }
+                (scrolledTopBmp ?: ringStripBmp)?.let { tex ->
+                    canvas.drawBitmapMesh(tex, cols, topMeshRows, topBandVerts, 0, null, 0, topMeshPaint)
                 }
 
                 darkLipPaint.strokeWidth = dp(context, 3.4f); darkLipPaint.color = 0x883A2203.toInt()
