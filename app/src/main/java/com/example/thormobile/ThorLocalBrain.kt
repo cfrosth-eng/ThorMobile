@@ -28,7 +28,8 @@ class ThorLocalBrain(private val context: Context) {
         const val MODEL_FILENAME = "gemma-4-E2B-it.litertlm"
         private const val SYSTEM_PROMPT =
             "You are Thor, Centh's loyal, sharp-witted British AI assistant running in offline dead-zone mode on his Samsung Galaxy Note 20 Ultra. " +
-            "Answer in 1 to 3 concise, direct spoken sentences with zero markdown formatting."
+            "Answer in 1 to 3 concise, direct spoken sentences with zero markdown formatting. " +
+            "If Centh asks to turn ON the flashlight or torch, begin with [ACTION:TORCH_ON]. If he asks to turn OFF the flashlight or torch, begin with [ACTION:TORCH_OFF]."
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -170,9 +171,17 @@ class ThorLocalBrain(private val context: Context) {
                         .trim()
                         .ifEmpty { response.toString().trim() }
 
-                    Log.i(TAG, "Gemma 4 E2B offline reply: $replyText")
+                    var cleanReply = replyText
+                        if (cleanReply.contains("[ACTION:TORCH_ON]", ignoreCase = true)) {
+                            ThorFlashlightAndLensService.setTorch(context, true)
+                            cleanReply = cleanReply.replace("[ACTION:TORCH_ON]", "", ignoreCase = true).trim()
+                        } else if (cleanReply.contains("[ACTION:TORCH_OFF]", ignoreCase = true)) {
+                            ThorFlashlightAndLensService.setTorch(context, false)
+                            cleanReply = cleanReply.replace("[ACTION:TORCH_OFF]", "", ignoreCase = true).trim()
+                        }
+                        Log.i(TAG, "Gemma 4 E2B offline reply: $cleanReply")
                     speakOffline(
-                        replyText.ifEmpty { "I heard you, Boss, and logged your audio to the offline outbox." },
+                        cleanReply.ifEmpty { "I heard you, Boss, and logged your audio to the offline outbox." },
                         onStartSpeaking,
                         onFinishedSpeaking
                     )

@@ -44,6 +44,10 @@ class MainActivity : AppCompatActivity() {
     private var displayShareTitleTv: TextView? = null
     private var displayShareSubTv: TextView? = null
     private var displayShareCardRef: LinearLayout? = null
+    private var torchCardRef: LinearLayout? = null
+    private var torchTitleTv: TextView? = null
+    private var rearCamCardRef: LinearLayout? = null
+    private var rearCamTitleTv: TextView? = null
     private var ravenCenterBadgeTv: TextView? = null
 
     private val toggleUiHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -61,6 +65,7 @@ class MainActivity : AppCompatActivity() {
         window.navigationBarColor = Color.parseColor("#040812")
 
         requestNeededPermissions()
+        ThorFlashlightAndLensService.ensureTorchListener(this)
         ObdLinkAutoWatchdog.startAutonomousWatchdog(CLOUD_URL)
         VikingPopupOverlayManager.start(this, CLOUD_URL)
         RavenHeraldService.ensureRunning(this)
@@ -173,6 +178,55 @@ class MainActivity : AppCompatActivity() {
         }
         displayShareCardRef = displayShareCard
         root.addView(displayShareCard)
+
+        val hwRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(12) }
+        }
+        val tCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = makeCardDrawable("#172033", "#64748B", 20)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+            val tt = TextView(this@MainActivity).apply {
+                text = "🔦 TORCH: OFF"; setTextColor(Color.parseColor("#FEF08A")); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+            }
+            val ts = TextView(this@MainActivity).apply {
+                text = "Standalone LED"; setTextColor(Color.parseColor("#FDE68A")); setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f); gravity = Gravity.CENTER; setPadding(0, dp(2), 0, 0)
+            }
+            torchTitleTv = tt; addView(tt); addView(ts)
+            setOnClickListener {
+                val on = ThorFlashlightAndLensService.toggleTorch(this@MainActivity)
+                Toast.makeText(this@MainActivity, if (on) "🔦 Flashlight ON" else "Flashlight OFF", Toast.LENGTH_SHORT).show()
+                updateVoiceToggleButtonAppearance()
+            }
+        }
+        torchCardRef = tCard
+
+        val cCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = makeCardDrawable("#0F172A", "#64748B", 20)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(6) }
+            val ct = TextView(this@MainActivity).apply {
+                text = "📷 REAR CAM: OFF"; setTextColor(Color.parseColor("#D1FAE5")); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+            }
+            val cs = TextView(this@MainActivity).apply {
+                text = "Live Mechanic Lens"; setTextColor(Color.parseColor("#6EE7B7")); setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f); gravity = Gravity.CENTER; setPadding(0, dp(2), 0, 0)
+            }
+            rearCamTitleTv = ct; addView(ct); addView(cs)
+            setOnClickListener {
+                if (ThorFlashlightAndLensService.isRearCameraActive) {
+                    ThorFlashlightAndLensService.stopRearCamera(this@MainActivity)
+                    Toast.makeText(this@MainActivity, "Rear Camera OFF", Toast.LENGTH_SHORT).show()
+                } else {
+                    ThorFlashlightAndLensService.startRearCamera(this@MainActivity, ThorFlashlightAndLensService.isTorchOn)
+                }
+                toggleUiHandler.postDelayed({ updateVoiceToggleButtonAppearance() }, 250L)
+            }
+        }
+        rearCamCardRef = cCard
+        hwRow.addView(tCard); hwRow.addView(cCard); root.addView(hwRow)
 
         // DIRECTLY UNDERNEATH FLOATING THOR BUTTON: Raven Messaging Center with Raven-on-Pedestal Button
         root.addView(buildRavenMessagingCenterCard())
@@ -574,6 +628,16 @@ class MainActivity : AppCompatActivity() {
                 radiusDp = 22
             )
         }
+        torchCardRef?.let { tc ->
+            val tOn = ThorFlashlightAndLensService.isTorchOn
+            torchTitleTv?.text = if (tOn) "🔦 TORCH: ON" else "🔦 TORCH: OFF"
+            tc.background = makeCardDrawable(if (tOn) "#422006" else "#172033", if (tOn) "#FACC15" else "#64748B", 20)
+        }
+        rearCamCardRef?.let { cc ->
+            val cOn = ThorFlashlightAndLensService.isRearCameraActive
+            rearCamTitleTv?.text = if (cOn) "🟢 REAR CAM: ON" else "📷 REAR CAM: OFF"
+            cc.background = makeCardDrawable(if (cOn) "#063224" else "#0F172A", if (cOn) "#34D399" else "#64748B", 20)
+        }
     }
 
     private fun launchFloatingThorOverlay() {
@@ -617,6 +681,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestNeededPermissions() {
         val perms = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA,
             Manifest.permission.READ_SMS,
             Manifest.permission.SEND_SMS,
             Manifest.permission.READ_CONTACTS

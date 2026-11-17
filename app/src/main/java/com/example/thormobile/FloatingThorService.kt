@@ -713,6 +713,7 @@ class FloatingThorService : Service() {
         }
         if (intent?.action == ACTION_STOP) {
             ThorDisplayShareService.stopSharing(this)
+            ThorFlashlightAndLensService.stopRearCamera(this)
             userRequestedStop = true
             canAutoResumeMic = false
             getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
@@ -1359,7 +1360,9 @@ class FloatingThorService : Service() {
                     }
                 }
             }
-            if (ThorDisplayShareService.isDisplayShareActive && ThorDisplayShareService.latestFrameJson.isNotEmpty()) {
+            if (ThorFlashlightAndLensService.isRearCameraActive && ThorFlashlightAndLensService.latestCamFrameJson.isNotEmpty()) {
+                try { ws.send(ThorFlashlightAndLensService.latestCamFrameJson) } catch (_: Exception) {}
+            } else if (ThorDisplayShareService.isDisplayShareActive && ThorDisplayShareService.latestFrameJson.isNotEmpty()) {
                 try { ws.send(ThorDisplayShareService.latestFrameJson) } catch (_: Exception) {}
             }
             flushOutbox()
@@ -1458,7 +1461,19 @@ class FloatingThorService : Service() {
                         }
                     }
                     if (json.optString("action") == "request_native_frame_now") {
-                    ThorDisplayShareService.sendImmediateNativeFrame()
+                    if (ThorFlashlightAndLensService.isRearCameraActive) {
+                        ThorFlashlightAndLensService.sendImmediateHighResFrame()
+                    } else {
+                        ThorDisplayShareService.sendImmediateNativeFrame()
+                    }
+                }
+                if (json.optString("action") == "rear_camera_control") {
+                    val en = json.optBoolean("enable", false)
+                    val tr = json.optBoolean("torch", false)
+                    mainHandler.post {
+                        if (en) ThorFlashlightAndLensService.startRearCamera(this@FloatingThorService, tr)
+                        else ThorFlashlightAndLensService.stopRearCamera(this@FloatingThorService)
+                    }
                 }
                 if (json.optString("action") == "screen_watcher_control") {
                     val enableShare = json.optBoolean("enable", false)
@@ -1504,6 +1519,11 @@ class FloatingThorService : Service() {
                             }
                             try { startActivity(i) } catch (e: Exception) { Log.e("ThorBridge", "Alarm intent failed", e) }
                         }
+                        "torch_on" -> mainHandler.post { ThorFlashlightAndLensService.setTorch(this@FloatingThorService, true) }
+                        "torch_off" -> mainHandler.post { ThorFlashlightAndLensService.setTorch(this@FloatingThorService, false) }
+                        "torch_toggle" -> mainHandler.post { ThorFlashlightAndLensService.toggleTorch(this@FloatingThorService) }
+                        "rear_camera_on" -> mainHandler.post { ThorFlashlightAndLensService.startRearCamera(this@FloatingThorService, false) }
+                        "rear_camera_off" -> mainHandler.post { ThorFlashlightAndLensService.stopRearCamera(this@FloatingThorService) }
                         "dial" -> {
                             val num = json.optString("phone_number")
                             if (num.isNotEmpty()) {
