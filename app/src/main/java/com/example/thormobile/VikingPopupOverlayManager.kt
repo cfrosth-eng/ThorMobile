@@ -1067,12 +1067,26 @@ object VikingPopupOverlayManager {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 background = makePillDrawable("#172033", "#F5B942", 1, 99, ctx)
-                layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 0.95f)
+                layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 0.95f).apply { marginEnd = dp(ctx, 5) }
                 setOnClickListener {
                     hideVikingShield()
                     try {
                         ctx.startActivity(Intent(ctx, RavenCenterActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
                     } catch (_: Exception) {}
+                }
+            })
+            tacCount++
+            tacRow.addView(Button(ctx).apply {
+                text = "✓ Got It"
+                isAllCaps = false
+                setTextColor(Color.parseColor("#DCFCE7"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                background = makePillDrawable("#063224", "#34D399", 1, 99, ctx)
+                layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 36), 0.95f)
+                setOnClickListener {
+                    triggerServerActionBg(lastRavenCleanBase, "dismiss_reply")
+                    hideVikingShield()
                 }
             })
             tacCount++

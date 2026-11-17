@@ -80,6 +80,29 @@ class FloatingThorService : Service() {
         const val ACTION_STOP = "com.example.thormobile.action.STOP"
         const val ACTION_KEEP_ALIVE = "com.example.thormobile.action.KEEP_ALIVE"
         @Volatile var isServiceRunning = false
+        @Volatile private var activeInstance: FloatingThorService? = null
+
+        fun isVoiceSessionOpen(): Boolean {
+            val inst = activeInstance ?: return false
+            synchronized(inst.lock) {
+                return inst.socketReady && inst.activeSession != 0 && inst.webSocket != null
+            }
+        }
+
+        fun sendJsonToActiveBridge(jsonPayload: String): Boolean {
+            val inst = activeInstance ?: return false
+            synchronized(inst.lock) {
+                val ws = inst.webSocket
+                if (inst.socketReady && ws != null) {
+                    return try {
+                        ws.send(jsonPayload)
+                    } catch (_: Exception) {
+                        false
+                    }
+                }
+            }
+            return false
+        }
         @Volatile var userRequestedStop = false
         @Volatile var serviceCreatedElapsedMs = 0L
         private const val BRIDGE_URL = "wss://thor-api-443941171993.us-east4.run.app"
@@ -351,6 +374,7 @@ class FloatingThorService : Service() {
         VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
         RavenHeraldService.ensureRunning(this)
         isServiceRunning = true
+        activeInstance = this
         canAutoResumeMic = !isStandby
         LivingPedestalDirector.speechEnvelopeSupplier = { if (destroyed) 0f else sampleLiveHardwareSpeechEnvelope() }
 
@@ -688,6 +712,7 @@ class FloatingThorService : Service() {
             return START_STICKY
         }
         if (intent?.action == ACTION_STOP) {
+            ThorDisplayShareService.stopSharing(this)
             userRequestedStop = true
             canAutoResumeMic = false
             getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
@@ -753,6 +778,7 @@ class FloatingThorService : Service() {
         canAutoResumeMic = false
         awaitingThorReply = false
         isServiceRunning = false
+        if (activeInstance === this) activeInstance = null
         getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
         if (destroyed) {
             cancelOverlayNotificationCompletely()
@@ -1333,6 +1359,9 @@ class FloatingThorService : Service() {
                     }
                 }
             }
+            if (ThorDisplayShareService.isDisplayShareActive && ThorDisplayShareService.latestFrameJson.isNotEmpty()) {
+                try { ws.send(ThorDisplayShareService.latestFrameJson) } catch (_: Exception) {}
+            }
             flushOutbox()
         }
 
@@ -1428,7 +1457,22 @@ class FloatingThorService : Service() {
                             VikingPopupOverlayManager.pollNow(this@FloatingThorService, "https://" + "thor-api-443941171993.us-east4.run.app")
                         }
                     }
-                    if (json.optString("action") == "phone_intent") {
+                    if (json.optString("action") == "request_native_frame_now") {
+                    ThorDisplayShareService.sendImmediateNativeFrame()
+                }
+                if (json.optString("action") == "screen_watcher_control") {
+                    val enableShare = json.optBoolean("enable", false)
+                    mainHandler.post {
+                        if (enableShare) {
+                            if (!ThorDisplayShareService.isDisplayShareActive) {
+                                DisplayShareConsentActivity.launchConsent(this@FloatingThorService)
+                            }
+                        } else {
+                            ThorDisplayShareService.stopSharing(this@FloatingThorService)
+                        }
+                    }
+                }
+                if (json.optString("action") == "phone_intent") {
                     val intentType = json.optString("intent_type")
                     val label = json.optString("label", "Thor")
                     when (intentType) {
@@ -2402,6 +2446,7 @@ class FloatingThorService : Service() {
         canAutoResumeMic = false
         awaitingThorReply = false
         isServiceRunning = false
+        if (activeInstance === this) activeInstance = null
         cancelOverlayNotificationCompletely()
         mainHandler.removeCallbacksAndMessages(null)
         stopStreamingAudio()

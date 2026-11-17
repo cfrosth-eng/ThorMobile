@@ -41,6 +41,9 @@ class MainActivity : AppCompatActivity() {
     private var voiceToggleTitleTv: TextView? = null
     private var voiceToggleSubTv: TextView? = null
     private var voiceToggleCardRef: LinearLayout? = null
+    private var displayShareTitleTv: TextView? = null
+    private var displayShareSubTv: TextView? = null
+    private var displayShareCardRef: LinearLayout? = null
     private var ravenCenterBadgeTv: TextView? = null
 
     private val toggleUiHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -129,6 +132,47 @@ class MainActivity : AppCompatActivity() {
         }
         voiceToggleCardRef = singleToggleCard
         root.addView(singleToggleCard)
+
+        val displayShareCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(18), dp(13), dp(18), dp(13))
+            background = makeCardDrawable("#0F172A", "#38BDF8", 22)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+
+            val dsTitle = TextView(this@MainActivity).apply {
+                text = "📱 DISPLAY SHARE (2-GEAR HD): OFF"
+                setTextColor(Color.parseColor("#E0F2FE"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            val dsSub = TextView(this@MainActivity).apply {
+                text = "Tap to share live screen with Thor (720p fast + 1:1 native UI auto-shift, zero files saved)"
+                setTextColor(Color.parseColor("#93C5FD"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                gravity = Gravity.CENTER
+                setPadding(dp(6), dp(3), dp(6), 0)
+            }
+            displayShareTitleTv = dsTitle
+            displayShareSubTv = dsSub
+            addView(dsTitle)
+            addView(dsSub)
+            setOnClickListener {
+                if (ThorDisplayShareService.isDisplayShareActive) {
+                    ThorDisplayShareService.stopSharing(this@MainActivity)
+                    Toast.makeText(this@MainActivity, "Display Share OFF", Toast.LENGTH_SHORT).show()
+                } else {
+                    DisplayShareConsentActivity.launchConsent(this@MainActivity)
+                }
+                toggleUiHandler.postDelayed({ updateVoiceToggleButtonAppearance() }, 250L)
+            }
+        }
+        displayShareCardRef = displayShareCard
+        root.addView(displayShareCard)
 
         // DIRECTLY UNDERNEATH FLOATING THOR BUTTON: Raven Messaging Center with Raven-on-Pedestal Button
         root.addView(buildRavenMessagingCenterCard())
@@ -514,6 +558,22 @@ class MainActivity : AppCompatActivity() {
             borderHex = if (isOn) "#22C55E" else "#EF4444",
             radiusDp = 24
         )
+        displayShareCardRef?.let { dsCard ->
+            val dsOn = ThorDisplayShareService.isDisplayShareActive
+            displayShareTitleTv?.text = if (dsOn) "🟢 DISPLAY SHARE (2-GEAR HD): ON" else "📱 DISPLAY SHARE (2-GEAR HD): OFF"
+            displayShareTitleTv?.setTextColor(Color.parseColor(if (dsOn) "#DCFCE7" else "#E0F2FE"))
+            displayShareSubTv?.text = if (dsOn) {
+                "In-RAM 720p + 1:1 Native Full-Res auto-shift active — tap to STOP"
+            } else {
+                "Tap to share live screen with Thor (720p fast + 1:1 native UI auto-shift, zero files saved)"
+            }
+            displayShareSubTv?.setTextColor(Color.parseColor(if (dsOn) "#86EFAC" else "#93C5FD"))
+            dsCard.background = makeCardDrawable(
+                bgHex = if (dsOn) "#063224" else "#0F172A",
+                borderHex = if (dsOn) "#34D399" else "#38BDF8",
+                radiusDp = 22
+            )
+        }
     }
 
     private fun launchFloatingThorOverlay() {
