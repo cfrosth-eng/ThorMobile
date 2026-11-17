@@ -76,6 +76,7 @@ object LivingPedestalDirector {
         private set
     @Volatile var flightInProgress: Boolean = false
         private set
+    @Volatile var speechEnvelopeSupplier: (() -> Float)? = null
 
     @Volatile private var attachedCrestView: LivingPedestalCrestView? = null
     private var flightWindowManager: WindowManager? = null
@@ -991,7 +992,6 @@ object LivingPedestalDirector {
         }
 
         fun pulseRunesResonance() {
-            runesDrawable?.triggerLightningResonance()
             skyBoltsDrawable.forceSingleStrikeNow()
             invalidate()
         }
@@ -999,7 +999,7 @@ object LivingPedestalDirector {
         fun triggerElectricStrikeBurst(durationMs: Long = 820L, intensity: Float = 1.0f) {
             strikeAnimator?.cancel()
             skyBoltsDrawable.forceSingleStrikeNow()
-            runesDrawable?.triggerLightningResonance()
+            // WO-173: Never flash runes on sky/hammer lightning so ONLY Thor Speaking flashes the runes!
             electricHammerDrawable.intensityScale = intensity
             strikeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
                 duration = durationMs; interpolator = LinearInterpolator()
@@ -1020,19 +1020,15 @@ object LivingPedestalDirector {
         ) {
             val standbyChanged = (isStandbyMode != standby)
             val sessionJustOpened = (!isSessionOpen && sessionOpen)
-            val micJustOpened = (!isMicListeningNow && micListening)
             isStandbyMode = standby; isSessionOpen = sessionOpen; isSpeakingNow = speaking; hasUnreadRavenFlag = unreadRaven; isMicListeningNow = micListening
             runesDrawable?.isMutedRed = standby
-            runesDrawable?.isMicListeningBlue = micListening && !standby
-            runesDrawable?.isSessionHot = (sessionOpen || speaking) && !micListening && !standby
-            if (standbyChanged) {
-                runesDrawable?.triggerLightningResonance()
-                if (currentOccupant == PedestalOccupant.MJOLNIR) triggerElectricStrikeBurst(680L, 1.0f)
+            runesDrawable?.isSpeakingEmerald = speaking && !standby
+            runesDrawable?.isMicListeningBlue = micListening && !speaking && !standby
+            if (standbyChanged && currentOccupant == PedestalOccupant.MJOLNIR) {
+                triggerElectricStrikeBurst(680L, 1.0f)
             }
             if (sessionJustOpened && !standby) {
                 if (currentOccupant == PedestalOccupant.MJOLNIR) triggerElectricStrikeBurst(820L, 1.0f) else pulseRunesResonance()
-            } else if (micJustOpened && !standby) {
-                runesDrawable?.triggerLightningResonance()
             }
             invalidate()
         }
@@ -1133,7 +1129,8 @@ object LivingPedestalDirector {
                     }
 
                     artView.tickLivingScene(dt, now, skyBoltsDrawable.currentFlashIntensity())
-                    runesDrawable?.tick(dt, elapsed)
+                    val liveVoiceEnv = if (isSpeakingNow && !isStandbyMode) (speechEnvelopeSupplier?.invoke() ?: 0f) else 0f
+                    runesDrawable?.tick(dt, liveVoiceEnv)
                     skyBoltsDrawable.tick(now)
 
                     // Mjolnir's high-voltage cyan handle/head lightning crackles every 2.2s-4.5s whenever Mjolnir is on the stone (including Standby!)
@@ -1268,30 +1265,36 @@ object LivingPedestalDirector {
 
     private class ShimmeringRuneOverlayDrawable(private val runesBitmap: Bitmap) : Drawable() {
         private val normRect = RectF(0.32031f, 0.61129f, 0.62813f, 0.89530f)
-        private val shadowPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xDD1A0502.toInt(), PorterDuff.Mode.SRC_IN) }
-        private val redHaloCoverPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xCC450A0A.toInt(), PorterDuff.Mode.SRC_IN) }
-        // Option A Intense Storm Cobalt (#0088FF) + Deep Storm-Navy Groove Cover (#041B3D -> zero gold/green bleed!)
-        private val blueHaloCoverPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xDD041B3D.toInt(), PorterDuff.Mode.SRC_IN) }
+        private val shadowPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xEE1A0502.toInt(), PorterDuff.Mode.SRC_IN) }
+        private val redHaloCoverPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xDD450A0A.toInt(), PorterDuff.Mode.SRC_IN) }
+        private val blueHaloCoverPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xEE041B3D.toInt(), PorterDuff.Mode.SRC_IN) }
+        private val emeraldGroovePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xF0021C0E.toInt(), PorterDuff.Mode.SRC_IN) }
+        private val emeraldOuterBloomPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xFF00E676.toInt(), PorterDuff.Mode.SRC_IN) }
+
         private val redFilter = PorterDuffColorFilter(0xFFEF233C.toInt(), PorterDuff.Mode.SRC_IN)
         private val blueListeningFilter = PorterDuffColorFilter(0xFF0088FF.toInt(), PorterDuff.Mode.SRC_IN)
-        private val hotGoldFilter = PorterDuffColorFilter(0xFFFFEA70.toInt(), PorterDuff.Mode.SRC_IN)
+        private val emeraldDimFilter = PorterDuffColorFilter(0xFF043B1F.toInt(), PorterDuff.Mode.SRC_IN)
+        private val emeraldBrightFilter = PorterDuffColorFilter(0xFF00E676.toInt(), PorterDuff.Mode.SRC_IN)
+
         private val basePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
         private val maskPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
-        private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP) }
+        private val coreOverlayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP) }
         private val dstRect = RectF(); private val shadowRect = RectF()
+
         var isMutedRed: Boolean = false
         var isMicListeningBlue: Boolean = false
-        var isSessionHot: Boolean = false
-        private var shimmerPhase = 0f; private var emberBreath = 0f; private var strikeFlash = 0f
+        var isSpeakingEmerald: Boolean = false
+        private var smoothVoiceEnv: Float = 0f
 
-        fun triggerLightningResonance() { strikeFlash = 1.0f; invalidateSelf() }
-
-        fun tick(dt: Float, elapsedMs: Long) {
-            val sweepPeriodSec = if (isMicListeningBlue) 2.15f else 3.20f
-            shimmerPhase = (shimmerPhase + dt / sweepPeriodSec) % 1f
-            val breathPeriodMs = if (isMicListeningBlue) 1250.0 else 1800.0
-            emberBreath = (0.5 + 0.5 * sin((elapsedMs.toDouble() / breathPeriodMs) * Math.PI * 2.0)).toFloat()
-            if (strikeFlash > 0f) strikeFlash = (strikeFlash - dt * 2.5f).coerceAtLeast(0f)
+        fun tick(dt: Float, rawVoiceEnv: Float) {
+            if (isSpeakingEmerald) {
+                val target = rawVoiceEnv.coerceIn(0f, 1f)
+                // Fast ~18ms vowel attack + crisp ~45ms inter-syllable drop -> sharp unmistakable syllable flashes!
+                val rate = if (target > smoothVoiceEnv) 55f else 22f
+                smoothVoiceEnv += (target - smoothVoiceEnv) * min(1f, dt * rate)
+            } else {
+                smoothVoiceEnv = 0f
+            }
             invalidateSelf()
         }
 
@@ -1299,62 +1302,85 @@ object LivingPedestalDirector {
             val b = bounds; if (b.isEmpty) return
             val bw = b.width().toFloat(); val bh = b.height().toFloat()
             dstRect.set(b.left + normRect.left * bw, b.top + normRect.top * bh, b.left + normRect.right * bw, b.top + normRect.bottom * bh)
+
             if (isMutedRed) {
+                // 1. Muted Standby: 100% Rock-Steady Solid Crimson Ember (ZERO flashing)
                 val ex = max(1.5f, bw * 0.014f)
                 for (dx in intArrayOf(-1, 1)) for (dy in intArrayOf(-1, 1)) {
                     shadowRect.set(dstRect.left + dx * ex, dstRect.top + dy * ex, dstRect.right + dx * ex, dstRect.bottom + dy * ex)
                     canvas.drawBitmap(runesBitmap, null, shadowRect, redHaloCoverPaint)
                 }
-            } else if (isMicListeningBlue) {
+                maskPaint.colorFilter = redFilter
+                maskPaint.alpha = 250
+                canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
+                return
+            }
+
+            if (isSpeakingEmerald) {
+                // 2. Thor Speaking ONLY: Option A Bifrost Aurora Emerald (#00E676) Real-Time Syllable Strobe!
+                val env = smoothVoiceEnv.coerceIn(0f, 1f)
+                val ex = max(1.5f, bw * 0.014f)
+                for (dx in intArrayOf(-1, 1)) for (dy in intArrayOf(-1, 1)) {
+                    shadowRect.set(dstRect.left + dx * ex, dstRect.top + dy * ex, dstRect.right + dx * ex, dstRect.bottom + dy * ex)
+                    canvas.drawBitmap(runesBitmap, null, shadowRect, emeraldGroovePaint)
+                }
+                // Expanding outer emerald stone bloom on voiced syllables
+                if (env > 0.16f) {
+                    val bloomEx = max(2.2f, bw * (0.016f + 0.015f * env))
+                    emeraldOuterBloomPaint.alpha = ((env - 0.16f) * 185f).toInt().coerceIn(0, 165)
+                    for (dx in intArrayOf(-1, 0, 1)) for (dy in intArrayOf(-1, 0, 1)) {
+                        if (dx == 0 && dy == 0) continue
+                        shadowRect.set(dstRect.left + dx * bloomEx, dstRect.top + dy * bloomEx, dstRect.right + dx * bloomEx, dstRect.bottom + dy * bloomEx)
+                        canvas.drawBitmap(runesBitmap, null, shadowRect, emeraldOuterBloomPaint)
+                    }
+                }
+
+                val lid = canvas.saveLayer(dstRect, null)
+                // Deep dark forest-emerald groove between syllables so bright voiced syllables pop with huge contrast
+                maskPaint.colorFilter = emeraldDimFilter
+                maskPaint.alpha = 145
+                canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
+
+                // Blazing #00E676 Aurora Emerald driven directly by live 20ms AudioTrack playhead amplitude
+                if (env > 0.02f) {
+                    maskPaint.colorFilter = emeraldBrightFilter
+                    maskPaint.alpha = (env * 255f).toInt().coerceIn(0, 255)
+                    canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
+                }
+
+                // Crisp white-mint (#E2FFEF) arc flash at the peak of every stressed syllable
+                if (env > 0.34f) {
+                    coreOverlayPaint.color = Color.argb(((env - 0.34f) / 0.66f * 225f).toInt().coerceIn(0, 230), 226, 255, 239)
+                    canvas.drawRect(dstRect, coreOverlayPaint)
+                }
+                canvas.restoreToCount(lid)
+                return
+            }
+
+            if (isMicListeningBlue) {
+                // 3. Mic Open / Listening: 100% Rock-Steady Intense Storm Cobalt (#0088FF) (ZERO flashing)
                 val ex = max(1.5f, bw * 0.014f)
                 for (dx in intArrayOf(-1, 1)) for (dy in intArrayOf(-1, 1)) {
                     shadowRect.set(dstRect.left + dx * ex, dstRect.top + dy * ex, dstRect.right + dx * ex, dstRect.bottom + dy * ex)
                     canvas.drawBitmap(runesBitmap, null, shadowRect, blueHaloCoverPaint)
                 }
-            } else {
-                val off = max(1f, bw * 0.008f)
-                shadowRect.set(dstRect.left + off, dstRect.top + off, dstRect.right + off, dstRect.bottom + off)
-                canvas.drawBitmap(runesBitmap, null, shadowRect, shadowPaint)
+                val lid = canvas.saveLayer(dstRect, null)
+                maskPaint.colorFilter = blueListeningFilter
+                maskPaint.alpha = 252
+                canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
+                coreOverlayPaint.color = Color.argb(46, 96, 205, 255)
+                canvas.drawRect(dstRect, coreOverlayPaint)
+                canvas.restoreToCount(lid)
+                return
             }
 
-            val lid = canvas.saveLayer(dstRect, null)
-            maskPaint.colorFilter = when {
-                isMutedRed -> redFilter
-                isMicListeningBlue -> blueListeningFilter
-                isSessionHot -> hotGoldFilter
-                else -> null
-            }
-            maskPaint.alpha = if (isMicListeningBlue) (242 + 13 * emberBreath).toInt().coerceIn(0, 255)
-                              else (232 + 23 * emberBreath).toInt().coerceIn(0, 255)
+            // 4. Armed / Idle: 100% Rock-Steady Chiseled 24k Norse Gold (ZERO flashing)
+            val off = max(1f, bw * 0.008f)
+            shadowRect.set(dstRect.left + off, dstRect.top + off, dstRect.right + off, dstRect.bottom + off)
+            canvas.drawBitmap(runesBitmap, null, shadowRect, shadowPaint)
+            maskPaint.colorFilter = null
+            maskPaint.alpha = 248
             canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
-
-            if (isMicListeningBlue) {
-                sweepPaint.shader = null
-                sweepPaint.color = Color.argb((36 + 48 * emberBreath).toInt(), 56, 189, 248)
-                canvas.drawRect(dstRect, sweepPaint)
-            }
-
-            val rw = dstRect.width(); val rh = dstRect.height()
-            val sx = dstRect.left - rw * 0.55f + (rw * 2.10f) * shimmerPhase
-            val sy = dstRect.top - rh * 0.20f + (rh * 0.65f) * shimmerPhase
-            val cols = when {
-                isMutedRed -> intArrayOf(0x00EF233C, 0xAAFF4D6D.toInt(), 0xFFFFB3C1.toInt(), 0xFFFFF0F3.toInt(), 0xFFFFB3C1.toInt(), 0xAAFF4D6D.toInt(), 0x00EF233C)
-                isMicListeningBlue -> intArrayOf(0x000088FF, 0xBB38BDF8.toInt(), 0xFFBAE6FD.toInt(), 0xFFF0F9FF.toInt(), 0xFFBAE6FD.toInt(), 0xBB38BDF8.toInt(), 0x000088FF)
-                else -> intArrayOf(0x00966B12, 0x88D4A234.toInt(), 0xFFFFF08A.toInt(), 0xFFFFFBEB.toInt(), 0xFFFFF08A.toInt(), 0x88D4A234.toInt(), 0x00966B12)
-            }
-            sweepPaint.shader = LinearGradient(sx, sy, sx + rw * 0.44f, sy + rh * 0.30f, cols, floatArrayOf(0f, 0.22f, 0.44f, 0.50f, 0.56f, 0.78f, 1f), Shader.TileMode.CLAMP)
-            canvas.drawRect(dstRect, sweepPaint)
-
-            if (strikeFlash > 0.02f) {
-                sweepPaint.shader = null
-                sweepPaint.color = when {
-                    isMutedRed -> Color.argb((strikeFlash * 235f).toInt(), 255, 190, 200)
-                    isMicListeningBlue -> Color.argb((strikeFlash * 242f).toInt(), 185, 236, 255)
-                    else -> Color.argb((strikeFlash * 235f).toInt(), 255, 251, 235)
-                }
-                canvas.drawRect(dstRect, sweepPaint)
-            }
-            canvas.restoreToCount(lid)
         }
 
         override fun setAlpha(alpha: Int) { basePaint.alpha = alpha }

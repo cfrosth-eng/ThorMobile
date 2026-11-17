@@ -303,6 +303,10 @@ class FloatingThorService : Service() {
     @Volatile private var lastPlaybackTime = 0L
     @Volatile private var totalFramesWritten: Long = 0L
     @Volatile private var speechEndFrame: Long = 0L
+    // WO-173: Lock-free 2048-bin (~41s @ 480 frames/bin) PCM amplitude ring buffer indexed by AudioTrack.playbackHeadPosition
+    private val speechEnvBinFrames = 480L
+    private val speechEnvRing = FloatArray(2048)
+    @Volatile private var speechPeakRmsEwma: Double = 7800.0
     @Volatile private var playbackStartedAtMs: Long = 0L
     @Volatile private var echoBaselineRms: Double = 260.0
     @Volatile private var lastKnownMusicVol: Int = -1
@@ -337,7 +341,7 @@ class FloatingThorService : Service() {
                 speakingActive = speaking,
                 micListeningActive = micListening
             )
-            mainHandler.postDelayed(this, if (speaking || activeSession != 0) 140L else 420L)
+            mainHandler.postDelayed(this, if (speaking || activeSession != 0) 48L else 420L)
         }
     }
 
@@ -348,6 +352,7 @@ class FloatingThorService : Service() {
         RavenHeraldService.ensureRunning(this)
         isServiceRunning = true
         canAutoResumeMic = !isStandby
+        LivingPedestalDirector.speechEnvelopeSupplier = { if (destroyed) 0f else sampleLiveHardwareSpeechEnvelope() }
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         powerGuard = PowerGuard(this)
@@ -2162,7 +2167,17 @@ class FloatingThorService : Service() {
                             awaitingUtterancePrebuffer = true
                         }
                         val sw = try { track.write(silenceKeepAlive, 0, silenceKeepAlive.size) } catch (_: Exception) { 0 }
-                        if (sw > 0) totalFramesWritten += (sw / 2).toLong()
+                        if (sw > 0) {
+                            val fStart = totalFramesWritten
+                            val fEnd = fStart + (sw / 2).toLong()
+                            var bIdx = fStart / speechEnvBinFrames
+                            val bLast = fEnd / speechEnvBinFrames
+                            while (bIdx <= bLast) {
+                                speechEnvRing[(bIdx and 2047L).toInt()] = 0f
+                                bIdx++
+                            }
+                            totalFramesWritten = fEnd
+                        }
                         continue
                     }
                     if (chunk.generation != flushGeneration.get()) {
@@ -2204,6 +2219,7 @@ class FloatingThorService : Service() {
                             val length = min(PLAYBACK_SLICE_BYTES * 4, chunk.data.size - offset)
                             val written = track.write(chunk.data, offset, length)
                             if (written < 0) break
+                            if (written > 0) recordWrittenPcmEnvelope(chunk.data, offset, written, totalFramesWritten)
                             offset += written
                             totalFramesWritten += (written / 2).toLong()
                             speechEndFrame = totalFramesWritten
@@ -2226,6 +2242,61 @@ class FloatingThorService : Service() {
         thread.start()
     }
 
+    private fun recordWrittenPcmEnvelope(pcm: ByteArray, byteOffset: Int, byteCount: Int, startFrame: Long) {
+        val totalSamples = byteCount / 2
+        if (totalSamples <= 0) return
+        var curFrame = startFrame
+        val endFrame = startFrame + totalSamples.toLong()
+        var sPos = 0
+        while (curFrame < endFrame) {
+            val binIdx = ((curFrame / speechEnvBinFrames) and 2047L).toInt()
+            val isBinStart = (curFrame % speechEnvBinFrames == 0L)
+            val nextBoundary = min(endFrame, ((curFrame / speechEnvBinFrames) + 1L) * speechEnvBinFrames)
+            val take = (nextBoundary - curFrame).toInt()
+            var sumSq = 0.0
+            var k = 0
+            while (k < take) {
+                val bi = byteOffset + (sPos + k) * 2
+                val sample = ((pcm[bi + 1].toInt() shl 8) or (pcm[bi].toInt() and 0xFF)).toShort().toDouble()
+                sumSq += sample * sample
+                k += 2
+            }
+            val counted = (take + 1) / 2
+            val rms = if (counted > 0) kotlin.math.sqrt(sumSq / counted) else 0.0
+            if (rms > 1400.0) {
+                speechPeakRmsEwma = if (rms > speechPeakRmsEwma) rms else (speechPeakRmsEwma * 0.985 + rms * 0.015).coerceIn(3800.0, 16500.0)
+            }
+            val floorRms = speechPeakRmsEwma * 0.16
+            val spanRms = kotlin.math.max(1800.0, speechPeakRmsEwma * 0.62)
+            val lin = if (rms <= floorRms) 0.0 else ((rms - floorRms) / spanRms).coerceIn(0.0, 1.0)
+            val norm = (lin * kotlin.math.sqrt(lin)).toFloat()
+            speechEnvRing[binIdx] = if (isBinStart) norm else kotlin.math.max(speechEnvRing[binIdx], norm)
+            sPos += take
+            curFrame = nextBoundary
+        }
+    }
+
+    private fun sampleLiveHardwareSpeechEnvelope(): Float {
+        val track = audioTrack
+        val endF = speechEndFrame
+        if (track != null && endF > 0L) {
+            try {
+                val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                if (endF > head) {
+                    val bin0 = ((head / speechEnvBinFrames) and 2047L).toInt()
+                    val bin1 = (((head / speechEnvBinFrames) + 1L) and 2047L).toInt()
+                    return kotlin.math.max(speechEnvRing[bin0], speechEnvRing[bin1] * 0.78f).coerceIn(0f, 1f)
+                }
+            } catch (_: Exception) {}
+        }
+        if (playbackBusy && offlineModeActive) {
+            val t = SystemClock.elapsedRealtime().toDouble() / 1000.0
+            val syll = kotlin.math.max(0.0, kotlin.math.sin(t * 17.5)) * (0.65 + 0.35 * kotlin.math.sin(t * 6.8))
+            return syll.coerceIn(0.0, 1.0).toFloat()
+        }
+        return 0f
+    }
+
     private fun remainingHardwareSpeechMs(): Long {
         val track = audioTrack ?: return 0L
         val endF = speechEndFrame
@@ -2243,6 +2314,7 @@ class FloatingThorService : Service() {
         playbackQueue.clear()
         playbackBusy = false
         currentPlaybackRms = 0.0
+        speechEnvRing.fill(0f)
         bargeRecordingActive = false
         bargePcmBuffer.reset()
         val track = audioTrack ?: return
@@ -2262,6 +2334,7 @@ class FloatingThorService : Service() {
         currentPlaybackRms = 0.0
         totalFramesWritten = 0L
         speechEndFrame = 0L
+        speechEnvRing.fill(0f)
         bargeRecordingActive = false
         bargePcmBuffer.reset()
         playbackThread?.interrupt()
