@@ -330,10 +330,12 @@ class FloatingThorService : Service() {
             if (destroyed) return
             val now = SystemClock.elapsedRealtime()
             val speaking = playbackBusy || remainingHardwareSpeechMs() > 0L || (now - lastHardwareSpeechActiveMs < 350L)
+            val micListening = !isStandby && activeSession != 0 && !endingSession && !speaking
             LivingPedestalDirector.updateServiceAudioVisualState(
                 isStandby = isStandby,
                 sessionActive = (activeSession != 0 || endingSession),
-                speakingActive = speaking
+                speakingActive = speaking,
+                micListeningActive = micListening
             )
             mainHandler.postDelayed(this, if (speaking || activeSession != 0) 140L else 420L)
         }
@@ -614,10 +616,12 @@ class FloatingThorService : Service() {
             if (destroyed) return@post
             val now = SystemClock.elapsedRealtime()
             val speaking = playbackBusy || remainingHardwareSpeechMs() > 0L || (now - lastHardwareSpeechActiveMs < 350L)
+            val micListening = !isStandby && activeSession != 0 && !endingSession && !speaking
             LivingPedestalDirector.updateServiceAudioVisualState(
                 isStandby = isStandby,
                 sessionActive = (activeSession != 0 || endingSession),
-                speakingActive = speaking
+                speakingActive = speaking,
+                micListeningActive = micListening
             )
         }
     }

@@ -214,8 +214,15 @@ object LivingPedestalDirector {
         if (v != null && v.parent != null) { try { flightWindowManager?.removeView(v) } catch (_: Exception) {} }
     }
 
-    fun updateServiceAudioVisualState(isStandby: Boolean, sessionActive: Boolean, speakingActive: Boolean) {
-        mainHandler.post { attachedCrestView?.updateOperationalState(isStandby, sessionActive, speakingActive, hasUnreadRaven) }
+    fun updateServiceAudioVisualState(
+        isStandby: Boolean,
+        sessionActive: Boolean,
+        speakingActive: Boolean,
+        micListeningActive: Boolean = (sessionActive && !speakingActive && !isStandby)
+    ) {
+        mainHandler.post {
+            attachedCrestView?.updateOperationalState(isStandby, sessionActive, speakingActive, hasUnreadRaven, micListeningActive)
+        }
     }
 
     fun pulseMutedRunesFeedback() { mainHandler.post { attachedCrestView?.pulseRunesResonance() } }
@@ -931,7 +938,7 @@ object LivingPedestalDirector {
 
         private var lastFrameMs = SystemClock.elapsedRealtime()
         private var flowPhase = 0f
-        private var isStandbyMode = false; private var isSessionOpen = false; private var isSpeakingNow = false; private var hasUnreadRavenFlag = false
+        private var isStandbyMode = false; private var isSessionOpen = false; private var isSpeakingNow = false; private var hasUnreadRavenFlag = false; private var isMicListeningNow = false
         private var nextMjolnirIdleArcAtMs = SystemClock.elapsedRealtime() + 2200L
         private val bootShowcaseUntilMs = SystemClock.elapsedRealtime() + 45_000L
         private var masterLoop: ValueAnimator? = null
@@ -1004,18 +1011,28 @@ object LivingPedestalDirector {
             }
         }
 
-        fun updateOperationalState(standby: Boolean, sessionOpen: Boolean, speaking: Boolean, unreadRaven: Boolean) {
+        fun updateOperationalState(
+            standby: Boolean,
+            sessionOpen: Boolean,
+            speaking: Boolean,
+            unreadRaven: Boolean,
+            micListening: Boolean = (sessionOpen && !speaking && !standby)
+        ) {
             val standbyChanged = (isStandbyMode != standby)
             val sessionJustOpened = (!isSessionOpen && sessionOpen)
-            isStandbyMode = standby; isSessionOpen = sessionOpen; isSpeakingNow = speaking; hasUnreadRavenFlag = unreadRaven
+            val micJustOpened = (!isMicListeningNow && micListening)
+            isStandbyMode = standby; isSessionOpen = sessionOpen; isSpeakingNow = speaking; hasUnreadRavenFlag = unreadRaven; isMicListeningNow = micListening
             runesDrawable?.isMutedRed = standby
-            runesDrawable?.isSessionHot = sessionOpen && !standby
+            runesDrawable?.isMicListeningBlue = micListening && !standby
+            runesDrawable?.isSessionHot = (sessionOpen || speaking) && !micListening && !standby
             if (standbyChanged) {
                 runesDrawable?.triggerLightningResonance()
                 if (currentOccupant == PedestalOccupant.MJOLNIR) triggerElectricStrikeBurst(680L, 1.0f)
             }
             if (sessionJustOpened && !standby) {
                 if (currentOccupant == PedestalOccupant.MJOLNIR) triggerElectricStrikeBurst(820L, 1.0f) else pulseRunesResonance()
+            } else if (micJustOpened && !standby) {
+                runesDrawable?.triggerLightningResonance()
             }
             invalidate()
         }
@@ -1253,20 +1270,27 @@ object LivingPedestalDirector {
         private val normRect = RectF(0.32031f, 0.61129f, 0.62813f, 0.89530f)
         private val shadowPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xDD1A0502.toInt(), PorterDuff.Mode.SRC_IN) }
         private val redHaloCoverPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xCC450A0A.toInt(), PorterDuff.Mode.SRC_IN) }
+        // Option A Intense Storm Cobalt (#0088FF) + Deep Storm-Navy Groove Cover (#041B3D -> zero gold/green bleed!)
+        private val blueHaloCoverPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { colorFilter = PorterDuffColorFilter(0xDD041B3D.toInt(), PorterDuff.Mode.SRC_IN) }
         private val redFilter = PorterDuffColorFilter(0xFFEF233C.toInt(), PorterDuff.Mode.SRC_IN)
+        private val blueListeningFilter = PorterDuffColorFilter(0xFF0088FF.toInt(), PorterDuff.Mode.SRC_IN)
         private val hotGoldFilter = PorterDuffColorFilter(0xFFFFEA70.toInt(), PorterDuff.Mode.SRC_IN)
         private val basePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
         private val maskPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         private val sweepPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP) }
         private val dstRect = RectF(); private val shadowRect = RectF()
-        var isMutedRed: Boolean = false; var isSessionHot: Boolean = false
+        var isMutedRed: Boolean = false
+        var isMicListeningBlue: Boolean = false
+        var isSessionHot: Boolean = false
         private var shimmerPhase = 0f; private var emberBreath = 0f; private var strikeFlash = 0f
 
         fun triggerLightningResonance() { strikeFlash = 1.0f; invalidateSelf() }
 
         fun tick(dt: Float, elapsedMs: Long) {
-            shimmerPhase = (elapsedMs % 3200L).toFloat() / 3200f
-            emberBreath = (0.5 + 0.5 * sin((elapsedMs.toDouble() / 1800.0) * Math.PI * 2.0)).toFloat()
+            val sweepPeriodSec = if (isMicListeningBlue) 2.15f else 3.20f
+            shimmerPhase = (shimmerPhase + dt / sweepPeriodSec) % 1f
+            val breathPeriodMs = if (isMicListeningBlue) 1250.0 else 1800.0
+            emberBreath = (0.5 + 0.5 * sin((elapsedMs.toDouble() / breathPeriodMs) * Math.PI * 2.0)).toFloat()
             if (strikeFlash > 0f) strikeFlash = (strikeFlash - dt * 2.5f).coerceAtLeast(0f)
             invalidateSelf()
         }
@@ -1281,6 +1305,12 @@ object LivingPedestalDirector {
                     shadowRect.set(dstRect.left + dx * ex, dstRect.top + dy * ex, dstRect.right + dx * ex, dstRect.bottom + dy * ex)
                     canvas.drawBitmap(runesBitmap, null, shadowRect, redHaloCoverPaint)
                 }
+            } else if (isMicListeningBlue) {
+                val ex = max(1.5f, bw * 0.014f)
+                for (dx in intArrayOf(-1, 1)) for (dy in intArrayOf(-1, 1)) {
+                    shadowRect.set(dstRect.left + dx * ex, dstRect.top + dy * ex, dstRect.right + dx * ex, dstRect.bottom + dy * ex)
+                    canvas.drawBitmap(runesBitmap, null, shadowRect, blueHaloCoverPaint)
+                }
             } else {
                 val off = max(1f, bw * 0.008f)
                 shadowRect.set(dstRect.left + off, dstRect.top + off, dstRect.right + off, dstRect.bottom + off)
@@ -1288,21 +1318,40 @@ object LivingPedestalDirector {
             }
 
             val lid = canvas.saveLayer(dstRect, null)
-            maskPaint.colorFilter = when { isMutedRed -> redFilter; isSessionHot -> hotGoldFilter; else -> null }
-            maskPaint.alpha = (232 + 23 * emberBreath).toInt().coerceIn(0, 255)
+            maskPaint.colorFilter = when {
+                isMutedRed -> redFilter
+                isMicListeningBlue -> blueListeningFilter
+                isSessionHot -> hotGoldFilter
+                else -> null
+            }
+            maskPaint.alpha = if (isMicListeningBlue) (242 + 13 * emberBreath).toInt().coerceIn(0, 255)
+                              else (232 + 23 * emberBreath).toInt().coerceIn(0, 255)
             canvas.drawBitmap(runesBitmap, null, dstRect, maskPaint)
+
+            if (isMicListeningBlue) {
+                sweepPaint.shader = null
+                sweepPaint.color = Color.argb((36 + 48 * emberBreath).toInt(), 56, 189, 248)
+                canvas.drawRect(dstRect, sweepPaint)
+            }
 
             val rw = dstRect.width(); val rh = dstRect.height()
             val sx = dstRect.left - rw * 0.55f + (rw * 2.10f) * shimmerPhase
             val sy = dstRect.top - rh * 0.20f + (rh * 0.65f) * shimmerPhase
-            val cols = if (isMutedRed) intArrayOf(0x00EF233C, 0xAAFF4D6D.toInt(), 0xFFFFB3C1.toInt(), 0xFFFFF0F3.toInt(), 0xFFFFB3C1.toInt(), 0xAAFF4D6D.toInt(), 0x00EF233C)
-            else intArrayOf(0x00966B12, 0x88D4A234.toInt(), 0xFFFFF08A.toInt(), 0xFFFFFBEB.toInt(), 0xFFFFF08A.toInt(), 0x88D4A234.toInt(), 0x00966B12)
+            val cols = when {
+                isMutedRed -> intArrayOf(0x00EF233C, 0xAAFF4D6D.toInt(), 0xFFFFB3C1.toInt(), 0xFFFFF0F3.toInt(), 0xFFFFB3C1.toInt(), 0xAAFF4D6D.toInt(), 0x00EF233C)
+                isMicListeningBlue -> intArrayOf(0x000088FF, 0xBB38BDF8.toInt(), 0xFFBAE6FD.toInt(), 0xFFF0F9FF.toInt(), 0xFFBAE6FD.toInt(), 0xBB38BDF8.toInt(), 0x000088FF)
+                else -> intArrayOf(0x00966B12, 0x88D4A234.toInt(), 0xFFFFF08A.toInt(), 0xFFFFFBEB.toInt(), 0xFFFFF08A.toInt(), 0x88D4A234.toInt(), 0x00966B12)
+            }
             sweepPaint.shader = LinearGradient(sx, sy, sx + rw * 0.44f, sy + rh * 0.30f, cols, floatArrayOf(0f, 0.22f, 0.44f, 0.50f, 0.56f, 0.78f, 1f), Shader.TileMode.CLAMP)
             canvas.drawRect(dstRect, sweepPaint)
 
             if (strikeFlash > 0.02f) {
                 sweepPaint.shader = null
-                sweepPaint.color = if (isMutedRed) Color.argb((strikeFlash * 235f).toInt(), 255, 190, 200) else Color.argb((strikeFlash * 235f).toInt(), 255, 251, 235)
+                sweepPaint.color = when {
+                    isMutedRed -> Color.argb((strikeFlash * 235f).toInt(), 255, 190, 200)
+                    isMicListeningBlue -> Color.argb((strikeFlash * 242f).toInt(), 185, 236, 255)
+                    else -> Color.argb((strikeFlash * 235f).toInt(), 255, 251, 235)
+                }
                 canvas.drawRect(dstRect, sweepPaint)
             }
             canvas.restoreToCount(lid)
