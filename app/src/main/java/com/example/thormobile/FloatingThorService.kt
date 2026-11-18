@@ -1360,10 +1360,24 @@ class FloatingThorService : Service() {
                     }
                 }
             }
+            try {
+                ws.send(
+                    org.json.JSONObject()
+                        .put("type", "phone_hw_state")
+                        .put("torch_on", ThorFlashlightAndLensService.isTorchOn)
+                        .put("display_share", ThorDisplayShareService.isDisplayShareActive)
+                        .put("rear_camera", ThorFlashlightAndLensService.isRearCameraActive)
+                        .toString()
+                )
+            } catch (_: Exception) {}
             if (ThorFlashlightAndLensService.isRearCameraActive && ThorFlashlightAndLensService.latestCamFrameJson.isNotEmpty()) {
                 try { ws.send(ThorFlashlightAndLensService.latestCamFrameJson) } catch (_: Exception) {}
-            } else if (ThorDisplayShareService.isDisplayShareActive && ThorDisplayShareService.latestFrameJson.isNotEmpty()) {
-                try { ws.send(ThorDisplayShareService.latestFrameJson) } catch (_: Exception) {}
+            } else if (ThorDisplayShareService.isDisplayShareActive) {
+                if (ThorDisplayShareService.latestFrameJson.isNotEmpty()) {
+                    try { ws.send(ThorDisplayShareService.latestFrameJson) } catch (_: Exception) {}
+                } else {
+                    ThorDisplayShareService.sendImmediateNativeFrame()
+                }
             }
             flushOutbox()
         }
@@ -1524,6 +1538,8 @@ class FloatingThorService : Service() {
                         "torch_toggle" -> mainHandler.post { ThorFlashlightAndLensService.toggleTorch(this@FloatingThorService) }
                         "rear_camera_on" -> mainHandler.post { ThorFlashlightAndLensService.startRearCamera(this@FloatingThorService, false) }
                         "rear_camera_off" -> mainHandler.post { ThorFlashlightAndLensService.stopRearCamera(this@FloatingThorService) }
+                        "display_share_on" -> mainHandler.post { if (!ThorDisplayShareService.isDisplayShareActive) DisplayShareConsentActivity.launchConsent(this@FloatingThorService) }
+                        "display_share_off" -> mainHandler.post { ThorDisplayShareService.stopSharing(this@FloatingThorService) }
                         "dial" -> {
                             val num = json.optString("phone_number")
                             if (num.isNotEmpty()) {

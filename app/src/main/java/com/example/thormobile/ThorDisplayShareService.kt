@@ -67,6 +67,9 @@ class DisplayShareConsentActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_DISPLAY_SHARE && resultCode == RESULT_OK && data != null) {
+            if (ThorFlashlightAndLensService.isRearCameraActive) {
+                ThorFlashlightAndLensService.stopRearCamera(this)
+            }
             val svcIntent = Intent(this, ThorDisplayShareService::class.java).apply {
                 action = ThorDisplayShareService.ACTION_START_SHARE
                 putExtra(ThorDisplayShareService.EXTRA_RESULT_CODE, resultCode)
@@ -141,7 +144,12 @@ class ThorDisplayShareService : Service() {
                 quickWsClient.newWebSocket(req, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         webSocket.send(jsonPayload)
-                        webSocket.close(1000, "done")
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        webSocket.close(1000, "ack")
+                    }
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        try { webSocket.cancel() } catch (_: Exception) {}
                     }
                 })
             } catch (_: Exception) {}
@@ -155,6 +163,7 @@ class ThorDisplayShareService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private var lastCapturedBitmap: Bitmap? = null
     private var nativeWidth: Int = 1080
     private var nativeHeight: Int = 2316
     private var nativeDpi: Int = 420
@@ -265,10 +274,11 @@ class ThorDisplayShareService : Service() {
                     .put("action", "screen_watcher_state")
                     .put("type", "screen_watcher_state")
                     .put("active", true)
+                    .put("source", "display_share")
                     .toString()
             )
             workerHandler?.removeCallbacks(refreshRunnable)
-            workerHandler?.postDelayed(refreshRunnable, 320L)
+            workerHandler?.postDelayed(refreshRunnable, 280L)
             Log.i(TAG, "2-Gear Display Share ready (${nativeWidth}x${nativeHeight}, dpi=$nativeDpi)")
         } catch (e: Exception) {
             Log.e(TAG, "Display Share start error", e)
@@ -282,62 +292,83 @@ class ThorDisplayShareService : Service() {
 
     private fun captureAndBufferFrame(forceNativeFullRes: Boolean, forceNetworkSend: Boolean) {
         val reader = imageReader ?: return
-        val img = reader.acquireLatestImage() ?: return
+        val img = reader.acquireLatestImage()
+
+        if (img != null) {
+            try {
+                val plane = img.planes[0]
+                val buf = plane.buffer
+                val pixelStride = plane.pixelStride
+                val rowStride = plane.rowStride
+                val rowPadding = rowStride - pixelStride * nativeWidth
+                val strideWidth = nativeWidth + (if (pixelStride > 0) rowPadding / pixelStride else 0)
+                val rawBmp = Bitmap.createBitmap(strideWidth, nativeHeight, Bitmap.Config.ARGB_8888)
+                buf.rewind()
+                rawBmp.copyPixelsFromBuffer(buf)
+                val fullBmp = if (strideWidth != nativeWidth) {
+                    Bitmap.createBitmap(rawBmp, 0, 0, nativeWidth, nativeHeight).also { rawBmp.recycle() }
+                } else {
+                    rawBmp
+                }
+                val prev = lastCapturedBitmap
+                lastCapturedBitmap = fullBmp
+                if (prev != null && prev !== fullBmp && !prev.isRecycled) {
+                    prev.recycle()
+                }
+            } finally {
+                img.close()
+            }
+        }
+
+        // WO-189 Static-Screen Guarantee: Even if zero pixels changed on screen (`img == null`),
+        // encode from `lastCapturedBitmap` in RAM so Thor NEVER goes blind on a motionless phone screen!
+        val srcBmp = lastCapturedBitmap
+        if (srcBmp == null || srcBmp.isRecycled) {
+            if (forceNetworkSend && latestFrameJson.isNotEmpty()) {
+                dispatchPacket(latestFrameJson)
+            }
+            return
+        }
+        if (img == null && !forceNativeFullRes && latestFrameJson.isNotEmpty()) {
+            if (forceNetworkSend) {
+                sentFirstFrame = true
+                dispatchPacket(latestFrameJson)
+            }
+            return
+        }
+
         val outWidth: Int
         val outHeight: Int
         val scaleFactor: Double
         val gearName: String
-        val b64: String
+        val baos = ByteArrayOutputStream()
 
-        try {
-            val plane = img.planes[0]
-            val buf = plane.buffer
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            val rowPadding = rowStride - pixelStride * nativeWidth
-            val strideWidth = nativeWidth + (if (pixelStride > 0) rowPadding / pixelStride else 0)
-            val rawBmp = Bitmap.createBitmap(strideWidth, nativeHeight, Bitmap.Config.ARGB_8888)
-            buf.rewind()
-            rawBmp.copyPixelsFromBuffer(buf)
-            val fullBmp = if (strideWidth != nativeWidth) {
-                Bitmap.createBitmap(rawBmp, 0, 0, nativeWidth, nativeHeight).also { rawBmp.recycle() }
-            } else {
-                rawBmp
+        if (forceNativeFullRes || nativeWidth <= 720) {
+            outWidth = nativeWidth
+            outHeight = nativeHeight
+            scaleFactor = 1.0
+            gearName = "native_full_res"
+            srcBmp.compress(Bitmap.CompressFormat.JPEG, 84, baos)
+        } else {
+            scaleFactor = 720.0 / nativeWidth.toDouble()
+            outWidth = 720
+            outHeight = (((nativeHeight * scaleFactor).toInt() / 2) * 2).coerceAtLeast(640)
+            gearName = "standard_720p"
+            val scaled = Bitmap.createScaledBitmap(srcBmp, outWidth, outHeight, true)
+            scaled.compress(Bitmap.CompressFormat.JPEG, 72, baos)
+            if (scaled !== srcBmp) {
+                scaled.recycle()
             }
-
-            val encodeBmp: Bitmap
-            val jpegQuality: Int
-            if (forceNativeFullRes || nativeWidth <= 720) {
-                outWidth = nativeWidth
-                outHeight = nativeHeight
-                scaleFactor = 1.0
-                gearName = "native_full_res"
-                encodeBmp = fullBmp
-                jpegQuality = 84
-            } else {
-                scaleFactor = 720.0 / nativeWidth.toDouble()
-                outWidth = 720
-                outHeight = (((nativeHeight * scaleFactor).toInt() / 2) * 2).coerceAtLeast(640)
-                gearName = "standard_720p"
-                encodeBmp = Bitmap.createScaledBitmap(fullBmp, outWidth, outHeight, true)
-                if (encodeBmp !== fullBmp) {
-                    fullBmp.recycle()
-                }
-                jpegQuality = 72
-            }
-
-            val baos = ByteArrayOutputStream()
-            encodeBmp.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
-            encodeBmp.recycle()
-            b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-        } finally {
-            img.close()
         }
 
+        val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
         if (b64.isEmpty() || !isDisplayShareActive) return
+
         val pkt = JSONObject()
             .put("action", "screen_watcher_frame")
             .put("type", "screen_watcher_frame")
+            .put("source", "display_share")
+            .put("torch_on", ThorFlashlightAndLensService.isTorchOn)
             .put("jpeg_b64", b64)
             .put("mime_type", "image/jpeg")
             .put("width", outWidth)
@@ -366,6 +397,11 @@ class ThorDisplayShareService : Service() {
         virtualDisplay = null
         try { imageReader?.close() } catch (_: Exception) {}
         imageReader = null
+        val bmp = lastCapturedBitmap
+        lastCapturedBitmap = null
+        if (bmp != null && !bmp.isRecycled) {
+            try { bmp.recycle() } catch (_: Exception) {}
+        }
         try {
             mediaProjection?.unregisterCallback(projectionCallback)
             mediaProjection?.stop()
