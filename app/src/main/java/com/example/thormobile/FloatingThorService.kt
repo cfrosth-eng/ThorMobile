@@ -1481,6 +1481,25 @@ class FloatingThorService : Service() {
                         ThorDisplayShareService.sendImmediateNativeFrame()
                     }
                 }
+                if (json.optString("action") == "capture_camera_snapshot") {
+                    val pid = json.optString("photo_id", "PHOTO-${System.currentTimeMillis()}")
+                    val bNote = json.optString("boss_note", "")
+                    val wTorch = json.optBoolean("with_torch", false)
+                    mainHandler.post {
+                        ThorFlashlightAndLensService.capturePhotoSnapshot(this@FloatingThorService, pid, bNote, wTorch)
+                    }
+                }
+                if (json.optString("action") == "show_visual_memory_card") {
+                    VikingPopupOverlayManager.showVisualMemoryPopup(
+                        context = this@FloatingThorService,
+                        photoId = json.optString("photo_id", ""),
+                        title = json.optString("title", "Visual Memory"),
+                        summary = json.optString("summary", ""),
+                        ocrText = json.optString("ocr_text", ""),
+                        timestampEt = json.optString("timestamp_et", ""),
+                        jpegB64 = json.optString("jpeg_b64", "")
+                    )
+                }
                 if (json.optString("action") == "rear_camera_control") {
                     val en = json.optBoolean("enable", false)
                     val tr = json.optBoolean("torch", false)

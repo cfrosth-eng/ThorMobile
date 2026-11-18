@@ -1898,6 +1898,188 @@ object VikingPopupOverlayManager {
         }
     }
 
+
+    private var visualCardView: View? = null
+
+    fun hideVisualMemoryPopup() {
+        mainHandler.post {
+            val v = visualCardView
+            visualCardView = null
+            if (v != null && v.parent != null) {
+                try { windowManager?.removeView(v) } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun showVisualMemoryPopup(
+        context: Context,
+        photoId: String,
+        title: String,
+        summary: String,
+        ocrText: String = "",
+        timestampEt: String = "",
+        jpegB64: String = ""
+    ) {
+        val app = context.applicationContext
+        appCtx = app
+        if (!Settings.canDrawOverlays(app)) return
+
+        thread(start = true, isDaemon = true) {
+            val cleanId = photoId.replace(Regex("[^A-Za-z0-9_-]"), "").ifBlank { "PHOTO_RECALL" }
+            val vaultDir = java.io.File(app.filesDir, "thor_visual_vault").apply { mkdirs() }
+            val localFile = java.io.File(vaultDir, "$cleanId.jpg")
+            var jpegBytes = ByteArray(0)
+
+            if (jpegB64.isNotBlank()) {
+                try {
+                    jpegBytes = android.util.Base64.decode(jpegB64, android.util.Base64.DEFAULT)
+                    if (jpegBytes.isNotEmpty() && !localFile.exists()) {
+                        ThorFlashlightAndLensService.saveJpegToThorVisionGalleryAndCache(app, cleanId, jpegBytes)
+                    } else if (jpegBytes.isNotEmpty()) {
+                        localFile.writeBytes(jpegBytes)
+                    }
+                } catch (_: Exception) {}
+            }
+            if (jpegBytes.isEmpty() && localFile.exists()) {
+                try { jpegBytes = localFile.readBytes() } catch (_: Exception) {}
+            }
+            val bmp = if (jpegBytes.isNotEmpty()) BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size) else null
+
+            mainHandler.post {
+                hideVisualMemoryPopup()
+                val wmLoc = (windowManager ?: (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager)).also { windowManager = it }
+                val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                } else {
+                    @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+                }
+                val dm = app.resources.displayMetrics
+                val cardW = (dm.widthPixels * 0.94f).toInt().coerceAtMost(dp(app, 430))
+                var isExpandedFull = false
+
+                val card = LinearLayout(app).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = makePillDrawable("#08101E", "#F5B942", 2, 18, app)
+                    val p = dp(app, 12)
+                    setPadding(p, p, p, p)
+                }
+
+                val hdr = TextView(app).apply {
+                    text = "THOR VISUAL MEMORY & GARAGE VAULT"
+                    setTextColor(Color.parseColor("#FDE047"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                }
+                card.addView(hdr)
+
+                val ttl = TextView(app).apply {
+                    text = title.ifBlank { "Recalled Photo" }
+                    setTextColor(Color.parseColor("#F8FAFC"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(0, dp(app, 4), 0, dp(app, 2))
+                }
+                card.addView(ttl)
+
+                if (timestampEt.isNotBlank()) {
+                    val tsTv = TextView(app).apply {
+                        text = timestampEt
+                        setTextColor(Color.parseColor("#94A3B8"))
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                        setPadding(0, 0, 0, dp(app, 6))
+                    }
+                    card.addView(tsTv)
+                }
+
+                val imgView = ImageView(app).apply {
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    background = makePillDrawable("#030712", "#334155", 1, 12, app)
+                    if (bmp != null) setImageBitmap(bmp)
+                    layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(app, 270)).apply {
+                        bottomMargin = dp(app, 8)
+                    }
+                }
+                card.addView(imgView)
+
+                val bodyTxt = buildString {
+                    if (summary.isNotBlank()) append(summary.trim())
+                    if (ocrText.isNotBlank()) {
+                        if (isNotEmpty()) append("\n")
+                        append("OCR: ").append(ocrText.trim().take(220))
+                    }
+                }
+                if (bodyTxt.isNotBlank()) {
+                    val sumTv = TextView(app).apply {
+                        text = bodyTxt
+                        setTextColor(Color.parseColor("#CBD5E1"))
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                        maxLines = 5
+                        setPadding(0, 0, 0, dp(app, 8))
+                    }
+                    card.addView(sumTv)
+                }
+
+                val lp = WindowManager.LayoutParams(
+                    cardW,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    overlayType,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    y = dp(app, 44)
+                }
+
+                val btnRow = LinearLayout(app).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER
+                }
+                val zoomBtn = TextView(app).apply {
+                    text = "Expand Full Size"
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.parseColor("#FEF08A"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    background = makePillDrawable("#172554", "#38BDF8", 1, 99, app)
+                    setPadding(dp(app, 10), dp(app, 8), dp(app, 10), dp(app, 8))
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                        marginEnd = dp(app, 8)
+                    }
+                    setOnClickListener {
+                        isExpandedFull = !isExpandedFull
+                        imgView.layoutParams = LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            if (isExpandedFull) (dm.heightPixels * 0.66f).toInt() else dp(app, 270)
+                        ).apply { bottomMargin = dp(app, 8) }
+                        text = if (isExpandedFull) "Shrink Card" else "Expand Full Size"
+                        lp.width = if (isExpandedFull) (dm.widthPixels * 0.98f).toInt() else cardW
+                        try { wmLoc.updateViewLayout(card, lp) } catch (_: Exception) {}
+                    }
+                }
+                imgView.setOnClickListener { zoomBtn.performClick() }
+
+                val closeBtn = TextView(app).apply {
+                    text = "Close"
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.parseColor("#FEE2E2"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    background = makePillDrawable("#3B0D14", "#EF4444", 1, 99, app)
+                    setPadding(dp(app, 10), dp(app, 8), dp(app, 10), dp(app, 8))
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.8f)
+                    setOnClickListener { hideVisualMemoryPopup() }
+                }
+                btnRow.addView(zoomBtn)
+                btnRow.addView(closeBtn)
+                card.addView(btnRow)
+
+                visualCardView = card
+                try { wmLoc.addView(card, lp) } catch (e: Exception) { Log.w(TAG, "Visual popup note: ${e.message}") }
+            }
+        }
+    }
+
     private fun hideVikingShield() {
         mainHandler.post {
             val v = popupView ?: return@post

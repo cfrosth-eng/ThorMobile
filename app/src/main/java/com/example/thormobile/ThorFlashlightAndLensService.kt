@@ -8,6 +8,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -29,10 +30,12 @@ import android.hardware.camera2.CaptureRequest
 import android.media.ImageReader
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
@@ -51,6 +54,10 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class CameraConsentActivity : Activity() {
     companion object {
@@ -98,7 +105,11 @@ class ThorFlashlightAndLensService : Service() {
 
         const val ACTION_START_LENS = "com.example.thormobile.action.START_REAR_LENS"
         const val ACTION_STOP_LENS = "com.example.thormobile.action.STOP_REAR_LENS"
+        const val ACTION_SNAP_PHOTO = "com.example.thormobile.action.SNAP_REAR_PHOTO"
         const val EXTRA_INIT_TORCH = "extra_init_torch"
+        const val EXTRA_SNAP_ID = "extra_snap_photo_id"
+        const val EXTRA_SNAP_NOTE = "extra_snap_note"
+        const val EXTRA_AUTO_CLOSE = "extra_auto_close_after_snap"
 
         @Volatile var isTorchOn: Boolean = false
         @Volatile var isRearCameraActive: Boolean = false
@@ -177,6 +188,70 @@ class ThorFlashlightAndLensService : Service() {
             })
         }
 
+        fun capturePhotoSnapshot(context: Context, photoId: String, bossNote: String = "", withTorch: Boolean = false) {
+            val app = context.applicationContext
+            val cleanId = photoId.ifBlank { "PHOTO-${System.currentTimeMillis()}" }
+            if (ContextCompat.checkSelfPermission(app, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                CameraConsentActivity.launch(app, withTorch)
+                return
+            }
+            val svc = activeSvc
+            if (isRearCameraActive && svc != null) {
+                if (withTorch && !isTorchOn) {
+                    isTorchOn = true
+                    svc.applySessionTorch(true)
+                }
+                svc.armImmediateSnapshot(cleanId, bossNote, autoCloseAfter = false, warmupDelayMs = 150L)
+                return
+            }
+            if (ThorDisplayShareService.isDisplayShareActive) {
+                ThorDisplayShareService.stopSharing(app)
+            }
+            ContextCompat.startForegroundService(app, Intent(app, ThorFlashlightAndLensService::class.java).apply {
+                action = ACTION_SNAP_PHOTO
+                putExtra(EXTRA_INIT_TORCH, withTorch || isTorchOn)
+                putExtra(EXTRA_SNAP_ID, cleanId)
+                putExtra(EXTRA_SNAP_NOTE, bossNote)
+                putExtra(EXTRA_AUTO_CLOSE, true)
+            })
+        }
+
+        fun saveJpegToThorVisionGalleryAndCache(context: Context, photoId: String, jpegBytes: ByteArray): String {
+            if (jpegBytes.isEmpty()) return ""
+            val cleanId = photoId.replace(Regex("[^A-Za-z0-9_-]"), "").ifBlank { "PHOTO_${System.currentTimeMillis()}" }
+            try {
+                val vaultDir = File(context.filesDir, "thor_visual_vault").apply { mkdirs() }
+                File(vaultDir, "$cleanId.jpg").writeBytes(jpegBytes)
+            } catch (_: Exception) {}
+
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val dispName = "THOR_${stamp}_${cleanId.takeLast(8)}.jpg"
+            val relFolder = Environment.DIRECTORY_PICTURES + "/Thor_Vision"
+            return try {
+                val resolver = context.contentResolver
+                val cv = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, dispName)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, relFolder)
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { os -> os.write(jpegBytes) }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val doneCv = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                        resolver.update(uri, doneCv, null, null)
+                    }
+                    "$relFolder/$dispName"
+                } else ""
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaStore Thor_Vision save note: ${e.message}")
+                ""
+            }
+        }
+
         fun stopRearCamera(context: Context) {
             isRearCameraActive = false
             latestCamFrameJson = ""
@@ -209,6 +284,10 @@ class ThorFlashlightAndLensService : Service() {
     @Volatile private var lastEncodeMs: Long = 0L
     @Volatile private var sentFirst: Boolean = false
     @Volatile private var forceNextHighRes: Boolean = false
+    @Volatile private var pendingSnapId: String = ""
+    @Volatile private var pendingSnapNote: String = ""
+    @Volatile private var snapReadyAfterElapsedMs: Long = 0L
+    @Volatile private var autoCloseAfterSnap: Boolean = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -221,6 +300,14 @@ class ThorFlashlightAndLensService : Service() {
         camHandler = Handler(ht.looper)
     }
 
+    fun armImmediateSnapshot(photoId: String, bossNote: String, autoCloseAfter: Boolean, warmupDelayMs: Long = 200L) {
+        pendingSnapId = photoId
+        pendingSnapNote = bossNote
+        autoCloseAfterSnap = autoCloseAfter
+        snapReadyAfterElapsedMs = System.currentTimeMillis() + warmupDelayMs
+        forceNextHighRes = true
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_LENS) {
             teardownAll(notifyOff = true)
@@ -228,6 +315,12 @@ class ThorFlashlightAndLensService : Service() {
             return START_NOT_STICKY
         }
         isTorchOn = intent?.getBooleanExtra(EXTRA_INIT_TORCH, isTorchOn) ?: isTorchOn
+        if (intent?.action == ACTION_SNAP_PHOTO) {
+            val sid = intent.getStringExtra(EXTRA_SNAP_ID) ?: "PHOTO-${System.currentTimeMillis()}"
+            val snote = intent.getStringExtra(EXTRA_SNAP_NOTE) ?: ""
+            val aClose = intent.getBooleanExtra(EXTRA_AUTO_CLOSE, false)
+            armImmediateSnapshot(sid, snote, autoCloseAfter = aClose, warmupDelayMs = 1150L)
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 startForeground(NOTIF_ID, buildNotif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
@@ -272,7 +365,7 @@ class ThorFlashlightAndLensService : Service() {
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
         }
         val lp = WindowManager.LayoutParams(
-            dp(176), dp(254), lType,
+            dp(196), dp(264), lType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -286,7 +379,7 @@ class ThorFlashlightAndLensService : Service() {
             setPadding(dp(6), dp(6), dp(6), dp(6))
         }
         val hdr = TextView(this).apply {
-            text = "⚡ THOR LENS • DRAG"
+            text = "THOR LENS - DRAG"
             setTextColor(Color.parseColor("#FDE047"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
@@ -305,10 +398,10 @@ class ThorFlashlightAndLensService : Service() {
         }
         val tPill = TextView(this).apply {
             gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(5), dp(5), dp(5), dp(5))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(5) }
+            setPadding(dp(4), dp(5), dp(4), dp(5))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
             setOnClickListener {
                 isTorchOn = !isTorchOn
                 applySessionTorch(isTorchOn)
@@ -317,22 +410,36 @@ class ThorFlashlightAndLensService : Service() {
         }
         torchBtnTv = tPill
 
+        val snapPill = TextView(this).apply {
+            text = "Snap"
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#DCFCE7"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            background = bgBox("#052E16", "#22C55E", 99)
+            setPadding(dp(4), dp(5), dp(4), dp(5))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.95f).apply { marginEnd = dp(4) }
+            setOnClickListener {
+                armImmediateSnapshot("PHOTO-${System.currentTimeMillis()}", "Manual Thor Lens Snapshot", autoCloseAfter = false, warmupDelayMs = 80L)
+            }
+        }
+
         val xPill = TextView(this).apply {
-            text = "✕ Off"
+            text = "Off"
             gravity = Gravity.CENTER
             setTextColor(Color.parseColor("#FEE2E2"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
             background = bgBox("#3B0D14", "#EF4444", 99)
-            setPadding(dp(5), dp(5), dp(5), dp(5))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.85f)
+            setPadding(dp(4), dp(5), dp(4), dp(5))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.8f)
             setOnClickListener {
                 isTorchOn = false
                 teardownAll(notifyOff = true)
                 stopSelf()
             }
         }
-        row.addView(tPill); row.addView(xPill)
+        row.addView(tPill); row.addView(snapPill); row.addView(xPill)
         root.addView(row)
 
         var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
@@ -368,11 +475,11 @@ class ThorFlashlightAndLensService : Service() {
         mainHandler.post {
             val tv = torchBtnTv ?: return@post
             if (isTorchOn) {
-                tv.text = "🔦 ON"
+                tv.text = "Light ON"
                 tv.setTextColor(Color.parseColor("#FEF08A"))
                 tv.background = bgBox("#422006", "#FACC15", 99)
             } else {
-                tv.text = "🔦 Light"
+                tv.text = "Light"
                 tv.setTextColor(Color.parseColor("#E0F2FE"))
                 tv.background = bgBox("#172554", "#38BDF8", 99)
             }
@@ -392,14 +499,15 @@ class ThorFlashlightAndLensService : Service() {
             val img = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
                 val now = System.currentTimeMillis()
-                val hiRes = forceNextHighRes
+                val snapDue = pendingSnapId.isNotEmpty() && now >= snapReadyAfterElapsedMs
+                val hiRes = forceNextHighRes || snapDue
                 if (!hiRes && sentFirst && (now - lastEncodeMs) < INTERVAL_MS) return@setOnImageAvailableListener
                 lastEncodeMs = now
                 forceNextHighRes = false
                 val buf = img.planes[0].buffer
                 val raw = ByteArray(buf.remaining())
                 buf.get(raw)
-                encodeAndSendFrame(raw, hiRes)
+                encodeAndSendFrame(raw, hiRes, snapDue)
             } catch (_: Exception) {
             } finally {
                 img.close()
@@ -451,24 +559,58 @@ class ThorFlashlightAndLensService : Service() {
         }
     }
 
-    private fun encodeAndSendFrame(rawJpeg: ByteArray, hiRes: Boolean) {
+    private fun encodeAndSendFrame(rawJpeg: ByteArray, hiRes: Boolean, isSnapshotCapture: Boolean) {
         if (!isRearCameraActive || rawJpeg.isEmpty()) return
         val bmp = BitmapFactory.decodeByteArray(rawJpeg, 0, rawJpeg.size) ?: return
         val mat = Matrix()
         if (sensorDeg != 0) mat.postRotate(sensorDeg.toFloat())
-        val scale = ((if (hiRes) 1920f else 1280f) / maxOf(bmp.width, bmp.height).coerceAtLeast(1)).coerceAtMost(1f)
+        val scale = ((if (hiRes || isSnapshotCapture) 1920f else 1280f) / maxOf(bmp.width, bmp.height).coerceAtLeast(1)).coerceAtMost(1f)
         mat.postScale(scale, scale)
         val outBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, mat, true)
         if (outBmp !== bmp) bmp.recycle()
         val w = outBmp.width; val h = outBmp.height
         val baos = ByteArrayOutputStream()
-        outBmp.compress(Bitmap.CompressFormat.JPEG, if (hiRes) 84 else 74, baos)
+        outBmp.compress(Bitmap.CompressFormat.JPEG, if (isSnapshotCapture) 92 else (if (hiRes) 84 else 74), baos)
         outBmp.recycle()
+
+        val jpegBytes = baos.toByteArray()
+        val b64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+
+        if (isSnapshotCapture) {
+            val capturedId = pendingSnapId
+            val capturedNote = pendingSnapNote
+            val shouldClose = autoCloseAfterSnap
+            pendingSnapId = ""
+            pendingSnapNote = ""
+            autoCloseAfterSnap = false
+
+            val galPath = saveJpegToThorVisionGalleryAndCache(applicationContext, capturedId, jpegBytes)
+            val snapPkt = JSONObject()
+                .put("action", "camera_snapshot_captured")
+                .put("type", "camera_snapshot_captured")
+                .put("photo_id", capturedId)
+                .put("boss_note", capturedNote)
+                .put("gallery_path", galPath)
+                .put("jpeg_b64", b64)
+                .put("width", w)
+                .put("height", h)
+                .toString()
+            ThorDisplayShareService.dispatchPacket(snapPkt)
+            mainHandler.post {
+                Toast.makeText(applicationContext, "Saved to Pictures/Thor_Vision & Thor Memory", Toast.LENGTH_SHORT).show()
+                if (shouldClose) {
+                    isTorchOn = false
+                    teardownAll(notifyOff = true)
+                    stopSelf()
+                }
+            }
+            if (shouldClose) return
+        }
 
         val pkt = JSONObject()
             .put("action", "screen_watcher_frame").put("type", "screen_watcher_frame")
             .put("source", "rear_camera").put("torch_on", isTorchOn)
-            .put("jpeg_b64", Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP))
+            .put("jpeg_b64", b64)
             .put("mime_type", "image/jpeg").put("width", w).put("height", h)
             .put("native_width_px", w).put("native_height_px", h)
             .put("scale_factor", 1.0).put("gear", if (hiRes) "native_full_res" else "standard_720p")
@@ -520,8 +662,8 @@ class ThorFlashlightAndLensService : Service() {
         )
         return NotificationCompat.Builder(this, CH_ID)
             .setSmallIcon(R.drawable.image_5)
-            .setContentTitle("Thor Rear-Camera Lens: ON (RAM Only)")
-            .setContentText("In-RAM keyframes only (zero video saved). Tap Stop anytime.")
+            .setContentTitle("Thor Rear-Camera Lens: ON (RAM + Thor_Vision)")
+            .setContentText("Say 'take a picture' or tap Snap to save to Thor_Vision.")
             .setOngoing(true)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "STOP CAMERA", pi)
             .build()
