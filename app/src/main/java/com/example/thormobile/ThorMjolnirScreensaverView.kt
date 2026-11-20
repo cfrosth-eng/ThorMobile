@@ -56,9 +56,7 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
     private val tallBolts: Array<Bitmap?>
     private val rimCwSrc: Bitmap?
     private val dustCcwSrc: Bitmap?
-    private val flyUpBmp: Bitmap?
-    private val flyGlideBmp: Bitmap?
-    private val flyDownBmp: Bitmap?
+    private val flyCycle: Array<Bitmap?>
 
     private var scrolledCwBmp: Bitmap? = null
     private var scrolledCwCanvas: Canvas? = null
@@ -113,27 +111,26 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         )
     }
 
-    // WO-219: Natural 3D Corvid Flight Engine (scene-proportional sizing, 100% solid opaque feathers,
-    // genuine Far<->Close 3D perspective depth & flap-then-soar bird rhythm — Gold frame 100% untouched)
+    // WO-220: Effortless 12-Frame Corvid Flight & Organic 3D Thermal-Wind Engine (Gold frame 100% locked!)
     private var passDir = 1
-    private var passMode = 0            // 0=Swoop-In, 1=Climb-Out, 2=Valley Arch (In & Out), 3=High Thermal Patrol
     private var ravenPxX = -200f
     private var ravenPxY = 300f
     private var startX = -200f
     private var endX = 1600f
-    private var yStartFrac = 0.22f
-    private var yEndFrac = 0.26f
-    private var yArchFrac = 0.08f
-    private var depthStart = 0.30f
-    private var depthMid = 0.72f
-    private var depthEnd = 1.02f
+    private var yP0 = 0.22f
+    private var yP1 = 0.16f
+    private var yP2 = 0.28f
+    private var yP3 = 0.20f
+    private var zP0 = 0.34f
+    private var zP1 = 0.78f
+    private var zP2 = 0.82f
+    private var zP3 = 0.34f
     private var restCooldown = 0f
     private var smoothPitchDeg = 0f
-    private var wingPhase = 0f
-    private var gliding = false
-    private var glideTimer = 0f
-    private var beatsRemaining = 4
-    private var prevCycleQuarter = 0
+    private var wingPos = 4f           // 0..12 continuous frame phase; index 4 = outstretched effortless Level Glide
+    private var gliding = true
+    private var glideTimer = 1.6f
+    private var beatsRemaining = 0
     private var needsInitialPass = true
     private var running = false
 
@@ -153,9 +150,14 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         )
         rimCwSrc = decodeSafe(R.drawable.raven_gold_rim_cw, opts) ?: decodeSafe(R.drawable.raven_gold_ring_strip, opts)
         dustCcwSrc = decodeSafe(R.drawable.raven_gold_dust_ccw, opts)
-        flyUpBmp = decodeSafe(R.drawable.raven_ss_up, opts) ?: decodeSafe(R.drawable.raven_fly_up, opts)
-        flyGlideBmp = decodeSafe(R.drawable.raven_ss_glide, opts) ?: decodeSafe(R.drawable.raven_fly_glide, opts)
-        flyDownBmp = decodeSafe(R.drawable.raven_ss_down, opts) ?: decodeSafe(R.drawable.raven_fly_down, opts)
+        flyCycle = arrayOf(
+            decodeSafe(R.drawable.raven_f00, opts), decodeSafe(R.drawable.raven_f01, opts),
+            decodeSafe(R.drawable.raven_f02, opts), decodeSafe(R.drawable.raven_f03, opts),
+            decodeSafe(R.drawable.raven_f04, opts), decodeSafe(R.drawable.raven_f05, opts),
+            decodeSafe(R.drawable.raven_f06, opts), decodeSafe(R.drawable.raven_f07, opts),
+            decodeSafe(R.drawable.raven_f08, opts), decodeSafe(R.drawable.raven_f09, opts),
+            decodeSafe(R.drawable.raven_f10, opts), decodeSafe(R.drawable.raven_f11, opts),
+        )
 
         rimCwSrc?.let { src ->
             scrolledCwBmp = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
@@ -191,7 +193,8 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
 
     fun releaseBitmaps() {
         running = false
-        for (b in listOf(wideBaseBmp, tallBaseBmp, rimCwSrc, dustCcwSrc, scrolledCwBmp, scrolledCcwBmp, flyUpBmp, flyGlideBmp, flyDownBmp)) {
+        for (b in flyCycle) { try { b?.recycle() } catch (_: Exception) {} }
+        for (b in listOf(wideBaseBmp, tallBaseBmp, rimCwSrc, dustCcwSrc, scrolledCwBmp, scrolledCcwBmp)) {
             try { b?.recycle() } catch (_: Exception) {}
         }
         for (b in wideBolts) { try { b?.recycle() } catch (_: Exception) {} }
@@ -309,50 +312,52 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         startX = if (passDir > 0) (innerClipRect.left - marginPx) else (innerClipRect.right + marginPx)
         endX = if (passDir > 0) (innerClipRect.right + marginPx) else (innerClipRect.left - marginPx)
         ravenPxX = if (immediateVisible) (innerClipRect.left + innerClipRect.width() * 0.14f) else startX
-        restCooldown = if (immediateVisible) 0f else (1.0f + rng.nextFloat() * 1.8f)
+        restCooldown = if (immediateVisible) 0f else (1.4f + rng.nextFloat() * 2.4f)
 
-        passMode = if (immediateVisible) 2 else rng.nextInt(4)
-        when (passMode) {
-            0 -> { // Swoop-In: small over distant peaks -> majestic foreground pass
-                depthStart = 0.28f + rng.nextFloat() * 0.08f
-                depthMid = 0.62f + rng.nextFloat() * 0.12f
-                depthEnd = 0.96f + rng.nextFloat() * 0.12f
-                yStartFrac = 0.13f + rng.nextFloat() * 0.10f
-                yEndFrac = 0.26f + rng.nextFloat() * 0.14f
-                yArchFrac = -0.04f - rng.nextFloat() * 0.04f
-            }
-            1 -> { // Climb-Out: bold in foreground -> climbing & receding into storm sky
-                depthStart = 0.94f + rng.nextFloat() * 0.12f
-                depthMid = 0.60f + rng.nextFloat() * 0.12f
-                depthEnd = 0.28f + rng.nextFloat() * 0.08f
-                yStartFrac = 0.26f + rng.nextFloat() * 0.14f
-                yEndFrac = 0.12f + rng.nextFloat() * 0.10f
-                yArchFrac = 0.04f + rng.nextFloat() * 0.04f
-            }
-            2 -> { // Valley Arch (Coming & Going): enters far -> swoops closer near center -> banks back out far!
-                depthStart = 0.30f + rng.nextFloat() * 0.08f
-                depthMid = 0.86f + rng.nextFloat() * 0.16f
-                depthEnd = 0.30f + rng.nextFloat() * 0.08f
-                yStartFrac = 0.15f + rng.nextFloat() * 0.12f
-                yEndFrac = 0.15f + rng.nextFloat() * 0.12f
-                yArchFrac = 0.10f + rng.nextFloat() * 0.06f
-            }
-            else -> { // High Mountain Thermal Soar: graceful mid-distance glide across valley
-                val d = 0.40f + rng.nextFloat() * 0.18f
-                depthStart = d
-                depthMid = (d + 0.12f).coerceAtMost(0.76f)
-                depthEnd = (d + (rng.nextFloat() - 0.5f) * 0.14f).coerceIn(0.32f, 0.72f)
-                yStartFrac = 0.14f + rng.nextFloat() * 0.18f
-                yEndFrac = (yStartFrac + (rng.nextFloat() - 0.5f) * 0.12f).coerceIn(0.11f, 0.36f)
-                yArchFrac = (rng.nextFloat() - 0.5f) * 0.10f
-            }
+        // Organic randomized 3D depth control points (no fixed repeating presets — every flight path is unique!)
+        val roll = rng.nextFloat()
+        if (roll < 0.34f) {
+            // Distant mountain approach -> sweeps gracefully closer across the valley -> drifts back out
+            zP0 = 0.26f + rng.nextFloat() * 0.12f
+            zP1 = 0.62f + rng.nextFloat() * 0.28f
+            zP2 = 0.66f + rng.nextFloat() * 0.28f
+            zP3 = 0.28f + rng.nextFloat() * 0.16f
+        } else if (roll < 0.67f) {
+            // Far-to-close OR close-to-far continuous 3D depth glide
+            val comingCloser = rng.nextBoolean()
+            val farZ = 0.26f + rng.nextFloat() * 0.12f
+            val nearZ = 0.82f + rng.nextFloat() * 0.20f
+            zP0 = if (comingCloser) farZ else nearZ
+            zP3 = if (comingCloser) nearZ else farZ
+            zP1 = zP0 + (zP3 - zP0) * (0.28f + rng.nextFloat() * 0.22f)
+            zP2 = zP0 + (zP3 - zP0) * (0.58f + rng.nextFloat() * 0.22f)
+        } else {
+            // High effortless mountain thermal patrol at organic mid-distance
+            val baseZ = 0.34f + rng.nextFloat() * 0.24f
+            zP0 = baseZ
+            zP1 = (baseZ + (rng.nextFloat() - 0.35f) * 0.22f).coerceIn(0.26f, 0.78f)
+            zP2 = (baseZ + (rng.nextFloat() - 0.35f) * 0.22f).coerceIn(0.26f, 0.78f)
+            zP3 = (baseZ + (rng.nextFloat() - 0.50f) * 0.20f).coerceIn(0.26f, 0.76f)
         }
-        ravenPxY = innerClipRect.top + innerClipRect.height() * yStartFrac
+
+        // Organic gentle altitude spline (higher when far over peaks, slightly lower when sweeping closer)
+        yP0 = (0.12f + zP0 * 0.22f + (rng.nextFloat() - 0.5f) * 0.08f).coerceIn(0.09f, 0.44f)
+        yP1 = (0.12f + zP1 * 0.22f + (rng.nextFloat() - 0.5f) * 0.14f).coerceIn(0.08f, 0.48f)
+        yP2 = (0.12f + zP2 * 0.22f + (rng.nextFloat() - 0.5f) * 0.14f).coerceIn(0.08f, 0.48f)
+        yP3 = (0.12f + zP3 * 0.22f + (rng.nextFloat() - 0.5f) * 0.08f).coerceIn(0.09f, 0.44f)
+
+        ravenPxY = innerClipRect.top + innerClipRect.height() * yP0
         smoothPitchDeg = 0f
-        gliding = false
-        beatsRemaining = 3 + rng.nextInt(3)
-        prevCycleQuarter = 0
-        wingPhase = 0f
+        // Start with 2-3 slow, effortless strokes or gliding smoothly on wind
+        gliding = !immediateVisible && rng.nextBoolean()
+        glideTimer = if (gliding) (1.6f + rng.nextFloat() * 1.8f) else 0f
+        beatsRemaining = if (gliding) 0 else (2 + rng.nextInt(2))
+        wingPos = 4f
+    }
+
+    private fun evalCubicSpline(t: Float, a: Float, b: Float, c: Float, d: Float): Float {
+        val u = 1f - t
+        return u * u * u * a + 3f * u * u * t * b + 3f * u * t * t * c + t * t * t * d
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -441,20 +446,17 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             }
         }
 
-        // 4. NATURAL 3D CORVID FLIGHT (100% SOLID OPAQUE, SCENE-PROPORTIONAL, FLAP-THEN-SOAR, COMING & GOING)
+        // 4. EFFORTLESS 12-FRAME 3D CORVID FLIGHT (SOLID OPAQUE FEATHERS, REAL FLAP-THEN-SOAR, ORGANIC CURVES)
         if (restCooldown > 0f) {
             restCooldown -= dt
         } else {
             val sceneRef = min(fw, fh).coerceAtLeast(320f)
             val totalDx = abs(endX - startX).coerceAtLeast(1f)
             val progress = (abs(ravenPxX - startX) / totalDx).coerceIn(0f, 1f)
-            val u = 1f - progress
-            // Smooth quadratic Bezier depth curve -> true Far <-> Close coming-and-going perspective!
-            val depth = (u * u * depthStart + 2f * u * progress * depthMid + progress * progress * depthEnd)
-                .coerceIn(0.24f, 1.12f)
+            val depth = evalCubicSpline(progress, zP0, zP1, zP2, zP3).coerceIn(0.24f, 1.06f)
 
-            // True perspective velocity: slow & majestic when distant, brisk when swooping past foreground
-            val speedPx = sceneRef * 0.25f * (0.42f + 0.72f * depth)
+            // Calm, unhurried perspective airspeed (majestic slow glide far away, smooth sweep closer up)
+            val speedPx = sceneRef * 0.21f * (0.40f + 0.72f * depth)
             val prevX = ravenPxX
             val prevY = ravenPxY
             ravenPxX += passDir * speedPx * dt
@@ -462,63 +464,53 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             if ((passDir > 0 && ravenPxX >= endX) || (passDir < 0 && ravenPxX <= endX)) {
                 startFreshPhysicalPass(wf, hf, immediateVisible = false)
             } else {
-                // Smooth natural bird flight arc + gentle downstroke wing lift
-                val baseYFrac = yStartFrac + (yEndFrac - yStartFrac) * progress + sin(progress * PI.toFloat()) * yArchFrac
-                val liftBobPx = if (gliding) 0f else (sin(wingPhase * 2f * PI.toFloat()) * dp(2.8f) * depth)
-                val targetY = (innerClipRect.top + fh * baseYFrac + liftBobPx)
-                    .coerceIn(innerClipRect.top + fh * 0.07f, innerClipRect.top + fh * 0.56f)
-                ravenPxY = if (abs(ravenPxY - targetY) > fh * 0.25f) targetY else (ravenPxY + (targetY - ravenPxY) * min(1f, dt * 8.5f))
+                val baseYFrac = evalCubicSpline(progress, yP0, yP1, yP2, yP3)
+                // Gentle aerodynamic lift strictly during the power downstroke (frames 4..7), completely still while gliding
+                val strokeBobPx = if (gliding) 0f else (sin(((wingPos - 4f) / 12f) * 2f * PI.toFloat()) * dp(2.0f) * depth)
+                val targetY = (innerClipRect.top + fh * baseYFrac + strokeBobPx)
+                    .coerceIn(innerClipRect.top + fh * 0.07f, innerClipRect.top + fh * 0.54f)
+                ravenPxY = if (abs(ravenPxY - targetY) > fh * 0.22f) targetY else (ravenPxY + (targetY - ravenPxY) * min(1f, dt * 7.0f))
 
                 val vx = (ravenPxX - prevX) / dt
                 val vy = (ravenPxY - prevY) / dt
-                // Strictly beak-first climb/dive angle (gentle +/- 14 deg max — NEVER flies sideways!)
-                val targetPitch = (atan2(vy.toDouble(), max(60f, abs(vx)).toDouble()) * 180.0 / PI * 0.78)
-                    .toFloat().coerceIn(-14f, 14f)
-                smoothPitchDeg += (targetPitch - smoothPitchDeg) * min(1f, dt * 5.2f)
+                // Smooth beak-first banking pitch (max +/- 13 deg — effortless gliding silhouette)
+                val targetPitch = (atan2(vy.toDouble(), max(70f, abs(vx)).toDouble()) * 180.0 / PI * 0.75)
+                    .toFloat().coerceIn(-13f, 13f)
+                smoothPitchDeg += (targetPitch - smoothPitchDeg) * min(1f, dt * 4.2f)
 
-                // Realistic corvid wingbeat rhythm: 3-5 crisp steady wingbeats -> majestic 1.4-2.8s outstretched glide
+                // Effortless corvid energy cycle: slow heavy 840ms wingbeats (2-4 strokes) -> long 2.2-4.4s outstretched glides!
                 if (gliding) {
+                    wingPos = 4f // Hold crisp outstretched Level Glide (F2) seamlessly!
                     glideTimer -= dt
                     if (glideTimer <= 0f) {
                         gliding = false
-                        beatsRemaining = if (vy < -15f) (4 + rng.nextInt(3)) else (3 + rng.nextInt(3))
-                        wingPhase = 0f
-                        prevCycleQuarter = 0
+                        beatsRemaining = if (vy < -12f) (3 + rng.nextInt(2)) else (2 + rng.nextInt(2))
                     }
                 } else {
-                    val beatHz = if (vy < -12f) 2.25f else 1.95f
-                    wingPhase += dt * beatHz
-                    if (wingPhase >= 1f) {
-                        wingPhase -= 1f
+                    val beatsPerSec = if (vy < -12f) 1.32f else 1.16f // Calm heavy raven beat (~860ms per full stroke)
+                    val prevPos = wingPos
+                    wingPos = (wingPos + dt * beatsPerSec * 12f) % 12f
+                    // Check clean arrival at outstretched Level Glide (index 4) to transition effortlessly into soaring!
+                    val crossedGlide = (prevPos < 4f && wingPos >= 4f) || (prevPos > 10f && wingPos < 4f && beatsRemaining <= 0)
+                    if (crossedGlide) {
                         beatsRemaining--
                         if (beatsRemaining <= 0) {
                             gliding = true
-                            glideTimer = (if (vy > 8f) 1.9f else 1.3f) + rng.nextFloat() * 1.4f
+                            wingPos = 4f
+                            glideTimer = (if (vy > 6f) 2.8f else 2.0f) + rng.nextFloat() * 1.9f
                         }
                     }
                 }
 
-                // Crisp discrete wing frame selection — 100% SOLID OPAQUE (alpha=255, ZERO ghosting/transparency!)
-                val activeBmp = if (gliding) {
-                    flyGlideBmp
-                } else {
-                    when ((wingPhase * 4f).toInt().coerceIn(0, 3)) {
-                        0 -> flyUpBmp
-                        2 -> flyDownBmp
-                        else -> flyGlideBmp
-                    }
-                } ?: flyGlideBmp
-
+                val frameIdx = wingPos.toInt().coerceIn(0, 11)
+                val activeBmp = flyCycle.getOrNull(frameIdx) ?: flyCycle.getOrNull(4)
                 if (activeBmp != null) {
-                    // Scene-proportional sizing: identical realistic bird-to-valley scale in Portrait, Landscape & Laptop!
-                    val sizePx = sceneRef * 0.36f * depth
+                    val sizePx = sceneRef * 0.34f * depth
                     val flipX = if (passDir > 0) 1f else -1f
-                    val bodyFlexY = if (gliding) 1f else (0.975f + 0.035f * cos(wingPhase * 2f * PI.toFloat()))
                     ravenPaintA.alpha = 255
-
                     canvas.save()
                     canvas.translate(ravenPxX, ravenPxY)
-                    canvas.scale(flipX, bodyFlexY)
+                    canvas.scale(flipX, 1f)
                     canvas.rotate(smoothPitchDeg)
                     birdDstRect.set(-sizePx * 0.5f, -sizePx * 0.5f, sizePx * 0.5f, sizePx * 0.5f)
                     canvas.drawBitmap(activeBmp, null, birdDstRect, ravenPaintA)
