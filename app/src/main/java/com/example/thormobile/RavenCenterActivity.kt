@@ -9,6 +9,7 @@ import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
@@ -50,6 +51,7 @@ import java.util.TimeZone
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class RavenCenterActivity : AppCompatActivity() {
@@ -64,6 +66,23 @@ class RavenCenterActivity : AppCompatActivity() {
         private const val CLOUD_URL = "https://thor-api-443941171993.us-east4.run.app"
         private const val SOVEREIGN_TOKEN = "9d943a8005992357c7d6ca29278e803b80521c4d0d703e1ad74fb141ac050d19"
         private val bgIo = Executors.newCachedThreadPool()
+        private val replayLock = Any()
+        private val replaySeq = AtomicLong(0L)
+        @Volatile private var activeReplayPlayer: MediaPlayer? = null
+        @Volatile private var activeReplayFile: File? = null
+        @Volatile private var lastReplayTapMs: Long = 0L
+        @Volatile private var lastReplayTextHash: Int = 0
+
+        fun stopActiveCloudVoiceReplay() {
+            replaySeq.incrementAndGet()
+            synchronized(replayLock) {
+                try { activeReplayPlayer?.stop() } catch (_: Exception) {}
+                try { activeReplayPlayer?.release() } catch (_: Exception) {}
+                activeReplayPlayer = null
+                try { activeReplayFile?.delete() } catch (_: Exception) {}
+                activeReplayFile = null
+            }
+        }
 
         fun formatEtNow(ms: Long = System.currentTimeMillis()): String {
             val sdf = SimpleDateFormat("MMM dd, hh:mm a 'ET'", Locale.US)
@@ -102,33 +121,103 @@ class RavenCenterActivity : AppCompatActivity() {
         }
 
         fun requestCloudVoiceReplay(context: Context, textToSpeak: String, fallbackTts: TextToSpeech? = null) {
+            val cleanText = textToSpeak.trim()
+            if (cleanText.isEmpty()) return
+            val nowMs = System.currentTimeMillis()
+            val textHash = cleanText.hashCode()
+            synchronized(replayLock) {
+                if (textHash == lastReplayTextHash && (nowMs - lastReplayTapMs) < 1200L) {
+                    Log.d("RavenReplay", "Debounced duplicate Replay tap (<1200ms)")
+                    return
+                }
+                lastReplayTapMs = nowMs
+                lastReplayTextHash = textHash
+                try { activeReplayPlayer?.stop() } catch (_: Exception) {}
+                try { activeReplayPlayer?.release() } catch (_: Exception) {}
+                activeReplayPlayer = null
+                try { activeReplayFile?.delete() } catch (_: Exception) {}
+                activeReplayFile = null
+            }
+            try { fallbackTts?.stop() } catch (_: Exception) {}
+
+            val mySeq = replaySeq.incrementAndGet()
             val app = context.applicationContext
-            Toast.makeText(app, "Replaying Raven briefing...", Toast.LENGTH_SHORT).show()
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(app, "Replaying Raven briefing...", Toast.LENGTH_SHORT).show()
+            }
             bgIo.execute {
                 val payload = JSONObject()
                     .put("action", "raven_center")
                     .put("sub_action", "tts_replay")
-                    .put("text", textToSpeak.take(1300))
+                    .put("text", cleanText.take(1300))
                 val resp = sendLedgerWsRpcSync(payload, 25L)
+                if (replaySeq.get() != mySeq) {
+                    Log.d("RavenReplay", "Discarding superseded replay #$mySeq")
+                    return@execute
+                }
                 val wavB64 = resp?.optString("wav_b64", "") ?: ""
                 if (wavB64.isNotEmpty()) {
+                    var tmp: File? = null
+                    var mp: MediaPlayer? = null
                     try {
                         val bytes = Base64.decode(wavB64, Base64.DEFAULT)
-                        val tmp = File(app.cacheDir, "raven_replay_${System.currentTimeMillis()}.wav")
+                        tmp = File(app.cacheDir, "raven_replay_${mySeq}_${System.currentTimeMillis()}.wav")
                         tmp.writeBytes(bytes)
-                        val mp = MediaPlayer()
-                        mp.setDataSource(tmp.absolutePath)
-                        mp.setOnCompletionListener { player ->
-                            try { player.release() } catch (_: Exception) {}
-                            try { tmp.delete() } catch (_: Exception) {}
+                        val player = MediaPlayer().apply {
+                            setAudioAttributes(
+                                AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                    .build()
+                            )
+                            setDataSource(tmp.absolutePath)
+                            prepare()
                         }
-                        mp.prepare()
-                        mp.start()
+                        mp = player
+                        val wavFile = tmp
+                        player.setOnCompletionListener { finished ->
+                            synchronized(replayLock) {
+                                if (activeReplayPlayer === finished) {
+                                    activeReplayPlayer = null
+                                    activeReplayFile = null
+                                }
+                            }
+                            try { finished.release() } catch (_: Exception) {}
+                            try { wavFile.delete() } catch (_: Exception) {}
+                        }
+                        player.setOnErrorListener { failed, _, _ ->
+                            synchronized(replayLock) {
+                                if (activeReplayPlayer === failed) {
+                                    activeReplayPlayer = null
+                                    activeReplayFile = null
+                                }
+                            }
+                            try { failed.release() } catch (_: Exception) {}
+                            try { wavFile.delete() } catch (_: Exception) {}
+                            true
+                        }
+                        synchronized(replayLock) {
+                            if (replaySeq.get() != mySeq) {
+                                try { player.release() } catch (_: Exception) {}
+                                try { wavFile.delete() } catch (_: Exception) {}
+                                return@execute
+                            }
+                            try { activeReplayPlayer?.stop() } catch (_: Exception) {}
+                            try { activeReplayPlayer?.release() } catch (_: Exception) {}
+                            try { activeReplayFile?.delete() } catch (_: Exception) {}
+                            activeReplayPlayer = player
+                            activeReplayFile = wavFile
+                            player.start()
+                        }
                         return@execute
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        Log.w("RavenReplay", "Cloud WAV replay error: ${e.message}")
+                        try { mp?.release() } catch (_: Exception) {}
+                        try { tmp?.delete() } catch (_: Exception) {}
+                    }
                 }
-                if (fallbackTts != null) {
-                    fallbackTts.speak(textToSpeak.take(900), TextToSpeech.QUEUE_FLUSH, null, "raven_tts")
+                if (replaySeq.get() == mySeq && fallbackTts != null) {
+                    fallbackTts.speak(cleanText.take(900), TextToSpeech.QUEUE_FLUSH, null, "raven_tts")
                 }
             }
         }
