@@ -3,17 +3,21 @@ package com.example.thormobile
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 
 /**
  * WO-159: Instant Full-Screen Living Mjolnir Storm Screensaver Launcher (Portrait + Landscape Full Sensor).
- * Tap anywhere to exit cleanly.
+ * Double-tap anywhere (or press Back) to exit — prevents accidental exit while rotating your phone.
  */
 class ThorScreensaverActivity : AppCompatActivity() {
 
     private var stormView: ThorMjolnirScreensaverView? = null
+    private var lastTapElapsedMs: Long = 0L
+    private var lastHintElapsedMs: Long = 0L
 
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -24,7 +28,22 @@ class ThorScreensaverActivity : AppCompatActivity() {
                 WindowManager.LayoutParams.FLAG_FULLSCREEN
         )
         val view = ThorMjolnirScreensaverView(this).apply {
-            setOnClickListener { finish() }
+            setOnClickListener {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastTapElapsedMs <= 480L) {
+                    finish()
+                } else {
+                    lastTapElapsedMs = now
+                    if (now - lastHintElapsedMs >= 4500L) {
+                        lastHintElapsedMs = now
+                        Toast.makeText(
+                            this@ThorScreensaverActivity,
+                            "Double-tap anywhere to exit Mjolnir Storm",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            }
         }
         stormView = view
         setContentView(view)

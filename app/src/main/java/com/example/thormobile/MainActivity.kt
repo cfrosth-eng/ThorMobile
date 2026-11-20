@@ -231,6 +231,56 @@ class MainActivity : AppCompatActivity() {
         // DIRECTLY UNDERNEATH FLOATING THOR BUTTON: Raven Messaging Center with Raven-on-Pedestal Button
         root.addView(buildRavenMessagingCenterCard())
 
+        // WO-159: 1-Tap Mjolnir Storm Screensaver Launcher + Android System Screen Saver Picker
+        val ssRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = (10 * resources.displayMetrics.density).toInt() }
+        }
+        fun makeGoldBtn(titleTxt: String, subTxt: String, marginEndDp: Int, action: () -> Unit): LinearLayout {
+            val d = resources.displayMetrics.density
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = android.view.Gravity.CENTER
+                setPadding((10 * d).toInt(), (10 * d).toInt(), (10 * d).toInt(), (10 * d).toInt())
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = (marginEndDp * d).toInt()
+                }
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(android.graphics.Color.parseColor("#1A1305"))
+                    setStroke((1.5f * d).toInt(), android.graphics.Color.parseColor("#EAB308"))
+                    cornerRadius = 14f * d
+                }
+                addView(TextView(this@MainActivity).apply {
+                    text = titleTxt
+                    setTextColor(android.graphics.Color.parseColor("#FEF08A"))
+                    textSize = 13f
+                    setTypeface(null, android.graphics.Typeface.BOLD)
+                    gravity = android.view.Gravity.CENTER
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = subTxt
+                    setTextColor(android.graphics.Color.parseColor("#CBD5E1"))
+                    textSize = 10.5f
+                    gravity = android.view.Gravity.CENTER
+                })
+                setOnClickListener { action() }
+            }
+        }
+        ssRow.addView(makeGoldBtn("Mjolnir Screensaver", "Tap to Launch Full-Screen", 6) {
+            startActivity(Intent(this@MainActivity, ThorScreensaverActivity::class.java))
+        })
+        ssRow.addView(makeGoldBtn("Screen Saver Setup", "Set Default Charging Saver", 0) {
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_DREAM_SETTINGS))
+            } catch (_: Exception) {
+                startActivity(Intent(android.provider.Settings.ACTION_DISPLAY_SETTINGS))
+            }
+        })
+        root.addView(ssRow)
+
         // ====================================================================
         // SECTION 2: THOR SOVEREIGN REALMS
         // ====================================================================

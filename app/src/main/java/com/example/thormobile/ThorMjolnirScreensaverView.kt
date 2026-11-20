@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
@@ -27,15 +28,16 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 /**
- * WO-159: Living Mjolnir Storm Universal Screensaver View (Note 20 Ultra Portrait 1440x3088 & Landscape 3088x1440).
+ * WO-159 Polished: Living Mjolnir Storm Universal Screensaver View (Note 20 Ultra Portrait & Landscape).
  *
- * Full parity with Dell XPS `thor_mjolnir_screensaver.py`:
- *  - Auto-switches Ultra-HD Wide (16:9) vs Tall (9:16) valley masters on device rotation.
- *  - 4 independent randomized branching sky lightning bolts with double-flicker strikes & cloud flashes.
- *  - Diagonal living storm rain streaks catching lightning + breathing golden pedestal rune aura.
- *  - Free-flying Raven (raven_fly_up / glide / down) on continuous random cubic Bezier curves.
- *  - Floating-icon 24k metallic gold rounded perimeter frame (18.2s CW rotation, ZERO dripping) +
- *    2 opposing bright star-flare glints + dual-direction counter-rotating gold dust halo.
+ * Fixes verified from Boss's live visual inspection:
+ *  - Uncropped vertical-fit valley framing over darkened storm backdrop so Mjolnir's top & pedestal base
+ *    are NEVER cut off or zoomed-in in Portrait (1440x3088) OR Ultra-Wide Landscape (3088x1440).
+ *  - Real dark obsidian border margin (~6.8% minDim) outside the bold 24k metallic gold rim so all 260
+ *    multi-size sparkling gold dust grains visibly swirl in BOTH directions (CW & CCW) with ZERO dripping.
+ *  - Bright opposing 4-point star-flare glints gliding smoothly along the 18.2s clockwise gold rim.
+ *  - 4 independent randomized branching sky lightning bolts + cloud flashes + storm rain + breathing runes +
+ *    free-flying Raven across the entire valley.
  */
 class ThorMjolnirScreensaverView @JvmOverloads constructor(
     context: Context,
@@ -44,7 +46,7 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
 
     companion object {
         private const val GOLD_SHADOW = 0xFF3A2203.toInt()
-        private const val GOLD_WARM = 0xFFD4A234.toInt()
+        private const val GOLD_WARM = 0xFFEAB308.toInt()
         private const val GOLD_GLINT = 0xFFFEF08A.toInt()
     }
 
@@ -61,6 +63,9 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
     private val ringMatrix = Matrix()
 
     private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val dimBgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply { alpha = 110 }
+    private val seamFadePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val outerGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = GOLD_SHADOW }
     private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = GOLD_WARM }
     private val bevelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = GOLD_GLINT }
@@ -82,42 +87,47 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
     private val innerClipRect = RectF()
     private val frameRect = RectF()
     private val outerRect = RectF()
+    private val outerBevelRect = RectF()
     private val innerBevelRect = RectF()
     private val drawDstRect = RectF()
+    private val backdropRect = RectF()
 
     private data class DustMote(
         val pos01: Float,
-        val radialOffDp: Float,
+        val bandFrac: Float,
         val radiusDp: Float,
         val speed: Float,
         val dir: Float,
         val twinklePhase: Float,
         val bright: Boolean,
+        val hasHalo: Boolean,
     )
 
-    private val dustMotes = List(135) { idx ->
+    private val dustMotes = List(260) { idx ->
         val h1 = (idx * 37 + 11) % 97
         val h2 = (idx * 53 + 23) % 89
         val h3 = (idx * 71 + 7) % 83
+        val band = Math.pow((h2 / 89.0), 1.25).toFloat()
         DustMote(
-            pos01 = (idx.toFloat() / 135f) + (h1 / 97f) * 0.008f,
-            radialOffDp = 1.4f + Math.pow((h2 / 89.0), 1.35).toFloat() * 7.8f,
-            radiusDp = if (h3 < 18) 2.0f else if (h3 < 55) 1.32f else 0.85f,
-            speed = 0.009f + (h1 / 97f) * 0.025f,
+            pos01 = (idx.toFloat() / 260f) + (h1 / 97f) * 0.006f,
+            bandFrac = 0.08f + band * 0.84f,
+            radiusDp = if (h3 < 20) 2.55f else if (h3 < 58) 1.65f else 1.0f,
+            speed = 0.010f + (h1 / 97f) * 0.024f,
             dir = if (idx % 2 == 0) 1f else -1f, // Dual-direction CW & CCW
             twinklePhase = (h3 / 83f) * (2f * PI.toFloat()),
-            bright = h2 > 44,
+            bright = h2 > 36,
+            hasHalo = h3 < 28,
         )
     }
 
     private data class RainDrop(var x: Float, var y: Float, val len: Float, val speed: Float, val alpha: Float)
-    private val rainDrops = List(68) {
+    private val rainDrops = List(70) {
         RainDrop(
             x = rng.nextFloat(),
             y = rng.nextFloat(),
             len = 0.020f + rng.nextFloat() * 0.030f,
             speed = 0.70f + rng.nextFloat() * 0.55f,
-            alpha = 0.055f + rng.nextFloat() * 0.095f,
+            alpha = 0.06f + rng.nextFloat() * 0.095f,
         )
     }
 
@@ -177,14 +187,13 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
     private val bolts = List(4) { i ->
         BoltSlot(
             slot = i,
-            nextAtMs = startElapsedMs + 1400L + i * 2000L + rng.nextLong(2200L),
+            nextAtMs = startElapsedMs + 1100L + i * 1800L + rng.nextLong(2200L),
             startedAtMs = -99999L,
             durationMs = 400L,
             geom = buildBoltGeometry(i),
         )
     }
 
-    // Free-flying Raven Bezier state
     private var p0x = 0.14f; private var p0y = 0.28f
     private var p1x = 0.38f; private var p1y = 0.12f
     private var p2x = 0.68f; private var p2y = 0.52f
@@ -232,7 +241,7 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         startElapsedMs = SystemClock.elapsedRealtime()
         lastFrameMs = startElapsedMs
         for (i in bolts.indices) {
-            bolts[i].nextAtMs = startElapsedMs + 1200L + i * 1900L + rng.nextLong(2200L)
+            bolts[i].nextAtMs = startElapsedMs + 1000L + i * 1700L + rng.nextLong(2100L)
         }
         postInvalidateOnAnimation()
     }
@@ -272,15 +281,10 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             ex = 0.08f + rng.nextFloat() * 0.84f
             ey = 0.09f + rng.nextFloat() * 0.76f
         }
-        p0x = sx; p0y = sy
-        p1x = c1x; p1y = c1y
-        p2x = 0.10f + rng.nextFloat() * 0.80f
-        p2y = 0.08f + rng.nextFloat() * 0.76f
-        p3x = ex; p3y = ey
-        segT = 0f
-        segDur = 3.6f + rng.nextFloat() * 3.4f
-        depth0 = depth1
-        depth1 = 0.56f + (ey * 0.42f) + rng.nextFloat() * 0.18f
+        p0x = sx; p0y = sy; p1x = c1x; p1y = c1y
+        p2x = 0.10f + rng.nextFloat() * 0.80f; p2y = 0.08f + rng.nextFloat() * 0.76f
+        p3x = ex; p3y = ey; segT = 0f; segDur = 3.6f + rng.nextFloat() * 3.4f
+        depth0 = depth1; depth1 = 0.56f + (ey * 0.42f) + rng.nextFloat() * 0.18f
     }
 
     private fun evalCubic(t: Float, a: Float, b: Float, c: Float, d: Float): Float {
@@ -328,19 +332,19 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         flarePaint.shader = RadialGradient(
             x, y, radius,
             intArrayOf(
-                Color.argb((alpha01 * 248f).toInt().coerceIn(0, 255), 255, 253, 230),
-                Color.argb((alpha01 * 180f).toInt().coerceIn(0, 255), 254, 240, 138),
-                Color.argb((alpha01 * 62f).toInt().coerceIn(0, 255), 212, 162, 52),
+                Color.argb((alpha01 * 252f).toInt().coerceIn(0, 255), 255, 254, 238),
+                Color.argb((alpha01 * 205f).toInt().coerceIn(0, 255), 254, 240, 138),
+                Color.argb((alpha01 * 76f).toInt().coerceIn(0, 255), 234, 179, 8),
                 Color.TRANSPARENT,
             ),
-            floatArrayOf(0f, 0.22f, 0.55f, 1f),
+            floatArrayOf(0f, 0.24f, 0.58f, 1f),
             Shader.TileMode.CLAMP,
         )
         canvas.drawCircle(x, y, radius, flarePaint)
-        spikePaint.color = Color.argb((alpha01 * 225f).toInt().coerceIn(0, 255), 255, 252, 224)
-        spikePaint.strokeWidth = max(dp(0.9f), radius * 0.048f)
-        val sLong = radius * 1.42f
-        val sShort = radius * 0.85f
+        spikePaint.color = Color.argb((alpha01 * 240f).toInt().coerceIn(0, 255), 255, 253, 230)
+        spikePaint.strokeWidth = max(dp(1.2f), radius * 0.055f)
+        val sLong = radius * 1.60f
+        val sShort = radius * 0.94f
         canvas.drawLine(x - sLong, y, x + sLong, y, spikePaint)
         canvas.drawLine(x, y - sShort, x, y + sShort, spikePaint)
     }
@@ -356,41 +360,48 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         val elapsed = (now - startElapsedMs).coerceAtLeast(0L)
         val tSec = elapsed / 1000f
 
+        // REAL OBSIDIAN BORDER MARGIN + BOLD 24K GOLD FRAME SO OUTER GOLD DUST SHINES CLEARLY!
         val minDim = min(w, h)
-        val outerPad = max(dp(10f), minDim * 0.026f)
-        val ringThick = max(dp(3.4f), minDim * 0.0086f)
-        val cornerR = max(dp(16f), minDim * 0.032f)
+        val outerPad = max(dp(26f), minDim * 0.068f)
+        val ringThick = max(dp(7.2f), minDim * 0.0185f)
+        val cornerR = max(dp(20f), minDim * 0.042f)
 
         frameRect.set(outerPad, outerPad, w - outerPad, h - outerPad)
         outerRect.set(
-            frameRect.left - ringThick * 0.55f,
-            frameRect.top - ringThick * 0.55f,
-            frameRect.right + ringThick * 0.55f,
-            frameRect.bottom + ringThick * 0.55f,
+            frameRect.left - ringThick * 0.52f,
+            frameRect.top - ringThick * 0.52f,
+            frameRect.right + ringThick * 0.52f,
+            frameRect.bottom + ringThick * 0.52f,
+        )
+        outerBevelRect.set(
+            frameRect.left - ringThick * 0.26f,
+            frameRect.top - ringThick * 0.26f,
+            frameRect.right + ringThick * 0.26f,
+            frameRect.bottom + ringThick * 0.26f,
         )
         innerBevelRect.set(
-            frameRect.left + ringThick * 0.52f,
-            frameRect.top + ringThick * 0.52f,
-            frameRect.right - ringThick * 0.52f,
-            frameRect.bottom - ringThick * 0.52f,
+            frameRect.left + ringThick * 0.34f,
+            frameRect.top + ringThick * 0.34f,
+            frameRect.right - ringThick * 0.34f,
+            frameRect.bottom - ringThick * 0.34f,
         )
         innerClipRect.set(
-            frameRect.left + ringThick * 0.35f,
-            frameRect.top + ringThick * 0.35f,
-            frameRect.right - ringThick * 0.35f,
-            frameRect.bottom - ringThick * 0.35f,
+            frameRect.left + ringThick * 0.30f,
+            frameRect.top + ringThick * 0.30f,
+            frameRect.right - ringThick * 0.30f,
+            frameRect.bottom - ringThick * 0.30f,
         )
 
-        // 0. Deep obsidian void behind outer gold dust halo
-        canvas.drawColor(0xFF040509.toInt())
+        // 0. Pure obsidian background behind outer gold dust
+        canvas.drawColor(0xFF020305.toInt())
 
-        // 1. Clipped Ultra-HD Valley Master (auto-selects Wide in Landscape, Tall in Portrait)
+        // 1. Clipped Inner Viewport: UNCROPPED VALLEY ARTWORK (Full Mjolnir & Mountains in BOTH Orientations!)
         canvas.save()
         clipPath.reset()
         clipPath.addRoundRect(
             innerClipRect,
-            (cornerR - dp(2f)).coerceAtLeast(4f),
-            (cornerR - dp(2f)).coerceAtLeast(4f),
+            (cornerR - dp(2f)).coerceAtLeast(6f),
+            (cornerR - dp(2f)).coerceAtLeast(6f),
             Path.Direction.CW,
         )
         canvas.clipPath(clipPath)
@@ -399,27 +410,54 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         val fh = innerClipRect.height()
         val activeBg = if (w >= h) (wideValleyBmp ?: tallValleyBmp) else (tallValleyBmp ?: wideValleyBmp)
         activeBg?.let { bg ->
-            val scale = max(fw / bg.width.toFloat(), fh / bg.height.toFloat()) * 1.022f
-            val dw = bg.width * scale
-            val dh = bg.height * scale
+            // Dimmed full-bleed backdrop eliminates hard black bars on ultra-wide phone landscape (3088x1440)
+            val covScale = max(fw / bg.width.toFloat(), fh / bg.height.toFloat())
+            val cw = bg.width * covScale
+            val ch = bg.height * covScale
+            backdropRect.set(
+                innerClipRect.left + (fw - cw) * 0.5f,
+                innerClipRect.top + (fh - ch) * 0.5f,
+                innerClipRect.left + (fw + cw) * 0.5f,
+                innerClipRect.top + (fh + ch) * 0.5f,
+            )
+            canvas.drawBitmap(bg, null, backdropRect, dimBgPaint)
+
+            // Primary sharp uncropped vertical-fit valley (NEVER crops Mjolnir's top or pedestal base!)
+            val fitScale = fh / bg.height.toFloat()
+            val dw = bg.width * fitScale
+            val dh = bg.height * fitScale
             val maxPanX = max(0f, (dw - fw) * 0.5f)
-            val maxPanY = max(0f, (dh - fh) * 0.5f)
-            val panX = sin(tSec * 0.09f) * maxPanX * 0.65f
-            val panY = cos(tSec * 0.07f) * maxPanY * 0.55f
+            val panX = sin(tSec * 0.08f) * maxPanX * 0.45f
             val left = innerClipRect.left + (fw - dw) * 0.5f + panX
-            val top = innerClipRect.top + (fh - dh) * 0.5f + panY
+            val top = innerClipRect.top + (fh - dh) * 0.5f
             drawDstRect.set(left, top, left + dw, top + dh)
             canvas.drawBitmap(bg, null, drawDstRect, bmpPaint)
+
+            // Soft feathered storm-shadow seam on left/right when screen is wider than 16:9 (phone landscape)
+            if (dw < fw - 4f) {
+                val seamW = min(dp(42f), dw * 0.12f)
+                seamFadePaint.shader = LinearGradient(
+                    left, 0f, left + seamW, 0f,
+                    Color.argb(195, 6, 10, 18), Color.TRANSPARENT, Shader.TileMode.CLAMP,
+                )
+                canvas.drawRect(left, innerClipRect.top, left + seamW, innerClipRect.bottom, seamFadePaint)
+
+                seamFadePaint.shader = LinearGradient(
+                    left + dw - seamW, 0f, left + dw, 0f,
+                    Color.TRANSPARENT, Color.argb(195, 6, 10, 18), Shader.TileMode.CLAMP,
+                )
+                canvas.drawRect(left + dw - seamW, innerClipRect.top, left + dw, innerClipRect.bottom, seamFadePaint)
+            }
         }
 
-        // 2. 4 INDEPENDENT BRANCHING SKY LIGHTNING BOLTS & ATMOSPHERIC STORM FLASHES
+        // 2. 4 INDEPENDENT BRANCHING SKY LIGHTNING BOLTS & STORM CLOUD FLASHES
         var peakFlash = 0f
         for (b in bolts) {
             if (now >= b.nextAtMs) {
                 b.startedAtMs = now
                 b.durationMs = 310L + rng.nextLong(240L)
                 b.geom = buildBoltGeometry(b.slot)
-                b.nextAtMs = now + 2400L + rng.nextLong(5600L)
+                b.nextAtMs = now + 2200L + rng.nextLong(5200L)
             }
             val age = now - b.startedAtMs
             if (age in 0L..b.durationMs) {
@@ -435,28 +473,28 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
                     val ox = innerClipRect.left + b.geom.originX * fw
                     val oy = innerClipRect.top + b.geom.originY * fh
                     skyFlashPaint.shader = RadialGradient(
-                        ox, oy, minDim * 0.70f,
-                        if (b.geom.isWarmGold) Color.argb((env * 78f).toInt().coerceIn(0, 110), 254, 243, 199)
-                        else Color.argb((env * 82f).toInt().coerceIn(0, 115), 224, 242, 254),
+                        ox, oy, minDim * 0.72f,
+                        if (b.geom.isWarmGold) Color.argb((env * 88f).toInt().coerceIn(0, 125), 254, 243, 199)
+                        else Color.argb((env * 92f).toInt().coerceIn(0, 130), 224, 242, 254),
                         Color.TRANSPARENT,
                         Shader.TileMode.CLAMP,
                     )
                     canvas.drawRect(innerClipRect, skyFlashPaint)
 
                     boltHaloPaint.color = if (b.geom.isWarmGold) {
-                        Color.argb((env * 110f).toInt().coerceIn(0, 150), 253, 224, 71)
+                        Color.argb((env * 120f).toInt().coerceIn(0, 165), 253, 224, 71)
                     } else {
-                        Color.argb((env * 115f).toInt().coerceIn(0, 155), 147, 197, 253)
+                        Color.argb((env * 125f).toInt().coerceIn(0, 170), 147, 197, 253)
                     }
-                    boltCorePaint.color = Color.argb((env * 245f).toInt().coerceIn(0, 255), 255, 255, 248)
+                    boltCorePaint.color = Color.argb((env * 250f).toInt().coerceIn(0, 255), 255, 255, 248)
 
-                    boltHaloPaint.strokeWidth = max(dp(3.4f), minDim * 0.0095f)
-                    boltCorePaint.strokeWidth = max(dp(1.1f), minDim * 0.0026f)
+                    boltHaloPaint.strokeWidth = max(dp(3.6f), minDim * 0.010f)
+                    boltCorePaint.strokeWidth = max(dp(1.2f), minDim * 0.0028f)
                     drawPolyline(canvas, b.geom.trunk, innerClipRect.left, innerClipRect.top, fw, fh, boltHaloPaint)
                     drawPolyline(canvas, b.geom.trunk, innerClipRect.left, innerClipRect.top, fw, fh, boltCorePaint)
 
-                    boltHaloPaint.strokeWidth = max(dp(2.0f), minDim * 0.0052f)
-                    boltCorePaint.strokeWidth = max(dp(0.7f), minDim * 0.0015f)
+                    boltHaloPaint.strokeWidth = max(dp(2.1f), minDim * 0.0054f)
+                    boltCorePaint.strokeWidth = max(dp(0.75f), minDim * 0.0016f)
                     for (br in b.geom.branches) {
                         drawPolyline(canvas, br, innerClipRect.left, innerClipRect.top, fw, fh, boltHaloPaint)
                         drawPolyline(canvas, br, innerClipRect.left, innerClipRect.top, fw, fh, boltCorePaint)
@@ -465,34 +503,31 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             }
         }
 
-        // 3. BREATHING GOLDEN PEDESTAL RUNE AURA + FINE STORM RAIN STREAKS
+        // 3. BREATHING GOLDEN PEDESTAL RUNE AURA + FINE STORM RAIN
         val runePulse = 0.55f + 0.45f * sin(tSec * 1.9f)
         val rcx = innerClipRect.left + fw * 0.50f
         val rcy = innerClipRect.top + fh * 0.62f
         runeAuraPaint.shader = RadialGradient(
             rcx, rcy, minDim * 0.24f,
-            Color.argb(((0.07f + 0.09f * runePulse) * 255f).toInt().coerceIn(0, 80), 254, 215, 102),
+            Color.argb(((0.07f + 0.09f * runePulse) * 255f).toInt().coerceIn(0, 82), 254, 215, 102),
             Color.TRANSPARENT,
             Shader.TileMode.CLAMP,
         )
         canvas.drawRect(innerClipRect, runeAuraPaint)
 
-        rainPaint.strokeWidth = max(1f, dp(0.55f))
+        rainPaint.strokeWidth = max(1f, dp(0.6f))
         for (rd in rainDrops) {
-            rd.y += rd.speed * dt
-            rd.x += rd.speed * dt * 0.16f
+            rd.y += rd.speed * dt; rd.x += rd.speed * dt * 0.16f
             if (rd.y > 1.05f) { rd.y = -0.05f; rd.x = rng.nextFloat() }
             if (rd.x > 1.05f) rd.x -= 1.05f
             val x1 = innerClipRect.left + rd.x * fw
             val y1 = innerClipRect.top + rd.y * fh
-            val x2 = x1 + rd.len * fh * 0.16f
-            val y2 = y1 + rd.len * fh
-            val a = (rd.alpha * (1f + peakFlash * 1.8f) * 255f).toInt().coerceIn(0, 110)
+            val a = (rd.alpha * (1f + peakFlash * 1.8f) * 255f).toInt().coerceIn(0, 115)
             rainPaint.color = Color.argb(a, 220, 232, 248)
-            canvas.drawLine(x1, y1, x2, y2, rainPaint)
+            canvas.drawLine(x1, y1, x1 + rd.len * fh * 0.16f, y1 + rd.len * fh, rainPaint)
         }
 
-        // 4. FREE-FLYING RAVEN ACROSS THE FULL SCREEN
+        // 4. FREE-FLYING RAVEN ACROSS THE ENTIRE VALLEY
         segT += dt / segDur
         if (segT >= 1f) pickNextFlightSegment()
         val prevX = ravenX; val prevY = ravenY
@@ -506,31 +541,22 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         smoothPitchDeg += (targetPitchDeg - smoothPitchDeg) * min(1f, dt * 6f)
 
         nextGlideIn -= dt
-        if (!gliding && nextGlideIn <= 0f) {
-            gliding = true
-            glideTimer = 0.95f + rng.nextFloat() * 1.4f
-        }
+        if (!gliding && nextGlideIn <= 0f) { gliding = true; glideTimer = 0.95f + rng.nextFloat() * 1.4f }
         if (gliding) {
             glideTimer -= dt
-            if (glideTimer <= 0f) {
-                gliding = false
-                nextGlideIn = 2.5f + rng.nextFloat() * 2.8f
-            }
+            if (glideTimer <= 0f) { gliding = false; nextGlideIn = 2.5f + rng.nextFloat() * 2.8f }
         } else {
-            val flapRate = if (vy < -0.02f) 2.45f else 1.85f
-            wingPhase = (wingPhase + dt * flapRate) % 1f
+            wingPhase = (wingPhase + dt * (if (vy < -0.02f) 2.45f else 1.85f)) % 1f
         }
 
         val frameIdx = if (gliding) 1 else when ((wingPhase * 4f).toInt().coerceIn(0, 3)) {
-            0 -> 0
-            2 -> 2
-            else -> 1
+            0 -> 0; 2 -> 2; else -> 1
         }
         val wingScaleY = if (gliding) 1f else (0.94f + 0.08f * sin(wingPhase * 2f * PI.toFloat()))
         val birdBmp = flyFrames.getOrNull(frameIdx) ?: flyFrames.firstOrNull { it != null }
         if (birdBmp != null) {
             val depth = depth0 + (depth1 - depth0) * segT
-            val sizePx = minDim * 0.28f * depth
+            val sizePx = minDim * 0.27f * depth
             val cx = innerClipRect.left + ravenX * fw
             val cy = innerClipRect.top + ravenY * fh
             canvas.save()
@@ -544,10 +570,41 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
 
         canvas.restore() // end inner valley clip
 
-        // 5. ROTATING 24K GOLDEN PERIMETER FRAME + OPPOSING STAR GLINTS + DUAL-DIRECTION DUST (ZERO DRIPPING)
+        // 5. BOLD 24K GOLDEN PERIMETER FRAME + WARM HALO + 260 DUAL-DIRECTION OUTER GOLD DUST + STAR FLARES
         val pulse = 0.72f + 0.28f * sin(tSec * 2.1f)
-        shadowPaint.strokeWidth = ringThick * 1.48f
-        canvas.drawRoundRect(outerRect, cornerR + dp(1.5f), cornerR + dp(1.5f), shadowPaint)
+        val dustSpan = max(dp(12f), outerPad - ringThick * 0.65f)
+
+        // 5a. Warm golden ambient glow halo outside the frame
+        outerGlowPaint.color = Color.argb(((0.22f + 0.08f * pulse) * 255f).toInt().coerceIn(0, 100), 234, 179, 8)
+        outerGlowPaint.strokeWidth = ringThick * 2.1f
+        canvas.drawRoundRect(outerRect, cornerR + dp(2f), cornerR + dp(2f), outerGlowPaint)
+
+        // 5b. 260 Sparkling Gold Dust Grains visibly orbiting BOTH directions strictly outside the gold frame
+        for (dm in dustMotes) {
+            val p01 = dm.pos01 + dm.dir * dm.speed * tSec
+            val off = dm.bandFrac * dustSpan
+            val (px, py) = pointOnRoundedRect(
+                p01,
+                outerRect.left - off,
+                outerRect.top - off,
+                outerRect.right + off,
+                outerRect.bottom + off,
+                cornerR + off * 0.28f,
+            )
+            val tw = 0.34f + 0.66f * (0.5f + 0.5f * sin(tSec * 3.6f + dm.twinklePhase))
+            val rPx = dp(dm.radiusDp)
+            if (dm.hasHalo) {
+                dustPaint.color = Color.argb((tw * 80f).toInt().coerceIn(0, 100), 234, 179, 8)
+                canvas.drawCircle(px, py, rPx * 2.3f, dustPaint)
+            }
+            dustPaint.color = if (dm.bright) GOLD_GLINT else GOLD_WARM
+            dustPaint.alpha = (tw * (if (dm.bright) 250f else 205f)).toInt().coerceIn(0, 255)
+            canvas.drawCircle(px, py, rPx, dustPaint)
+        }
+
+        // 5c. Deep bronze shadow recess + bold 18.2s clockwise rotating metallic 24k gold rim + specular bevels
+        shadowPaint.strokeWidth = ringThick * 1.24f
+        canvas.drawRoundRect(frameRect, cornerR, cornerR, shadowPaint)
 
         val ringPhase = (elapsed % 18200L).toFloat() / 18200f
         updateScrolledRingStrip(ringPhase)
@@ -562,36 +619,24 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             framePaint.shader = null
             framePaint.color = GOLD_WARM
         }
-        framePaint.alpha = (255f * (0.94f + 0.06f * pulse)).toInt().coerceIn(0, 255)
+        framePaint.alpha = (255f * (0.96f + 0.04f * pulse)).toInt().coerceIn(0, 255)
         framePaint.strokeWidth = ringThick
         canvas.drawRoundRect(frameRect, cornerR, cornerR, framePaint)
 
-        bevelPaint.strokeWidth = max(dp(0.9f), ringThick * 0.22f)
-        bevelPaint.alpha = (120 + (68 * pulse).toInt()).coerceIn(0, 255)
-        canvas.drawRoundRect(innerBevelRect, (cornerR - dp(1.5f)).coerceAtLeast(2f), (cornerR - dp(1.5f)).coerceAtLeast(2f), bevelPaint)
+        bevelPaint.strokeWidth = max(dp(1.2f), ringThick * 0.16f)
+        bevelPaint.alpha = (145 + (65 * pulse).toInt()).coerceIn(0, 255)
+        canvas.drawRoundRect(outerBevelRect, cornerR + dp(1f), cornerR + dp(1f), bevelPaint)
 
-        for (dm in dustMotes) {
-            val p01 = dm.pos01 + dm.dir * dm.speed * tSec
-            val off = dp(dm.radialOffDp)
-            val (px, py) = pointOnRoundedRect(
-                p01,
-                outerRect.left - off,
-                outerRect.top - off,
-                outerRect.right + off,
-                outerRect.bottom + off,
-                cornerR + off * 0.32f,
-            )
-            val tw = 0.28f + 0.72f * (0.5f + 0.5f * sin(tSec * 3.5f + dm.twinklePhase))
-            dustPaint.color = if (dm.bright) GOLD_GLINT else GOLD_WARM
-            dustPaint.alpha = (tw * (if (dm.bright) 245f else 185f)).toInt().coerceIn(0, 255)
-            canvas.drawCircle(px, py, dp(dm.radiusDp), dustPaint)
-        }
+        bevelPaint.strokeWidth = max(dp(1.2f), ringThick * 0.18f)
+        bevelPaint.alpha = (165 + (68 * pulse).toInt()).coerceIn(0, 255)
+        canvas.drawRoundRect(innerBevelRect, (cornerR - dp(2f)).coerceAtLeast(4f), (cornerR - dp(2f)).coerceAtLeast(4f), bevelPaint)
 
-        val flareRadius = max(dp(12f), minDim * 0.032f)
-        val (gxA, gyA) = pointOnRoundedRect(ringPhase + 0.11f, frameRect.left, frameRect.top, frameRect.right, frameRect.bottom, cornerR)
-        val (gxB, gyB) = pointOnRoundedRect(ringPhase + 0.61f, frameRect.left, frameRect.top, frameRect.right, frameRect.bottom, cornerR)
-        drawStarFlare(canvas, gxA, gyA, flareRadius, 0.78f + 0.22f * pulse)
-        drawStarFlare(canvas, gxB, gyB, flareRadius * 0.92f, 0.72f + 0.22f * (1f - pulse * 0.5f))
+        // Two opposing bright 4-point star-flare glints gliding along the gold rim
+        val flareRadius = max(dp(16f), minDim * 0.046f)
+        val (gxA, gyA) = pointOnRoundedRect(ringPhase + 0.08f, frameRect.left, frameRect.top, frameRect.right, frameRect.bottom, cornerR)
+        val (gxB, gyB) = pointOnRoundedRect(ringPhase + 0.58f, frameRect.left, frameRect.top, frameRect.right, frameRect.bottom, cornerR)
+        drawStarFlare(canvas, gxA, gyA, flareRadius, 0.85f + 0.15f * pulse)
+        drawStarFlare(canvas, gxB, gyB, flareRadius * 0.94f, 0.78f + 0.18f * (1f - pulse * 0.4f))
 
         if (running) postInvalidateOnAnimation()
     }
