@@ -26,6 +26,11 @@ android {
             }
         }
     }
+    packaging {
+        jniLibs {
+            pickFirsts += listOf("lib/x86/libonnxruntime.so")
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -59,6 +64,9 @@ dependencies {
 
     // On-device wake word (openWakeWord models run through ONNX Runtime).
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
+
+    // WO-210: On-device Kyutai Pocket-TTS INT8 (Michael Caine offline voice)
+    implementation(files("libs/sherpa-onnx-static-link-onnxruntime-2.0.2.aar"))
 
     // On-device Gemma 4 E2B multimodal runtime (Audio + Text)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.19.0")

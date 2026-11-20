@@ -37,6 +37,7 @@ class ThorLocalBrain(private val context: Context) {
     private val isInitializing = AtomicBoolean(false)
     private var engine: Engine? = null
     private var tts: TextToSpeech? = null
+    private val pocketCaine = ThorPocketCaineEngine(context)
     @Volatile
     private var ttsReady = false
 
@@ -202,12 +203,22 @@ class ThorLocalBrain(private val context: Context) {
         onStart: (() -> Unit)? = null,
         onDone: (() -> Unit)? = null
     ) {
+        // WO-210 Primary: On-Device Michael Caine Pocket-TTS INT8 (alfred_headroom_1A.wav)
+        if (pocketCaine.isModelAvailable()) {
+            val spokeCaine = pocketCaine.speakBlocking(text, onStart, onDone)
+            if (spokeCaine) return
+            Log.w(TAG, "Pocket-TTS INT8 fallback triggered -> using system British TTS")
+        }
+        // Safety fallback: system UK TTS with Centh -> Kent phonetics
         val engineTts = tts
         if (!ttsReady || engineTts == null) {
             onStart?.invoke()
             onDone?.invoke()
             return
         }
+        val spoken = text
+            .replace(Regex("\\bCenth's\\b", RegexOption.IGNORE_CASE), "Kent's")
+            .replace(Regex("\\bCenth\\b", RegexOption.IGNORE_CASE), "Kent")
         val utteranceId = UUID.randomUUID().toString()
         engineTts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {
@@ -221,7 +232,7 @@ class ThorLocalBrain(private val context: Context) {
                 onDone?.invoke()
             }
         })
-        engineTts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        engineTts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
 
     private fun wrapPcm16MonoInWav(pcmData: ByteArray, sampleRate: Int): ByteArray {
@@ -249,6 +260,7 @@ class ThorLocalBrain(private val context: Context) {
     }
 
     fun shutdown() {
+        try { pocketCaine.release() } catch (_: Exception) {}
         try {
             tts?.stop()
             tts?.shutdown()

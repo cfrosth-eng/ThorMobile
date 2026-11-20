@@ -106,6 +106,7 @@ class FloatingThorService : Service() {
         @Volatile var userRequestedStop = false
         @Volatile var serviceCreatedElapsedMs = 0L
         private const val BRIDGE_URL = "wss://thor-api-443941171993.us-east4.run.app"
+        private const val TETHER_AUTH_TOKEN = "9d943a8005992357c7d6ca29278e803b80521c4d0d703e1ad74fb141ac050d19"
         // Single-Cloud Architecture (V25.2): Direct connection to primary thor-api only
         private const val END_SESSION_TEXT = "END_SESSION"
         private const val END_DRAIN_MAX_MS = 28_000L
@@ -269,6 +270,8 @@ class FloatingThorService : Service() {
     private val outboxExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var offlineModeActive = false
     @Volatile private var valleyReconnectAttempts = 0
+    @Volatile private var activeConnectionTier = 3 // 3=Cloud, 2=Laptop Tether, 1=Phone Standalone
+    private val tierProbeExecutor = Executors.newSingleThreadExecutor()
     private val offlineTurnBuffer = java.io.ByteArrayOutputStream()
     private val currentTurnPcm = java.io.ByteArrayOutputStream()
     @Volatile private var turnSpeechDetected = false
@@ -1193,18 +1196,45 @@ class FloatingThorService : Service() {
             }
         }
         Log.i(TAG_AUDIO, "Entered Offline Local Brain session (session=$id)")
-        mainHandler.post { toast("Offline Mode: Gemma 4 Local Brain listening...") }
+        mainHandler.post { toast("Tier 1 Offline: Gemma 4 + Michael Caine Voice listening...") }
+    }
+
+    private fun connectTier2OrTier1Offline(id: Int) {
+        tierProbeExecutor.execute {
+            if (id != activeSession || destroyed || isStandby) return@execute
+            val laptopUrl = ThorTetherDiscovery.discoverLaptopTetherUrl(TETHER_AUTH_TOKEN, 350)
+            if (laptopUrl != null) {
+                synchronized(lock) {
+                    if (id != activeSession || destroyed || isStandby) return@execute
+                    micSettling = false
+                    activeConnectionTier = 2
+                    val req = Request.Builder()
+                        .url(laptopUrl)
+                        .addHeader("X-Thor-Token", TETHER_AUTH_TOKEN)
+                        .build()
+                    webSocket = okHttpClient.newWebSocket(req, BridgeListener(id))
+                }
+                Log.i(TAG_WS, "[WO-210 TIER-2] Auto-tethered to Dell XPS local engine: $laptopUrl")
+                mainHandler.post { toast("Tier 2 Tether: Linked to Dell XPS (12B + Michael Caine)") }
+            } else {
+                activeConnectionTier = 1
+                valleyReconnectAttempts = 0
+                enterOfflineLocalSession(id)
+            }
+        }
     }
 
     private fun openBridgeSocket(id: Int) {
-        if (!networkSentinel.isConnected && valleyReconnectAttempts >= 6) {
-            valleyReconnectAttempts = 0
-            enterOfflineLocalSession(id)
+        // WO-210 Seamless 3-Tier Handover:
+        // Tier 3 (Cloud) when online -> Tier 2 (Dell XPS USB/Hotspot Tether) -> Tier 1 (Phone Gemma 4 E2B + Michael Caine INT8)
+        if (!networkSentinel.isConnected || valleyReconnectAttempts >= 2) {
+            connectTier2OrTier1Offline(id)
             return
         }
         synchronized(lock) {
             if (id != activeSession || destroyed) return
             micSettling = false
+            activeConnectionTier = 3
             val targetUrl = BRIDGE_URL
             val request = Request.Builder()
                 .url(targetUrl)
@@ -1680,7 +1710,8 @@ class FloatingThorService : Service() {
                         // HILL-HOPPER VALLEY RECOVERY:
                         // Keep activeSession & microphone capture running into preRoll for up to 12 reconnect attempts (~14 seconds)
                         // so when Boss crests the next hill, preRoll bursts the entire uninterrupted sentence to thor-api!
-                        if (valleyReconnectAttempts <= 12) {
+                        val maxRetries = if (activeConnectionTier == 2 || !networkSentinel.isConnected) 0 else 2
+                        if (valleyReconnectAttempts <= maxRetries) {
                             val retryDelayMs = if (wasReady) 800L else 1100L
                             mainHandler.postDelayed({
                                 if (sessionId == activeSession && !socketReady && !offlineModeActive && !destroyed && !isStandby) {
@@ -1716,7 +1747,12 @@ class FloatingThorService : Service() {
                                 )
                             }
                         }
-                        enterOfflineLocalSession(sessionId)
+                        if (activeConnectionTier == 3) {
+                            connectTier2OrTier1Offline(sessionId)
+                        } else {
+                            activeConnectionTier = 1
+                            enterOfflineLocalSession(sessionId)
+                        }
                     }
                     }
             }
