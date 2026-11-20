@@ -113,24 +113,27 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
         )
     }
 
-    // Physical-pixel constant-speed 3D Raven state (identical smooth flight in Portrait & Landscape!)
+    // WO-219: Natural 3D Corvid Flight Engine (scene-proportional sizing, 100% solid opaque feathers,
+    // genuine Far<->Close 3D perspective depth & flap-then-soar bird rhythm — Gold frame 100% untouched)
     private var passDir = 1
-    private var ravenPxX = -150f
+    private var passMode = 0            // 0=Swoop-In, 1=Climb-Out, 2=Valley Arch (In & Out), 3=High Thermal Patrol
+    private var ravenPxX = -200f
     private var ravenPxY = 300f
-    private var startX = -150f
+    private var startX = -200f
     private var endX = 1600f
-    private var baseYFrac = 0.24f
-    private var slopeRatio = 0.04f     // Strictly shallow climb/dive (|dy/dx| <= 0.16 -> nose-first!)
-    private var waveAmpPx = 28f
-    private var wavePhase = 0f
-    private var depthStart = 0.44f
-    private var depthEnd = 0.98f
+    private var yStartFrac = 0.22f
+    private var yEndFrac = 0.26f
+    private var yArchFrac = 0.08f
+    private var depthStart = 0.30f
+    private var depthMid = 0.72f
+    private var depthEnd = 1.02f
     private var restCooldown = 0f
     private var smoothPitchDeg = 0f
     private var wingPhase = 0f
     private var gliding = false
     private var glideTimer = 0f
-    private var nextGlideIn = 2.4f
+    private var beatsRemaining = 4
+    private var prevCycleQuarter = 0
     private var needsInitialPass = true
     private var running = false
 
@@ -300,39 +303,56 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
     }
 
     private fun startFreshPhysicalPass(wf: Float, hf: Float, immediateVisible: Boolean) {
-        val diag = hypot(wf.toDouble(), hf.toDouble()).toFloat()
-        val marginPx = diag * 0.16f
+        val sceneRef = min(innerClipRect.width(), innerClipRect.height()).coerceAtLeast(320f)
+        val marginPx = sceneRef * 0.28f
         passDir = if (immediateVisible) 1 else (if (rng.nextBoolean()) 1 else -1)
         startX = if (passDir > 0) (innerClipRect.left - marginPx) else (innerClipRect.right + marginPx)
         endX = if (passDir > 0) (innerClipRect.right + marginPx) else (innerClipRect.left - marginPx)
-        ravenPxX = if (immediateVisible) (innerClipRect.left + innerClipRect.width() * 0.18f) else startX
-        restCooldown = if (immediateVisible) 0f else (0.9f + rng.nextFloat() * 1.4f)
+        ravenPxX = if (immediateVisible) (innerClipRect.left + innerClipRect.width() * 0.14f) else startX
+        restCooldown = if (immediateVisible) 0f else (1.0f + rng.nextFloat() * 1.8f)
 
-        when (rng.nextInt(3)) {
-            0 -> { // Distant mountain peaks -> close foreground swoop
-                depthStart = 0.38f + rng.nextFloat() * 0.12f
-                depthEnd = 0.90f + rng.nextFloat() * 0.18f
-                baseYFrac = 0.22f + rng.nextFloat() * 0.18f
+        passMode = if (immediateVisible) 2 else rng.nextInt(4)
+        when (passMode) {
+            0 -> { // Swoop-In: small over distant peaks -> majestic foreground pass
+                depthStart = 0.28f + rng.nextFloat() * 0.08f
+                depthMid = 0.62f + rng.nextFloat() * 0.12f
+                depthEnd = 0.96f + rng.nextFloat() * 0.12f
+                yStartFrac = 0.13f + rng.nextFloat() * 0.10f
+                yEndFrac = 0.26f + rng.nextFloat() * 0.14f
+                yArchFrac = -0.04f - rng.nextFloat() * 0.04f
             }
-            1 -> { // Close foreground entry -> receding into distant storm sky
-                depthStart = 0.90f + rng.nextFloat() * 0.18f
-                depthEnd = 0.38f + rng.nextFloat() * 0.12f
-                baseYFrac = 0.24f + rng.nextFloat() * 0.18f
+            1 -> { // Climb-Out: bold in foreground -> climbing & receding into storm sky
+                depthStart = 0.94f + rng.nextFloat() * 0.12f
+                depthMid = 0.60f + rng.nextFloat() * 0.12f
+                depthEnd = 0.28f + rng.nextFloat() * 0.08f
+                yStartFrac = 0.26f + rng.nextFloat() * 0.14f
+                yEndFrac = 0.12f + rng.nextFloat() * 0.10f
+                yArchFrac = 0.04f + rng.nextFloat() * 0.04f
             }
-            else -> { // Steady mid-valley patrol
-                val d = 0.56f + rng.nextFloat() * 0.22f
+            2 -> { // Valley Arch (Coming & Going): enters far -> swoops closer near center -> banks back out far!
+                depthStart = 0.30f + rng.nextFloat() * 0.08f
+                depthMid = 0.86f + rng.nextFloat() * 0.16f
+                depthEnd = 0.30f + rng.nextFloat() * 0.08f
+                yStartFrac = 0.15f + rng.nextFloat() * 0.12f
+                yEndFrac = 0.15f + rng.nextFloat() * 0.12f
+                yArchFrac = 0.10f + rng.nextFloat() * 0.06f
+            }
+            else -> { // High Mountain Thermal Soar: graceful mid-distance glide across valley
+                val d = 0.40f + rng.nextFloat() * 0.18f
                 depthStart = d
-                depthEnd = (d + (rng.nextFloat() - 0.5f) * 0.20f).coerceIn(0.42f, 0.88f)
-                baseYFrac = 0.18f + rng.nextFloat() * 0.24f
+                depthMid = (d + 0.12f).coerceAtMost(0.76f)
+                depthEnd = (d + (rng.nextFloat() - 0.5f) * 0.14f).coerceIn(0.32f, 0.72f)
+                yStartFrac = 0.14f + rng.nextFloat() * 0.18f
+                yEndFrac = (yStartFrac + (rng.nextFloat() - 0.5f) * 0.12f).coerceIn(0.11f, 0.36f)
+                yArchFrac = (rng.nextFloat() - 0.5f) * 0.10f
             }
         }
-        // Strictly shallow physical slope (max +/- 0.13 rise/run -> ~7.5 deg) so Raven ALWAYS flies nose-first!
-        slopeRatio = (rng.nextFloat() - 0.5f) * 0.24f
-        waveAmpPx = min(wf, hf) * (0.03f + rng.nextFloat() * 0.035f)
-        wavePhase = rng.nextFloat() * 2f * PI.toFloat()
+        ravenPxY = innerClipRect.top + innerClipRect.height() * yStartFrac
         smoothPitchDeg = 0f
         gliding = false
-        nextGlideIn = 2.0f + rng.nextFloat() * 1.8f
+        beatsRemaining = 3 + rng.nextInt(3)
+        prevCycleQuarter = 0
+        wingPhase = 0f
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -421,17 +441,20 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             }
         }
 
-        // 4. ROCK-STEADY TORSO-LOCKED, CROSS-FADED 3D AERODYNAMIC RAVEN (CONSTANT PHYSICAL SPEED!)
+        // 4. NATURAL 3D CORVID FLIGHT (100% SOLID OPAQUE, SCENE-PROPORTIONAL, FLAP-THEN-SOAR, COMING & GOING)
         if (restCooldown > 0f) {
             restCooldown -= dt
         } else {
+            val sceneRef = min(fw, fh).coerceAtLeast(320f)
             val totalDx = abs(endX - startX).coerceAtLeast(1f)
             val progress = (abs(ravenPxX - startX) / totalDx).coerceIn(0f, 1f)
-            val smoothP = progress * progress * (3f - 2f * progress)
-            val depth = depthStart + (depthEnd - depthStart) * smoothP
+            val u = 1f - progress
+            // Smooth quadratic Bezier depth curve -> true Far <-> Close coming-and-going perspective!
+            val depth = (u * u * depthStart + 2f * u * progress * depthMid + progress * progress * depthEnd)
+                .coerceIn(0.24f, 1.12f)
 
-            // Physical speed scales naturally with perspective depth (faster close up, slower far away)
-            val speedPx = diagDim * 0.155f * (0.55f + 0.65f * depth)
+            // True perspective velocity: slow & majestic when distant, brisk when swooping past foreground
+            val speedPx = sceneRef * 0.25f * (0.42f + 0.72f * depth)
             val prevX = ravenPxX
             val prevY = ravenPxY
             ravenPxX += passDir * speedPx * dt
@@ -439,60 +462,68 @@ class ThorMjolnirScreensaverView @JvmOverloads constructor(
             if ((passDir > 0 && ravenPxX >= endX) || (passDir < 0 && ravenPxX <= endX)) {
                 startFreshPhysicalPass(wf, hf, immediateVisible = false)
             } else {
-                val centerX = innerClipRect.left + fw * 0.5f
-                val baseY = innerClipRect.top + fh * baseYFrac
-                val waveY = sin(progress * PI.toFloat() * 1.4f + wavePhase) * waveAmpPx
-                val slopeY = (ravenPxX - centerX) * passDir * slopeRatio
-                ravenPxY = (baseY + slopeY + waveY).coerceIn(innerClipRect.top + fh * 0.08f, innerClipRect.top + fh * 0.56f)
+                // Smooth natural bird flight arc + gentle downstroke wing lift
+                val baseYFrac = yStartFrac + (yEndFrac - yStartFrac) * progress + sin(progress * PI.toFloat()) * yArchFrac
+                val liftBobPx = if (gliding) 0f else (sin(wingPhase * 2f * PI.toFloat()) * dp(2.8f) * depth)
+                val targetY = (innerClipRect.top + fh * baseYFrac + liftBobPx)
+                    .coerceIn(innerClipRect.top + fh * 0.07f, innerClipRect.top + fh * 0.56f)
+                ravenPxY = if (abs(ravenPxY - targetY) > fh * 0.25f) targetY else (ravenPxY + (targetY - ravenPxY) * min(1f, dt * 8.5f))
 
                 val vx = (ravenPxX - prevX) / dt
                 val vy = (ravenPxY - prevY) / dt
-                // Gentle aerodynamic climb/dive pitch (capped at +/-12.5 deg so bird ALWAYS flies cleanly nose-first!)
-                val targetPitch = (atan2(vy.toDouble(), max(40f, abs(vx)).toDouble()) * 180.0 / PI * 0.80)
-                    .toFloat().coerceIn(-12.5f, 12.5f)
-                smoothPitchDeg += (targetPitch - smoothPitchDeg) * min(1f, dt * 5f)
+                // Strictly beak-first climb/dive angle (gentle +/- 14 deg max — NEVER flies sideways!)
+                val targetPitch = (atan2(vy.toDouble(), max(60f, abs(vx)).toDouble()) * 180.0 / PI * 0.78)
+                    .toFloat().coerceIn(-14f, 14f)
+                smoothPitchDeg += (targetPitch - smoothPitchDeg) * min(1f, dt * 5.2f)
 
-                nextGlideIn -= dt
-                if (!gliding && nextGlideIn <= 0f) {
-                    gliding = true
-                    glideTimer = 1.4f + rng.nextFloat() * 1.6f
-                }
+                // Realistic corvid wingbeat rhythm: 3-5 crisp steady wingbeats -> majestic 1.4-2.8s outstretched glide
                 if (gliding) {
                     glideTimer -= dt
                     if (glideTimer <= 0f) {
                         gliding = false
-                        nextGlideIn = 2.2f + rng.nextFloat() * 2.2f
+                        beatsRemaining = if (vy < -15f) (4 + rng.nextInt(3)) else (3 + rng.nextInt(3))
+                        wingPhase = 0f
+                        prevCycleQuarter = 0
                     }
                 } else {
-                    wingPhase = (wingPhase + dt * 1.55f) % 1f
+                    val beatHz = if (vy < -12f) 2.25f else 1.95f
+                    wingPhase += dt * beatHz
+                    if (wingPhase >= 1f) {
+                        wingPhase -= 1f
+                        beatsRemaining--
+                        if (beatsRemaining <= 0) {
+                            gliding = true
+                            glideTimer = (if (vy > 8f) 1.9f else 1.3f) + rng.nextFloat() * 1.4f
+                        }
+                    }
                 }
 
-                // Continuous sine wing curve -> smooth cross-fade between torso-locked up / glide / down sprites!
-                val wingWave = if (gliding) 0f else sin(wingPhase * 2f * PI.toFloat())
-                val sizePx = diagDim * 0.155f * depth
-                val baseAlpha = (218 + (37 * ((depth - 0.35f) / 0.70f).coerceIn(0f, 1f))).toInt()
-                val flipX = if (passDir > 0) 1f else -1f
+                // Crisp discrete wing frame selection — 100% SOLID OPAQUE (alpha=255, ZERO ghosting/transparency!)
+                val activeBmp = if (gliding) {
+                    flyGlideBmp
+                } else {
+                    when ((wingPhase * 4f).toInt().coerceIn(0, 3)) {
+                        0 -> flyUpBmp
+                        2 -> flyDownBmp
+                        else -> flyGlideBmp
+                    }
+                } ?: flyGlideBmp
 
-                canvas.save()
-                canvas.translate(ravenPxX, ravenPxY)
-                canvas.scale(flipX, 1f)
-                canvas.rotate(smoothPitchDeg)
-                birdDstRect.set(-sizePx * 0.5f, -sizePx * 0.5f, sizePx * 0.5f, sizePx * 0.5f)
+                if (activeBmp != null) {
+                    // Scene-proportional sizing: identical realistic bird-to-valley scale in Portrait, Landscape & Laptop!
+                    val sizePx = sceneRef * 0.36f * depth
+                    val flipX = if (passDir > 0) 1f else -1f
+                    val bodyFlexY = if (gliding) 1f else (0.975f + 0.035f * cos(wingPhase * 2f * PI.toFloat()))
+                    ravenPaintA.alpha = 255
 
-                val gBmp = flyGlideBmp
-                val secBmp = if (wingWave >= 0f) flyUpBmp else flyDownBmp
-                val secWeight = abs(wingWave).coerceIn(0f, 1f)
-
-                if (gBmp != null && secBmp != null && secWeight > 0.02f) {
-                    ravenPaintA.alpha = (baseAlpha * (1f - secWeight * 0.85f)).toInt().coerceIn(0, 255)
-                    canvas.drawBitmap(gBmp, null, birdDstRect, ravenPaintA)
-                    ravenPaintB.alpha = (baseAlpha * secWeight).toInt().coerceIn(0, 255)
-                    canvas.drawBitmap(secBmp, null, birdDstRect, ravenPaintB)
-                } else if (gBmp != null) {
-                    ravenPaintA.alpha = baseAlpha
-                    canvas.drawBitmap(gBmp, null, birdDstRect, ravenPaintA)
+                    canvas.save()
+                    canvas.translate(ravenPxX, ravenPxY)
+                    canvas.scale(flipX, bodyFlexY)
+                    canvas.rotate(smoothPitchDeg)
+                    birdDstRect.set(-sizePx * 0.5f, -sizePx * 0.5f, sizePx * 0.5f, sizePx * 0.5f)
+                    canvas.drawBitmap(activeBmp, null, birdDstRect, ravenPaintA)
+                    canvas.restore()
                 }
-                canvas.restore()
             }
         }
 
