@@ -106,6 +106,28 @@
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="camera" />
+        <service
+            android:name=".ThorMjolnirDreamService"
+            android:exported="true"
+            android:label="Thor Mjolnir Storm"
+            android:permission="android.permission.BIND_DREAM_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.dreams.DreamService" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.dream"
+                android:resource="@xml/thor_mjolnir_dream" />
+        </service>
+
+        <activity
+            android:name=".ThorScreensaverActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize"
+            android:exported="true"
+            android:label="Thor Mjolnir Screensaver"
+            android:screenOrientation="fullSensor"
+            android:theme="@style/Theme.AppCompat.NoActionBar" />
+
     </application>
 
 </manifest>
