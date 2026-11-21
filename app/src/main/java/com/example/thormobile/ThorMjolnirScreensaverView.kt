@@ -1,547 +1,214 @@
 package com.example.thormobile
 
+import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
-import android.graphics.RadialGradient
-import android.graphics.RectF
-import android.graphics.Shader
-import android.os.SystemClock
 import android.util.AttributeSet
+import android.util.Log
+import android.view.MotionEvent
 import android.view.View
-import kotlin.math.PI
-import kotlin.math.abs
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.floor
-import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToInt
-import kotlin.math.sin
-import kotlin.random.Random
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import java.io.ByteArrayInputStream
 
 /**
- * WO-159 V4: Living Mjolnir Storm Universal Screensaver View (Note 20 Ultra Portrait & Landscape).
+ * WO-225 V5 Living Mjolnir Storm Universal Screensaver View (Note 20 Ultra Portrait + Landscape).
  *
- * Fixes verified from Boss's V3 visual test & exact sprite/aspect measurements:
- *  1. 1:1 ASPECT-LOCKED FLOATING-ICON GOLD BORDER (IDENTICAL IN PORTRAIT, LANDSCAPE & DELL XPS):
- *     - Dynamically computes exact tile count from `perimeter / (bandWidth * 6.86)` (~16 tiles on phone)
- *       so `raven_gold_ring_strip.png` is NEVER stretched differently when rotating the phone.
- *     - Scrolls at constant physical speed (calm clockwise 24k rim + slower counter-clockwise outer dust).
- *  2. ROCK-STEADY TORSO-LOCKED, CROSS-FADED 3D AERODYNAMIC RAVEN (ZERO JERKS, ZERO SIDEWAYS FLOATING):
- *     - Uses torso-locked 512x512 sprites (`raven_ss_up / glide / down`) whose body & head are pinned to
- *       exact pixel center (256, 256) so ZERO body jump occurs on wingbeats.
- *     - Smoothly cross-fades consecutive wing frames on a continuous sine wing curve (`up <-> glide <-> down`).
- *     - Moves at constant physical pixel speed (`diagDim * 0.16 * depth`) with strictly nose-first shallow
- *       aerodynamic glide arcs (`|pitch| <= 12.5 deg`) and true 3D depth travel (`0.38x <-> 1.05x`).
- *  3. REAL PAINTED LIGHTNING ILLUMINATION + FULL-CLARITY 21:9 LANDSCAPE & 9:16 PORTRAIT.
+ * 100% parity with Dell XPS `thor_mjolnir_screensaver.py` (WO-224):
+ *  - Hosts a hardware-accelerated offline WebView rendering the 2K matte-obsidian 3D Nordic Raven
+ *    (`assets/screensaver_3d/nordic_raven_3d.glb` + local Three.js ES modules) with zero external network access.
+ *  - Auto-adapts on Portrait <-> Landscape rotation with calibrated stone pedestal perch coordinates.
+ *  - Preserves exact 1:1 calm molten-gold border (18s CW rim / 26s CCW outer stardust) & double-tap exit.
+ *  - Serves existing storm/bolt/gold PNGs directly from `res/drawable-nodpi` with zero APK duplication.
  */
 class ThorMjolnirScreensaverView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
-) : View(context, attrs) {
+    defStyleAttr: Int = 0,
+) : FrameLayout(context, attrs, defStyleAttr) {
 
-    private val rng = Random(System.currentTimeMillis())
-
-    private val wideBaseBmp: Bitmap?
-    private val tallBaseBmp: Bitmap?
-    private val wideBolts: Array<Bitmap?>
-    private val tallBolts: Array<Bitmap?>
-    private val rimCwSrc: Bitmap?
-    private val dustCcwSrc: Bitmap?
-    private val flyCycle: Array<Bitmap?>
-
-    private var scrolledCwBmp: Bitmap? = null
-    private var scrolledCwCanvas: Canvas? = null
-    private var scrolledCcwBmp: Bitmap? = null
-    private var scrolledCcwCanvas: Canvas? = null
-
-    private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val ravenPaintA = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val ravenPaintB = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val stripDrawPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val ringMeshPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
-    private val dustMeshPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
-    private val boltAddPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-        xfermode = PorterDuffXfermode(PorterDuff.Mode.SCREEN)
-    }
-    private val runeAuraPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val rainPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
-
-    private val clipPath = Path()
-    private val innerClipRect = RectF()
-    private val bgDstRect = RectF()
-    private val birdDstRect = RectF()
-
-    // Dynamic 1:1 aspect-locked perimeter mesh tiles (auto-adapts cleanly across Portrait & Landscape!)
-    private var tileCount = 16
-    private val segsPerTile = 12
-    private val radSteps = 6
-    private var tileMeshes: Array<FloatArray> = emptyArray()
-    private var builtW = -1
-    private var builtH = -1
-
-    private data class RainDrop(var x: Float, var y: Float, val len: Float, val speed: Float, val alpha: Float)
-    private val rainDrops = List(54) {
-        RainDrop(
-            x = rng.nextFloat(),
-            y = rng.nextFloat(),
-            len = 0.018f + rng.nextFloat() * 0.025f,
-            speed = 0.72f + rng.nextFloat() * 0.50f,
-            alpha = 0.045f + rng.nextFloat() * 0.070f,
-        )
+    companion object {
+        private const val TAG = "ThorScreensaver3D"
+        private const val VIRTUAL_HOST = "thor-local.assets"
+        private const val ENTRY_URL = "https://$VIRTUAL_HOST/index.html"
     }
 
-    private class RealBoltStrike(var nextAtMs: Long, var startedAtMs: Long, var durationMs: Long, var peakPower: Float)
-    private var startElapsedMs = SystemClock.elapsedRealtime()
-    private var lastFrameMs = startElapsedMs
-    private val strikes = List(3) { i ->
-        RealBoltStrike(
-            nextAtMs = startElapsedMs + 950L + i * 1950L + rng.nextLong(1800L),
-            startedAtMs = -99999L,
-            durationMs = 460L,
-            peakPower = 1.0f,
-        )
-    }
+    private var webView: WebView? = null
+    private var released = false
 
-    // WO-220: Effortless 12-Frame Corvid Flight & Organic 3D Thermal-Wind Engine (Gold frame 100% locked!)
-    private var passDir = 1
-    private var ravenPxX = -200f
-    private var ravenPxY = 300f
-    private var startX = -200f
-    private var endX = 1600f
-    private var yP0 = 0.22f
-    private var yP1 = 0.16f
-    private var yP2 = 0.28f
-    private var yP3 = 0.20f
-    private var zP0 = 0.34f
-    private var zP1 = 0.78f
-    private var zP2 = 0.82f
-    private var zP3 = 0.34f
-    private var restCooldown = 0f
-    private var smoothPitchDeg = 0f
-    private var wingPos = 4f           // 0..12 continuous frame phase; index 4 = outstretched effortless Level Glide
-    private var gliding = true
-    private var glideTimer = 1.6f
-    private var beatsRemaining = 0
-    private var needsInitialPass = true
-    private var running = false
+    private val drawableByName: Map<String, Int> = mapOf(
+        "mjolnir_wide_base_storm.png" to R.drawable.mjolnir_wide_base_storm,
+        "mjolnir_tall_base_storm.png" to R.drawable.mjolnir_tall_base_storm,
+        "mjolnir_wide_bolt_0.png" to R.drawable.mjolnir_wide_bolt_0,
+        "mjolnir_wide_bolt_1.png" to R.drawable.mjolnir_wide_bolt_1,
+        "mjolnir_wide_bolt_2.png" to R.drawable.mjolnir_wide_bolt_2,
+        "mjolnir_tall_bolt_0.png" to R.drawable.mjolnir_tall_bolt_0,
+        "mjolnir_tall_bolt_1.png" to R.drawable.mjolnir_tall_bolt_1,
+        "mjolnir_tall_bolt_2.png" to R.drawable.mjolnir_tall_bolt_2,
+        "raven_gold_rim_cw.png" to R.drawable.raven_gold_rim_cw,
+        "raven_gold_dust_ccw.png" to R.drawable.raven_gold_dust_ccw,
+    )
 
     init {
-        val opts = BitmapFactory.Options().apply { inScaled = false }
-        wideBaseBmp = decodeSafe(R.drawable.mjolnir_wide_base_storm, opts) ?: decodeSafe(R.drawable.mjolnir_valley_wide_hd, opts)
-        tallBaseBmp = decodeSafe(R.drawable.mjolnir_tall_base_storm, opts) ?: decodeSafe(R.drawable.mjolnir_valley_tall_hd, opts)
-        wideBolts = arrayOf(
-            decodeSafe(R.drawable.mjolnir_wide_bolt_0, opts),
-            decodeSafe(R.drawable.mjolnir_wide_bolt_1, opts),
-            decodeSafe(R.drawable.mjolnir_wide_bolt_2, opts),
-        )
-        tallBolts = arrayOf(
-            decodeSafe(R.drawable.mjolnir_tall_bolt_0, opts),
-            decodeSafe(R.drawable.mjolnir_tall_bolt_1, opts),
-            decodeSafe(R.drawable.mjolnir_tall_bolt_2, opts),
-        )
-        rimCwSrc = decodeSafe(R.drawable.raven_gold_rim_cw, opts) ?: decodeSafe(R.drawable.raven_gold_ring_strip, opts)
-        dustCcwSrc = decodeSafe(R.drawable.raven_gold_dust_ccw, opts)
-        flyCycle = arrayOf(
-            decodeSafe(R.drawable.raven_f00, opts), decodeSafe(R.drawable.raven_f01, opts),
-            decodeSafe(R.drawable.raven_f02, opts), decodeSafe(R.drawable.raven_f03, opts),
-            decodeSafe(R.drawable.raven_f04, opts), decodeSafe(R.drawable.raven_f05, opts),
-            decodeSafe(R.drawable.raven_f06, opts), decodeSafe(R.drawable.raven_f07, opts),
-            decodeSafe(R.drawable.raven_f08, opts), decodeSafe(R.drawable.raven_f09, opts),
-            decodeSafe(R.drawable.raven_f10, opts), decodeSafe(R.drawable.raven_f11, opts),
-        )
+        setBackgroundColor(Color.parseColor("#020305"))
+        isClickable = true
+        isFocusable = true
+        mountWebView(context)
+    }
 
-        rimCwSrc?.let { src ->
-            scrolledCwBmp = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
-            scrolledCwCanvas = Canvas(scrolledCwBmp!!)
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun mountWebView(ctx: Context) {
+        val wv = WebView(ctx).apply {
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#020305"))
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            isVerticalScrollBarEnabled = false
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isClickable = false
+            isFocusable = false
+            isLongClickable = false
+
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                useWideViewPort = true
+                loadWithOverviewMode = true
+                setSupportZoom(false)
+                builtInZoomControls = false
+                displayZoomControls = false
+                mediaPlaybackRequiresUserGesture = false
+                cacheMode = WebSettings.LOAD_NO_CACHE
+                allowFileAccess = false
+                allowContentAccess = false
+                // Note: keep blockNetworkLoads=false so Chromium invokes shouldInterceptRequest
+                // for https://thor-local.assets/; all external hosts are hard-blocked inside shouldInterceptRequest.
+                blockNetworkLoads = false
+            }
+
+            webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(cm: ConsoleMessage): Boolean {
+                    val msg = "${cm.message()} (${cm.sourceId()}:${cm.lineNumber()})"
+                    when (cm.messageLevel()) {
+                        ConsoleMessage.MessageLevel.ERROR -> Log.e(TAG, msg)
+                        ConsoleMessage.MessageLevel.WARNING -> Log.w(TAG, msg)
+                        else -> Log.i(TAG, msg)
+                    }
+                    return true
+                }
+            }
+
+            webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                ): WebResourceResponse? {
+                    val uri = request?.url ?: return empty404()
+                    if (uri.host != VIRTUAL_HOST) {
+                        return empty404()
+                    }
+                    val path = uri.path?.trimStart('/') ?: ""
+                    return serveLocalAsset(ctx, path)
+                }
+            }
         }
-        dustCcwSrc?.let { src ->
-            scrolledCcwBmp = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
-            scrolledCcwCanvas = Canvas(scrolledCcwBmp!!)
+
+        webView = wv
+        addView(wv)
+        wv.loadUrl(ENTRY_URL)
+    }
+
+    private fun corsHeaders(): Map<String, String> = mapOf(
+        "Access-Control-Allow-Origin" to "*",
+        "Cache-Control" to "no-store",
+    )
+
+    private fun empty404(): WebResourceResponse = WebResourceResponse(
+        "text/plain",
+        "utf-8",
+        404,
+        "Not Found",
+        corsHeaders(),
+        ByteArrayInputStream(ByteArray(0)),
+    )
+
+    private fun serveLocalAsset(ctx: Context, relPath: String): WebResourceResponse {
+        return try {
+            when {
+                relPath.isEmpty() || relPath == "index.html" -> {
+                    val stream = ctx.assets.open("screensaver_3d/index.html")
+                    WebResourceResponse("text/html", "utf-8", 200, "OK", corsHeaders(), stream)
+                }
+                relPath.startsWith("vendor/") -> {
+                    val fname = relPath.substringAfterLast('/')
+                    val stream = ctx.assets.open("screensaver_3d/vendor/$fname")
+                    WebResourceResponse("application/javascript", "utf-8", 200, "OK", corsHeaders(), stream)
+                }
+                relPath.startsWith("raven/") -> {
+                    val fname = relPath.substringAfterLast('/')
+                    val mime = if (fname.endsWith(".png", ignoreCase = true)) "image/png" else "model/gltf-binary"
+                    val stream = ctx.assets.open("screensaver_3d/$fname")
+                    WebResourceResponse(mime, null, 200, "OK", corsHeaders(), stream)
+                }
+                relPath.startsWith("assets/") -> {
+                    val fname = relPath.substringAfterLast('/')
+                    val resId = drawableByName[fname]
+                    if (resId != null) {
+                        val stream = ctx.resources.openRawResource(resId)
+                        WebResourceResponse("image/png", null, 200, "OK", corsHeaders(), stream)
+                    } else {
+                        Log.w(TAG, "Missing screensaver drawable: $fname")
+                        empty404()
+                    }
+                }
+                else -> empty404()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed serving local asset '$relPath': ${e.message}")
+            empty404()
         }
     }
 
-    private fun decodeSafe(resId: Int, opts: BitmapFactory.Options): Bitmap? {
-        return try { BitmapFactory.decodeResource(resources, resId, opts) } catch (_: Throwable) { null }
-    }
+    // Intercept all touch events so ThorScreensaverActivity's double-tap-to-exit fires reliably
+    override fun onInterceptTouchEvent(ev: MotionEvent?): Boolean = true
 
-    private fun dp(v: Float): Float = v * resources.displayMetrics.density
-
-    override fun onAttachedToWindow() {
-        super.onAttachedToWindow()
-        running = true
-        startElapsedMs = SystemClock.elapsedRealtime()
-        lastFrameMs = startElapsedMs
-        for (i in strikes.indices) {
-            strikes[i].nextAtMs = startElapsedMs + 850L + i * 1850L + rng.nextLong(1900L)
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (released) return
+        val wv = webView ?: return
+        if (visibility == View.VISIBLE) {
+            wv.onResume()
+            wv.resumeTimers()
+        } else {
+            wv.onPause()
         }
-        postInvalidateOnAnimation()
     }
 
     override fun onDetachedFromWindow() {
-        running = false
+        releaseBitmaps()
         super.onDetachedFromWindow()
     }
 
     fun releaseBitmaps() {
-        running = false
-        for (b in flyCycle) { try { b?.recycle() } catch (_: Exception) {} }
-        for (b in listOf(wideBaseBmp, tallBaseBmp, rimCwSrc, dustCcwSrc, scrolledCwBmp, scrolledCcwBmp)) {
-            try { b?.recycle() } catch (_: Exception) {}
-        }
-        for (b in wideBolts) { try { b?.recycle() } catch (_: Exception) {} }
-        for (b in tallBolts) { try { b?.recycle() } catch (_: Exception) {} }
-    }
-
-    private fun scrollStrip(src: Bitmap?, dstCanvas: Canvas?, phase01: Float) {
-        val s = src ?: return
-        val c = dstCanvas ?: return
-        c.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        val w = s.width.toFloat()
-        val shift = ((phase01 - floor(phase01)) * w).coerceIn(0f, w - 1f)
-        c.drawBitmap(s, shift, 0f, stripDrawPaint)
-        c.drawBitmap(s, shift - w, 0f, stripDrawPaint)
-    }
-
-    private fun sampleRoundedBorderAndNormal(
-        t01: Float, l: Float, t: Float, r: Float, b: Float, cr: Float
-    ): FloatArray {
-        val rw = (r - l - 2f * cr).coerceAtLeast(1f)
-        val rh = (b - t - 2f * cr).coerceAtLeast(1f)
-        val arc = (PI.toFloat() * 0.5f) * cr
-        val perim = 2f * rw + 2f * rh + 4f * arc
-        var frac = t01 - floor(t01)
-        if (frac < 0f) frac += 1f
-        var d = frac * perim
-
-        if (d <= rw) return floatArrayOf(l + cr + d, t, 0f, -1f)
-        d -= rw
-        if (d <= arc) {
-            val a = -PI.toFloat() * 0.5f + d / cr
-            val nx = cos(a); val ny = sin(a)
-            return floatArrayOf(r - cr + nx * cr, t + cr + ny * cr, nx, ny)
-        }
-        d -= arc
-        if (d <= rh) return floatArrayOf(r, t + cr + d, 1f, 0f)
-        d -= rh
-        if (d <= arc) {
-            val a = d / cr
-            val nx = cos(a); val ny = sin(a)
-            return floatArrayOf(r - cr + nx * cr, b - cr + ny * cr, nx, ny)
-        }
-        d -= arc
-        if (d <= rw) return floatArrayOf(r - cr - d, b, 0f, 1f)
-        d -= rw
-        if (d <= arc) {
-            val a = PI.toFloat() * 0.5f + d / cr
-            val nx = cos(a); val ny = sin(a)
-            return floatArrayOf(l + cr + nx * cr, b - cr + ny * cr, nx, ny)
-        }
-        d -= arc
-        if (d <= rh) return floatArrayOf(l, b - cr - d, -1f, 0f)
-        d -= rh
-        val a = PI.toFloat() + d / cr
-        val nx = cos(a); val ny = sin(a)
-        return floatArrayOf(l + cr + nx * cr, t + cr + ny * cr, nx, ny)
-    }
-
-    private fun rebuildGeometryOnResize(w: Int, h: Int) {
-        if (w == builtW && h == builtH) return
-        builtW = w; builtH = h
-        val wf = w.toFloat(); val hf = h.toFloat()
-        val minDim = min(wf, hf)
-        val pad = max(dp(22f), minDim * 0.056f)
-        val cornerR = max(dp(20f), minDim * 0.042f)
-        val l = pad; val t = pad; val r = wf - pad; val b = hf - pad
-
-        innerClipRect.set(l, t, r, b)
-        clipPath.reset()
-        clipPath.addRoundRect(innerClipRect, cornerR, cornerR, Path.Direction.CW)
-
-        val rcx = innerClipRect.left + innerClipRect.width() * 0.50f
-        val rcy = innerClipRect.top + innerClipRect.height() * 0.63f
-        runeAuraPaint.shader = RadialGradient(
-            rcx, rcy, minDim * 0.22f,
-            Color.argb(46, 254, 215, 102),
-            Color.TRANSPARENT,
-            Shader.TileMode.CLAMP,
-        )
-
-        // Exact 1:1 Aspect-Locked Tiling based on `raven_gold_ring_strip.png` natural 6.86:1 ratio!
-        // Ensures IDENTICAL gold rim thickness and stardust grain size in Portrait, Landscape & Laptop!
-        val innerTuck = -dp(2.0f)
-        val outerSpan = pad * 0.98f - innerTuck
-        val perim = 2f * ((r - l) - 2f * cornerR) + 2f * ((b - t) - 2f * cornerR) + 2f * PI.toFloat() * cornerR
-        val naturalAspect = 1536f / 224f
-        val idealTileLen = outerSpan * naturalAspect
-        tileCount = (perim / idealTileLen).roundToInt().coerceIn(8, 24)
-
-        tileMeshes = Array(tileCount) { FloatArray((segsPerTile + 1) * (radSteps + 1) * 2) }
-        for (q in 0 until tileCount) {
-            val verts = tileMeshes[q]
-            val uStart = q.toFloat() / tileCount.toFloat()
-            val uSpan = 1f / tileCount.toFloat()
-            var k = 0
-            for (row in 0..radSteps) {
-                val rf = row.toFloat() / radSteps.toFloat()
-                val dist = innerTuck + outerSpan * rf
-                for (col in 0..segsPerTile) {
-                    val u = uStart + (col.toFloat() / segsPerTile.toFloat()) * uSpan
-                    val pt = sampleRoundedBorderAndNormal(u, l, t, r, b, cornerR)
-                    verts[k++] = pt[0] + pt[2] * dist
-                    verts[k++] = pt[1] + pt[3] * dist
-                }
+        if (released) return
+        released = true
+        val wv = webView
+        webView = null
+        if (wv != null) {
+            try {
+                wv.onPause()
+                wv.stopLoading()
+                removeView(wv)
+                wv.loadUrl("about:blank")
+                wv.destroy()
+            } catch (_: Exception) {
             }
         }
-        startFreshPhysicalPass(wf, hf, immediateVisible = needsInitialPass)
-        needsInitialPass = false
-    }
-
-    private fun startFreshPhysicalPass(wf: Float, hf: Float, immediateVisible: Boolean) {
-        val sceneRef = min(innerClipRect.width(), innerClipRect.height()).coerceAtLeast(320f)
-        val marginPx = sceneRef * 0.28f
-        passDir = if (immediateVisible) 1 else (if (rng.nextBoolean()) 1 else -1)
-        startX = if (passDir > 0) (innerClipRect.left - marginPx) else (innerClipRect.right + marginPx)
-        endX = if (passDir > 0) (innerClipRect.right + marginPx) else (innerClipRect.left - marginPx)
-        ravenPxX = if (immediateVisible) (innerClipRect.left + innerClipRect.width() * 0.14f) else startX
-        restCooldown = if (immediateVisible) 0f else (1.4f + rng.nextFloat() * 2.4f)
-
-        // Organic randomized 3D depth control points (no fixed repeating presets — every flight path is unique!)
-        val roll = rng.nextFloat()
-        if (roll < 0.34f) {
-            // Distant mountain approach -> sweeps gracefully closer across the valley -> drifts back out
-            zP0 = 0.26f + rng.nextFloat() * 0.12f
-            zP1 = 0.62f + rng.nextFloat() * 0.28f
-            zP2 = 0.66f + rng.nextFloat() * 0.28f
-            zP3 = 0.28f + rng.nextFloat() * 0.16f
-        } else if (roll < 0.67f) {
-            // Far-to-close OR close-to-far continuous 3D depth glide
-            val comingCloser = rng.nextBoolean()
-            val farZ = 0.26f + rng.nextFloat() * 0.12f
-            val nearZ = 0.82f + rng.nextFloat() * 0.20f
-            zP0 = if (comingCloser) farZ else nearZ
-            zP3 = if (comingCloser) nearZ else farZ
-            zP1 = zP0 + (zP3 - zP0) * (0.28f + rng.nextFloat() * 0.22f)
-            zP2 = zP0 + (zP3 - zP0) * (0.58f + rng.nextFloat() * 0.22f)
-        } else {
-            // High effortless mountain thermal patrol at organic mid-distance
-            val baseZ = 0.34f + rng.nextFloat() * 0.24f
-            zP0 = baseZ
-            zP1 = (baseZ + (rng.nextFloat() - 0.35f) * 0.22f).coerceIn(0.26f, 0.78f)
-            zP2 = (baseZ + (rng.nextFloat() - 0.35f) * 0.22f).coerceIn(0.26f, 0.78f)
-            zP3 = (baseZ + (rng.nextFloat() - 0.50f) * 0.20f).coerceIn(0.26f, 0.76f)
-        }
-
-        // Organic gentle altitude spline (higher when far over peaks, slightly lower when sweeping closer)
-        yP0 = (0.12f + zP0 * 0.22f + (rng.nextFloat() - 0.5f) * 0.08f).coerceIn(0.09f, 0.44f)
-        yP1 = (0.12f + zP1 * 0.22f + (rng.nextFloat() - 0.5f) * 0.14f).coerceIn(0.08f, 0.48f)
-        yP2 = (0.12f + zP2 * 0.22f + (rng.nextFloat() - 0.5f) * 0.14f).coerceIn(0.08f, 0.48f)
-        yP3 = (0.12f + zP3 * 0.22f + (rng.nextFloat() - 0.5f) * 0.08f).coerceIn(0.09f, 0.44f)
-
-        ravenPxY = innerClipRect.top + innerClipRect.height() * yP0
-        smoothPitchDeg = 0f
-        // Start with 2-3 slow, effortless strokes or gliding smoothly on wind
-        gliding = !immediateVisible && rng.nextBoolean()
-        glideTimer = if (gliding) (1.6f + rng.nextFloat() * 1.8f) else 0f
-        beatsRemaining = if (gliding) 0 else (2 + rng.nextInt(2))
-        wingPos = 4f
-    }
-
-    private fun evalCubicSpline(t: Float, a: Float, b: Float, c: Float, d: Float): Float {
-        val u = 1f - t
-        return u * u * u * a + 3f * u * u * t * b + 3f * u * t * t * c + t * t * t * d
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        val wi = width; val hi = height
-        if (wi <= 2 || hi <= 2) return
-        val wf = wi.toFloat(); val hf = hi.toFloat()
-        rebuildGeometryOnResize(wi, hi)
-
-        val now = SystemClock.elapsedRealtime()
-        val dt = ((now - lastFrameMs).coerceIn(1L, 40L)).toFloat() / 1000f
-        lastFrameMs = now
-        val elapsed = (now - startElapsedMs).coerceAtLeast(0L)
-        val tSec = elapsed / 1000f
-        val diagDim = hypot(wf.toDouble(), hf.toDouble()).toFloat()
-
-        // 0. Pure obsidian gallery canvas behind 1:1 gold stardust halo
-        canvas.drawColor(0xFF020305.toInt())
-
-        // 1. Clipped Inner Viewport: FULL-CLARITY VALLEY + REAL PAINTED LIGHTNING + SMOOTH 3D RAVEN
-        canvas.save()
-        canvas.clipPath(clipPath)
-
-        val fw = innerClipRect.width()
-        val fh = innerClipRect.height()
-        val isLand = wi >= hi
-        val activeBase = if (isLand) (wideBaseBmp ?: tallBaseBmp) else (tallBaseBmp ?: wideBaseBmp)
-        val activeBolts = if (isLand) wideBolts else tallBolts
-
-        if (activeBase != null) {
-            val scale = max(fw / activeBase.width.toFloat(), fh / activeBase.height.toFloat())
-            val dw = activeBase.width * scale
-            val dh = activeBase.height * scale
-            val left = innerClipRect.left + (fw - dw) * 0.5f
-            val top = innerClipRect.top + (fh - dh) * 0.5f
-            bgDstRect.set(left, top, left + dw, top + dh)
-            canvas.drawBitmap(activeBase, null, bgDstRect, bmpPaint)
-
-            // 2. REAL PAINTED LIGHTNING ILLUMINATION
-            var peakFlash = 0f
-            for (i in strikes.indices) {
-                val st = strikes[i]
-                if (now >= st.nextAtMs) {
-                    st.startedAtMs = now
-                    st.durationMs = 340L + rng.nextLong(260L)
-                    st.peakPower = 0.85f + rng.nextFloat() * 0.35f
-                    st.nextAtMs = now + 2100L + rng.nextLong(4800L)
-                }
-                val age = now - st.startedAtMs
-                if (age in 0L..st.durationMs) {
-                    val p = age.toFloat() / st.durationMs.toFloat()
-                    val env = when {
-                        p < 0.12f -> p / 0.12f
-                        p < 0.28f -> 1f - ((p - 0.12f) / 0.16f) * 0.72f
-                        p < 0.44f -> 0.28f + ((p - 0.28f) / 0.16f) * 0.72f
-                        else -> (1f - (p - 0.44f) / 0.56f).coerceAtLeast(0f)
-                    } * st.peakPower
-                    if (env > 0.02f) {
-                        peakFlash = max(peakFlash, env)
-                        activeBolts.getOrNull(i)?.let { boltBmp ->
-                            boltAddPaint.alpha = (env * 255f).toInt().coerceIn(0, 255)
-                            canvas.drawBitmap(boltBmp, null, bgDstRect, boltAddPaint)
-                            if (env > 0.65f) {
-                                boltAddPaint.alpha = ((env - 0.55f) * 200f).toInt().coerceIn(0, 175)
-                                canvas.drawBitmap(boltBmp, null, bgDstRect, boltAddPaint)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 3. BREATHING GOLDEN PEDESTAL RUNES + FINE STORM RAIN
-            val runePulse = 0.50f + 0.50f * sin(tSec * 1.85f)
-            runeAuraPaint.alpha = (110 + (140 * runePulse).toInt()).coerceIn(90, 255)
-            canvas.drawRect(innerClipRect, runeAuraPaint)
-
-            rainPaint.strokeWidth = max(1f, dp(0.55f))
-            for (rd in rainDrops) {
-                rd.y += rd.speed * dt; rd.x += rd.speed * dt * 0.16f
-                if (rd.y > 1.05f) { rd.y = -0.05f; rd.x = rng.nextFloat() }
-                if (rd.x > 1.05f) rd.x -= 1.05f
-                val x1 = innerClipRect.left + rd.x * fw
-                val y1 = innerClipRect.top + rd.y * fh
-                val a = (rd.alpha * (1f + peakFlash * 1.9f) * 255f).toInt().coerceIn(0, 100)
-                rainPaint.color = Color.argb(a, 224, 236, 250)
-                canvas.drawLine(x1, y1, x1 + rd.len * fh * 0.16f, y1 + rd.len * fh, rainPaint)
-            }
-        }
-
-        // 4. EFFORTLESS 12-FRAME 3D CORVID FLIGHT (SOLID OPAQUE FEATHERS, REAL FLAP-THEN-SOAR, ORGANIC CURVES)
-        if (restCooldown > 0f) {
-            restCooldown -= dt
-        } else {
-            val sceneRef = min(fw, fh).coerceAtLeast(320f)
-            val totalDx = abs(endX - startX).coerceAtLeast(1f)
-            val progress = (abs(ravenPxX - startX) / totalDx).coerceIn(0f, 1f)
-            val depth = evalCubicSpline(progress, zP0, zP1, zP2, zP3).coerceIn(0.24f, 1.06f)
-
-            // Calm, unhurried perspective airspeed (majestic slow glide far away, smooth sweep closer up)
-            val speedPx = sceneRef * 0.21f * (0.40f + 0.72f * depth)
-            val prevX = ravenPxX
-            val prevY = ravenPxY
-            ravenPxX += passDir * speedPx * dt
-
-            if ((passDir > 0 && ravenPxX >= endX) || (passDir < 0 && ravenPxX <= endX)) {
-                startFreshPhysicalPass(wf, hf, immediateVisible = false)
-            } else {
-                val baseYFrac = evalCubicSpline(progress, yP0, yP1, yP2, yP3)
-                // Gentle aerodynamic lift strictly during the power downstroke (frames 4..7), completely still while gliding
-                val strokeBobPx = if (gliding) 0f else (sin(((wingPos - 4f) / 12f) * 2f * PI.toFloat()) * dp(2.0f) * depth)
-                val targetY = (innerClipRect.top + fh * baseYFrac + strokeBobPx)
-                    .coerceIn(innerClipRect.top + fh * 0.07f, innerClipRect.top + fh * 0.54f)
-                ravenPxY = if (abs(ravenPxY - targetY) > fh * 0.22f) targetY else (ravenPxY + (targetY - ravenPxY) * min(1f, dt * 7.0f))
-
-                val vx = (ravenPxX - prevX) / dt
-                val vy = (ravenPxY - prevY) / dt
-                // Smooth beak-first banking pitch (max +/- 13 deg — effortless gliding silhouette)
-                val targetPitch = (atan2(vy.toDouble(), max(70f, abs(vx)).toDouble()) * 180.0 / PI * 0.75)
-                    .toFloat().coerceIn(-13f, 13f)
-                smoothPitchDeg += (targetPitch - smoothPitchDeg) * min(1f, dt * 4.2f)
-
-                // Effortless corvid energy cycle: slow heavy 840ms wingbeats (2-4 strokes) -> long 2.2-4.4s outstretched glides!
-                if (gliding) {
-                    wingPos = 4f // Hold crisp outstretched Level Glide (F2) seamlessly!
-                    glideTimer -= dt
-                    if (glideTimer <= 0f) {
-                        gliding = false
-                        beatsRemaining = if (vy < -12f) (3 + rng.nextInt(2)) else (2 + rng.nextInt(2))
-                    }
-                } else {
-                    val beatsPerSec = if (vy < -12f) 1.32f else 1.16f // Calm heavy raven beat (~860ms per full stroke)
-                    val prevPos = wingPos
-                    wingPos = (wingPos + dt * beatsPerSec * 12f) % 12f
-                    // Check clean arrival at outstretched Level Glide (index 4) to transition effortlessly into soaring!
-                    val crossedGlide = (prevPos < 4f && wingPos >= 4f) || (prevPos > 10f && wingPos < 4f && beatsRemaining <= 0)
-                    if (crossedGlide) {
-                        beatsRemaining--
-                        if (beatsRemaining <= 0) {
-                            gliding = true
-                            wingPos = 4f
-                            glideTimer = (if (vy > 6f) 2.8f else 2.0f) + rng.nextFloat() * 1.9f
-                        }
-                    }
-                }
-
-                val frameIdx = wingPos.toInt().coerceIn(0, 11)
-                val activeBmp = flyCycle.getOrNull(frameIdx) ?: flyCycle.getOrNull(4)
-                if (activeBmp != null) {
-                    val sizePx = sceneRef * 0.34f * depth
-                    val flipX = if (passDir > 0) 1f else -1f
-                    ravenPaintA.alpha = 255
-                    canvas.save()
-                    canvas.translate(ravenPxX, ravenPxY)
-                    canvas.scale(flipX, 1f)
-                    canvas.rotate(smoothPitchDeg)
-                    birdDstRect.set(-sizePx * 0.5f, -sizePx * 0.5f, sizePx * 0.5f, sizePx * 0.5f)
-                    canvas.drawBitmap(activeBmp, null, birdDstRect, ravenPaintA)
-                    canvas.restore()
-                }
-            }
-        }
-
-        canvas.restore() // end inner valley clip
-
-        // 5. 1:1 ASPECT-LOCKED FLOATING-ICON GOLD FRAME + CALM DUAL-DIRECTION STARDUST (ZERO DRIPPING!)
-        // 18s per single 1:1 tile (~29 px/sec calm liquid gold CW) & 26s per tile (~20 px/sec CCW outer dust)
-        val cwPhase = (elapsed % 18000L).toFloat() / 18000f
-        val ccwPhase = 1f - ((elapsed % 26000L).toFloat() / 26000f)
-        scrollStrip(rimCwSrc, scrolledCwCanvas, cwPhase)
-        scrollStrip(dustCcwSrc, scrolledCcwCanvas, ccwPhase)
-
-        val pulse = 0.89f + 0.11f * sin(tSec * 1.6f)
-        scrolledCwBmp?.let { cwStrip ->
-            ringMeshPaint.alpha = (255f * pulse).toInt().coerceIn(220, 255)
-            for (q in 0 until tileCount) {
-                canvas.drawBitmapMesh(cwStrip, segsPerTile, radSteps, tileMeshes[q], 0, null, 0, ringMeshPaint)
-            }
-        }
-        scrolledCcwBmp?.let { ccwStrip ->
-            dustMeshPaint.alpha = (190f * (0.82f + 0.18f * sin(tSec * 2.1f + 1.2f))).toInt().coerceIn(145, 210)
-            for (q in 0 until tileCount) {
-                canvas.drawBitmapMesh(ccwStrip, segsPerTile, radSteps, tileMeshes[q], 0, null, 0, dustMeshPaint)
-            }
-        }
-
-        if (running) postInvalidateOnAnimation()
     }
 }

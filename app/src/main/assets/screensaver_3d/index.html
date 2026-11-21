@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Thor Mjolnir Storm 3D Screensaver</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #020305;
+    user-select: none; -webkit-user-select: none; touch-action: none;
+  }
+  canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  #bg-stage { z-index: 1; }
+  #raven-gl { z-index: 2; pointer-events: none; }
+  #frame-stage { z-index: 3; pointer-events: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://thor-local.assets/vendor/three.module.min.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="bg-stage"></canvas>
+<canvas id="raven-gl"></canvas>
+<canvas id="frame-stage"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'https://thor-local.assets/vendor/GLTFLoader.js';
+
+const PERCH_CFG = {"wide_u": 0.544, "wide_v": 0.362, "tall_u": 0.6274, "tall_v": 0.3656, "perch_z": 1.6, "perch_scale": 1.2, "tall_scale": 0.92, "perch_yaw_deg": -28, "tall_yaw_deg": -28, "light_exp": 1.35, "flip_beak": false};
+
+const bgCanvas = document.getElementById('bg-stage');
+const bgCtx = bgCanvas.getContext('2d', { alpha: false });
+const glCanvas = document.getElementById('raven-gl');
+const frameCanvas = document.getElementById('frame-stage');
+const frameCtx = frameCanvas.getContext('2d', { alpha: true });
+
+let W = 1080, H = 2316, DPR = 2;
+let pad = 60, cornerR = 44, tileCount = 16;
+let borderPts = [];
+const SEGS = 192;
+
+const viewMetrics = {
+  fl: 60, ft: 60, fw: 960, fh: 2196,
+  dx: 0, dy: 0, dw: 1080, dh: 2316,
+  isWide: false,
+};
+
+function lerpAngle(a, b, t) {
+  let diff = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return a + diff * t;
+}
+
+function sampleRoundedBorderAndNormal(t01, l, t, r, b, cr) {
+  const rw = Math.max(1, r - l - 2 * cr);
+  const rh = Math.max(1, b - t - 2 * cr);
+  const arc = (Math.PI * 0.5) * cr;
+  const perim = 2 * rw + 2 * rh + 4 * arc;
+  let frac = t01 - Math.floor(t01);
+  if (frac < 0) frac += 1;
+  let d = frac * perim;
+  if (d <= rw) return [l + cr + d, t, 0, -1];
+  d -= rw;
+  if (d <= arc) { const a = -Math.PI * 0.5 + d / cr; const nx = Math.cos(a), ny = Math.sin(a); return [r - cr + nx * cr, t + cr + ny * cr, nx, ny]; }
+  d -= arc;
+  if (d <= rh) return [r, t + cr + d, 1, 0];
+  d -= rh;
+  if (d <= arc) { const a = d / cr; const nx = Math.cos(a), ny = Math.sin(a); return [r - cr + nx * cr, b - cr + ny * cr, nx, ny]; }
+  d -= arc;
+  if (d <= rw) return [r - cr - d, b, 0, 1];
+  d -= rw;
+  if (d <= arc) { const a = Math.PI * 0.5 + d / cr; const nx = Math.cos(a), ny = Math.sin(a); return [l + cr + nx * cr, b - cr + ny * cr, nx, ny]; }
+  d -= arc;
+  if (d <= rh) return [l, b - cr - d, -1, 0];
+  d -= rh;
+  const a = Math.PI + d / cr; const nx = Math.cos(a), ny = Math.sin(a);
+  return [l + cr + nx * cr, t + cr + ny * cr, nx, ny];
+}
+
+function loadImg(src) { const im = new Image(); im.src = src; return im; }
+const BASE = 'https://thor-local.assets/assets/';
+const wideBase = loadImg(BASE + 'mjolnir_wide_base_storm.png');
+const tallBase = loadImg(BASE + 'mjolnir_tall_base_storm.png');
+const wideBolts = [0, 1, 2].map(i => loadImg(BASE + `mjolnir_wide_bolt_${i}.png`));
+const tallBolts = [0, 1, 2].map(i => loadImg(BASE + `mjolnir_tall_bolt_${i}.png`));
+const rimCw = loadImg(BASE + 'raven_gold_rim_cw.png');
+const dustCcw = loadImg(BASE + 'raven_gold_dust_ccw.png');
+
+const startMs = performance.now();
+const strikes = [0, 1, 2].map(i => ({
+  nextAt: startMs + 950 + i * 1950 + Math.random() * 1800,
+  startedAt: -99999, duration: 460, power: 1.0,
+}));
+
+const rainDrops = Array.from({ length: 54 }, () => ({
+  x: Math.random(), y: Math.random(),
+  len: 0.018 + Math.random() * 0.025,
+  speed: 0.72 + Math.random() * 0.50,
+  alpha: 0.045 + Math.random() * 0.070,
+}));
+
+function drawRoundedRectPath(ctx, l, t, w, h, cr) {
+  ctx.beginPath();
+  ctx.moveTo(l + cr, t);
+  ctx.lineTo(l + w - cr, t);
+  ctx.quadraticCurveTo(l + w, t, l + w, t + cr);
+  ctx.lineTo(l + w, t + h - cr);
+  ctx.quadraticCurveTo(l + w, t + h, l + w - cr, t + h);
+  ctx.lineTo(l + cr, t + h);
+  ctx.quadraticCurveTo(l, t + h, l, t + h - cr);
+  ctx.lineTo(l, t + cr);
+  ctx.quadraticCurveTo(l, t, l + cr, t);
+  ctx.closePath();
+}
+
+function drawAspectLockedGoldStrip(ctx, img, phase01, alpha) {
+  if (!img.complete || img.naturalWidth <= 0 || borderPts.length < 2) return;
+  const sw = img.naturalWidth, sh = img.naturalHeight;
+  const innerTuck = -4 * DPR;
+  const outerEdge = pad * 0.98;
+  const bandHeight = outerEdge - innerTuck;
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = alpha;
+  for (let i = 0; i < SEGS; i++) {
+    const p0 = borderPts[i], p1 = borderPts[i + 1];
+    const segLen = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]);
+    if (segLen < 0.5) continue;
+    const ang = Math.atan2(p1[1] - p0[1], p1[0] - p0[0]);
+    const u0 = ((i / SEGS) * tileCount - phase01) % 1;
+    const uWrap = u0 < 0 ? u0 + 1 : u0;
+    const sx = uWrap * sw;
+    const sliceW = Math.max(1, (tileCount / SEGS) * sw);
+    ctx.save();
+    ctx.translate(p0[0], p0[1]);
+    ctx.rotate(ang);
+    ctx.scale(1, -1);
+    if (sx + sliceW <= sw) {
+      ctx.drawImage(img, sx, 0, sliceW, sh, -0.8, innerTuck, segLen + 1.6, bandHeight);
+    } else {
+      const part1 = sw - sx;
+      const frac1 = part1 / sliceW;
+      ctx.drawImage(img, sx, 0, part1, sh, -0.8, innerTuck, (segLen + 1.6) * frac1, bandHeight);
+      ctx.drawImage(img, 0, 0, sliceW - part1, sh, -0.8 + (segLen + 1.6) * frac1, innerTuck, (segLen + 1.6) * (1 - frac1) + 0.8, bandHeight);
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+// ============================================================================
+// 100% OFFLINE THREE.JS 3D NORDIC RAVEN + HARDWARE Z-BUFFER PEDESTAL OCCLUDER
+// ============================================================================
+const renderer = new THREE.WebGLRenderer({
+  canvas: glCanvas,
+  antialias: true,
+  alpha: true,
+  powerPreference: 'high-performance',
+});
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = Number(PERCH_CFG.light_exp || 1.35);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, Math.max(0.2, window.innerWidth / Math.max(1, window.innerHeight)), 0.05, 220);
+camera.position.set(0, 0.85, 9.5);
+camera.lookAt(0, 0.35, 0);
+camera.updateMatrixWorld(true);
+scene.add(camera);
+
+scene.add(new THREE.HemisphereLight(0xc2dcff, 0x243145, 2.35));
+const moonKey = new THREE.DirectionalLight(0xdcecff, 3.4);
+moonKey.position.set(-5.0, 8.5, 8.5);
+scene.add(moonKey);
+const frontFill = new THREE.DirectionalLight(0xa8c8f0, 2.0);
+frontFill.position.set(2.5, 2.5, 9.5);
+scene.add(frontFill);
+const goldRim = new THREE.DirectionalLight(0xffcf70, 0.45);
+goldRim.position.set(3.5, -4.0, 4.5);
+scene.add(goldRim);
+const backRim = new THREE.DirectionalLight(0x88b4eb, 1.5);
+backRim.position.set(0, 5.5, -8.5);
+scene.add(backRim);
+const boltLight = new THREE.DirectionalLight(0xe0f2fe, 0.0);
+boltLight.position.set(3, 12, 5);
+scene.add(boltLight);
+
+const OCCLUDER_DEPTH = 9.0;
+const texLoader = new THREE.TextureLoader();
+let occWideLoaded = false;
+let occTallLoaded = false;
+
+function prepMaskTex(tex) {
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+const wideOccluderTex = texLoader.load('https://thor-local.assets/raven/mjolnir_wide_occluder.png', (t) => {
+  prepMaskTex(t);
+  occWideLoaded = true;
+});
+const tallOccluderTex = texLoader.load('https://thor-local.assets/raven/mjolnir_tall_occluder.png', (t) => {
+  prepMaskTex(t);
+  occTallLoaded = true;
+});
+
+const occluderMat = new THREE.MeshBasicMaterial({
+  map: tallOccluderTex,
+  alphaTest: 0.48,
+  colorWrite: false,
+  depthWrite: true,
+  depthTest: true,
+  side: THREE.DoubleSide,
+});
+const occluderMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), occluderMat);
+occluderMesh.renderOrder = -10;
+occluderMesh.frustumCulled = false;
+camera.add(occluderMesh);
+
+function updateOccluderPlane() {
+  const targetTex = viewMetrics.isWide ? wideOccluderTex : tallOccluderTex;
+  if (occluderMat.map !== targetTex) {
+    occluderMat.map = targetTex;
+    occluderMat.needsUpdate = true;
+  }
+  const hasTex = viewMetrics.isWide ? occWideLoaded : occTallLoaded;
+  occluderMesh.visible = hasTex && viewMetrics.dw > 10 && viewMetrics.dh > 10;
+  if (!occluderMesh.visible) return;
+
+  const visH = 2 * OCCLUDER_DEPTH * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
+  const visW = visH * camera.aspect;
+  const cx = (viewMetrics.dx + viewMetrics.dw * 0.5) / Math.max(1, W);
+  const cy = (viewMetrics.dy + viewMetrics.dh * 0.5) / Math.max(1, H);
+  occluderMesh.position.set((cx - 0.5) * visW, (0.5 - cy) * visH, -OCCLUDER_DEPTH);
+  occluderMesh.scale.set((viewMetrics.dw / Math.max(1, W)) * visW, (viewMetrics.dh / Math.max(1, H)) * visH, 1);
+}
+
+function createContactShadowMesh() {
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 5, 64, 64, 60);
+  g.addColorStop(0.0, 'rgba(0, 0, 0, 0.84)');
+  g.addColorStop(0.45, 'rgba(0, 0, 0, 0.40)');
+  g.addColorStop(1.0, 'rgba(0, 0, 0, 0.0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, opacity: 0.0 });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(0.85, 0.36), mat);
+  mesh.rotation.x = -Math.PI * 0.44;
+  mesh.renderOrder = -1;
+  scene.add(mesh);
+  return mesh;
+}
+const contactShadow = createContactShadowMesh();
+
+const ravenRoot = new THREE.Group();
+const ravenYawFix = new THREE.Group();
+const ravenNormGroup = new THREE.Group();
+ravenRoot.add(ravenYawFix);
+ravenYawFix.add(ravenNormGroup);
+ravenYawFix.rotation.y = PERCH_CFG.flip_beak ? Math.PI : 0;
+scene.add(ravenRoot);
+
+let mixer = null;
+const actions = {};
+let currentAction = null;
+let currentClipName = '';
+let baseAutoScale = 1.0;
+let talonLocalOffsetY = -0.2127;
+let landClipDur = 1.0;
+const landToeSamples = [];
+const perchZ = Number(PERCH_CFG.perch_z || 1.6);
+let perchWorld = new THREE.Vector3(0.3, 0.2, perchZ);
+let lastIsWide = null;
+
+function sampleLandToeOffset(norm) {
+  if (landToeSamples.length < 2) return talonLocalOffsetY;
+  const clamped = Math.max(0, Math.min(1, norm));
+  const fIdx = clamped * (landToeSamples.length - 1);
+  const i0 = Math.floor(fIdx);
+  const i1 = Math.min(landToeSamples.length - 1, i0 + 1);
+  return THREE.MathUtils.lerp(landToeSamples[i0], landToeSamples[i1], fIdx - i0);
+}
+
+function getActiveRawScale() {
+  return viewMetrics.isWide ? Number(PERCH_CFG.perch_scale || 1.2) : Number(PERCH_CFG.tall_scale || 0.92);
+}
+
+function getActiveBaseYawRad() {
+  const deg = viewMetrics.isWide ? Number(PERCH_CFG.perch_yaw_deg ?? -28) : Number(PERCH_CFG.tall_yaw_deg ?? -28);
+  return THREE.MathUtils.degToRad(deg);
+}
+
+function getEffectivePerchScale() {
+  const paneHeightRatio = Math.max(0.65, Math.min(1.0, viewMetrics.fh / Math.max(1, H)));
+  return getActiveRawScale() * paneHeightRatio;
+}
+
+function frustumHalfSizeAtZ(z) {
+  const dist = Math.max(2.2, camera.position.z - z);
+  const halfH = dist * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
+  return { halfW: halfH * camera.aspect, halfH };
+}
+
+function updatePerchWorldFromBackdrop() {
+  const u = viewMetrics.isWide ? Number(PERCH_CFG.wide_u ?? 0.544) : Number(PERCH_CFG.tall_u ?? 0.6274);
+  const v = viewMetrics.isWide ? Number(PERCH_CFG.wide_v ?? 0.362) : Number(PERCH_CFG.tall_v ?? 0.3656);
+  const sx = viewMetrics.dx + u * viewMetrics.dw;
+  const sy = viewMetrics.dy + v * viewMetrics.dh;
+  const ndcX = (sx / Math.max(1, W)) * 2 - 1;
+  const ndcY = 1 - (sy / Math.max(1, H)) * 2;
+  const rayVec = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera).sub(camera.position).normalize();
+  const t = (perchZ - camera.position.z) / rayVec.z;
+  perchWorld.copy(camera.position).addScaledVector(rayVec, t);
+  const effScale = getEffectivePerchScale();
+  contactShadow.position.set(perchWorld.x, perchWorld.y - 0.01, perchWorld.z - 0.04);
+  contactShadow.scale.setScalar(effScale);
+}
+
+function getGroundedRootPos(toeOffset = talonLocalOffsetY) {
+  const effScale = getEffectivePerchScale();
+  return new THREE.Vector3(
+    perchWorld.x,
+    perchWorld.y - (toeOffset * effScale) - 0.015,
+    perchWorld.z
+  );
+}
+
+function crossFadeTo(name, fadeSec = 0.35, loopOnce = false, speed = 1.0) {
+  const next = actions[name];
+  if (!next) return;
+  if (currentAction === next && !loopOnce) {
+    next.setEffectiveTimeScale(speed);
+    return;
+  }
+  next.reset();
+  next.setLoop(loopOnce ? THREE.LoopOnce : THREE.LoopRepeat, loopOnce ? 1 : Infinity);
+  next.clampWhenFinished = loopOnce;
+  next.setEffectiveTimeScale(speed);
+  next.setEffectiveWeight(1.0);
+  next.play();
+  if (currentAction && currentAction !== next) {
+    currentAction.crossFadeTo(next, fadeSec, false);
+  }
+  currentAction = next;
+  currentClipName = name;
+}
+
+// ============================================================================
+// OPEN-SKY VALLEY FLIGHT + ZERO-HOVER CORVID TOUCHDOWN CHOREOGRAPHY
+// ============================================================================
+let state = 'pass';
+let activePassName = '';
+let passCurve = null;
+let passDuration = 8.0;
+let passElapsed = 0.0;
+let passGapTimer = 0.0;
+let stateTime = 0.0;
+let perchDuration = 11.0;
+let perchHeadingYaw = getActiveBaseYawRad();
+let glideSwitchTimer = 2.4;
+let isGliding = false;
+let passQueueIdx = 0;
+let landStarted = false;
+let perchBlendTimer = 0.26;
+let perchStartToeOff = talonLocalOffsetY;
+
+// Start with behind-pedestal pass straight into stone landing so Boss can verify touchdown in ~10s
+const OPENING_SEQUENCE = ['mid_behind', 'approach_perch', 'distant_valley', 'foreground_swoop'];
+let lastRandomPass = '';
+
+let curPos = new THREE.Vector3(-8, 2.2, -5.0);
+let smoothForward = new THREE.Vector3(1, 0, 0);
+let prevForward = new THREE.Vector3(1, 0, 0);
+let smoothBank = 0;
+let smoothPitch = 0;
+const tmpTan = new THREE.Vector3();
+const tmpCross = new THREE.Vector3();
+
+function pickNextPassKind() {
+  if (passQueueIdx < OPENING_SEQUENCE.length) {
+    return OPENING_SEQUENCE[passQueueIdx++];
+  }
+  const pool = [
+    'mid_behind',
+    'distant_valley',
+    'valley_orbit',
+    'foreground_swoop',
+    'distant_valley',
+    'mid_behind',
+    'approach_perch',
+  ];
+  let pick = pool[Math.floor(Math.random() * pool.length)];
+  if (pick === lastRandomPass) {
+    pick = pool[(pool.indexOf(pick) + 1) % pool.length];
+  }
+  lastRandomPass = pick;
+  return pick;
+}
+
+function buildSweepCurve(kind) {
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  const birdMargin = 2.3;
+
+  if (kind === 'mid_behind') {
+    const zStart = -3.8 - Math.random() * 2.2;
+    const zMid = -4.6 - Math.random() * 2.8;
+    const zEnd = -4.0 - Math.random() * 2.5;
+    const xStart = -dir * (frustumHalfSizeAtZ(zStart).halfW + birdMargin);
+    const xEnd = dir * (frustumHalfSizeAtZ(zEnd).halfW + birdMargin);
+    const yBase = 1.05 + Math.random() * 1.45;
+    const pts = [
+      new THREE.Vector3(xStart, yBase + 0.55, zStart),
+      new THREE.Vector3(xStart * 0.35, yBase - 0.15, zMid + 0.4),
+      new THREE.Vector3(xEnd * 0.35, yBase + 0.35, zMid - 0.5),
+      new THREE.Vector3(xEnd, yBase + 0.95, zEnd),
+    ];
+    const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+    const speed = 3.2 + Math.random() * 0.6;
+    return { curve, dur: Math.max(4.8, curve.getLength() / speed), startsGliding: false };
+  }
+
+  if (kind === 'distant_valley') {
+    const zFar = -13.5 - Math.random() * 5.5;
+    const fFar = frustumHalfSizeAtZ(zFar);
+    const xStart = -dir * (fFar.halfW + birdMargin * 1.4);
+    const xEnd = dir * (fFar.halfW + birdMargin * 1.4);
+    const yHigh = 2.0 + Math.random() * Math.max(1.2, fFar.halfH * 0.45);
+    const yDip = yHigh - (0.9 + Math.random() * 1.1);
+    const pts = [
+      new THREE.Vector3(xStart, yHigh, zFar + 1.5),
+      new THREE.Vector3(xStart * 0.32, yDip, zFar - 1.2),
+      new THREE.Vector3(xEnd * 0.32, yDip + 0.55, zFar - 0.6),
+      new THREE.Vector3(xEnd, yHigh + 0.8, zFar + 1.0),
+    ];
+    const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+    const speed = 4.4 + Math.random() * 0.8;
+    return { curve, dur: Math.max(6.8, curve.getLength() / speed), startsGliding: true };
+  }
+
+  if (kind === 'foreground_swoop') {
+    const zFront = 3.0 + Math.random() * 1.2;
+    const fFront = frustumHalfSizeAtZ(zFront);
+    const xStart = -dir * (fFront.halfW + birdMargin);
+    const xEnd = dir * (fFront.halfW + birdMargin);
+    const yStart = 1.65 + Math.random() * 0.95;
+    const yDip = 0.55 + Math.random() * 0.65;
+    const pts = [
+      new THREE.Vector3(xStart, yStart, zFront - 0.5),
+      new THREE.Vector3(xStart * 0.30, yDip, zFront + 0.35),
+      new THREE.Vector3(xEnd * 0.30, yDip + 0.45, zFront + 0.15),
+      new THREE.Vector3(xEnd, yStart + 0.65, zFront - 0.7),
+    ];
+    const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+    const speed = 3.1 + Math.random() * 0.5;
+    return { curve, dur: Math.max(3.6, curve.getLength() / speed), startsGliding: false };
+  }
+
+  if (kind === 'valley_orbit') {
+    const zBack = -7.5 - Math.random() * 3.5;
+    const zFront = 2.9 + Math.random() * 0.9;
+    const xBackOut = frustumHalfSizeAtZ(zBack).halfW + birdMargin * 1.25;
+    const xTurnWide = Math.max(frustumHalfSizeAtZ(-1.0).halfW + birdMargin * 1.6, 5.4);
+    const xFrontOut = frustumHalfSizeAtZ(zFront).halfW + birdMargin * 1.2;
+    const pts = [
+      new THREE.Vector3(-dir * xBackOut, 2.5, zBack),
+      new THREE.Vector3(0, 1.55, zBack - 1.5),
+      new THREE.Vector3(dir * xTurnWide, 1.95, -2.2),
+      new THREE.Vector3(dir * xTurnWide * 0.92, 1.15, zFront + 0.2),
+      new THREE.Vector3(0, 0.85, zFront + 0.35),
+      new THREE.Vector3(-dir * xFrontOut, 1.85, zFront - 0.6),
+    ];
+    const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+    const speed = 3.7 + Math.random() * 0.5;
+    return { curve, dur: Math.max(9.5, curve.getLength() / speed), startsGliding: true };
+  }
+
+  // 'approach_perch': Low, level corvid swoop right onto the stone surface (zero steep nose-dive!)
+  const grounded = getGroundedRootPos(talonLocalOffsetY);
+  const zEntry = -2.2 - Math.random() * 1.8;
+  const xEntry = dir * (frustumHalfSizeAtZ(zEntry).halfW + birdMargin);
+  const sideOffset = dir * (viewMetrics.isWide ? 1.45 : 0.72);
+  const pts = [
+    new THREE.Vector3(xEntry, grounded.y + 1.95, zEntry),
+    new THREE.Vector3(grounded.x + sideOffset * 1.40, grounded.y + 0.62, grounded.z - 0.15),
+    new THREE.Vector3(grounded.x + sideOffset * 0.48, grounded.y + 0.12, grounded.z + 0.16),
+    grounded.clone(),
+  ];
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+  const speed = 2.95;
+  return { curve, dur: Math.max(3.2, Math.min(5.0, curve.getLength() / speed)), startsGliding: false };
+}
+
+function startNewPass(forcedKind = null) {
+  const kind = forcedKind || pickNextPassKind();
+  activePassName = kind;
+  landStarted = false;
+  if (kind === 'approach_perch') {
+    perchHeadingYaw = getActiveBaseYawRad() + (Math.random() - 0.5) * 0.22;
+  }
+  const built = buildSweepCurve(kind);
+  passCurve = built.curve;
+  passDuration = built.dur;
+  passElapsed = 0;
+  state = (kind === 'approach_perch') ? 'approach' : 'pass';
+  stateTime = 0;
+
+  curPos.copy(passCurve.getPointAt(0));
+  passCurve.getTangentAt(0, tmpTan).normalize();
+  smoothForward.copy(tmpTan);
+  prevForward.copy(tmpTan);
+  smoothBank = 0;
+  smoothPitch = THREE.MathUtils.clamp(-smoothForward.y * 0.60, -0.40, 0.40);
+
+  isGliding = built.startsGliding;
+  glideSwitchTimer = isGliding ? (2.6 + Math.random() * 2.0) : (1.8 + Math.random() * 1.4);
+  if (mixer) {
+    crossFadeTo(isGliding ? 'fly_glide' : 'fly_flap', 0.15, false, isGliding ? 0.95 : 1.0);
+  }
+  console.log(`[RAVEN_3D_PASS] kind=${kind} dur=${passDuration.toFixed(1)}s wide=${viewMetrics.isWide}`);
+}
+
+function startTakeoff() {
+  state = 'takeoff';
+  stateTime = 0;
+  const grounded = getGroundedRootPos(talonLocalOffsetY);
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  const zExit = -2.2 - Math.random() * 2.4;
+  const xExit = dir * (frustumHalfSizeAtZ(zExit).halfW + 2.4);
+  const pts = [
+    grounded.clone(),
+    new THREE.Vector3(grounded.x + dir * 0.85, grounded.y + 0.95, grounded.z + 0.25),
+    new THREE.Vector3(xExit * 0.55, grounded.y + 2.05, -0.4),
+    new THREE.Vector3(xExit, grounded.y + 2.95, zExit),
+  ];
+  passCurve = new THREE.CatmullRomCurve3(pts, false, 'centripetal', 0.5);
+  passDuration = Math.max(3.2, passCurve.getLength() / 2.95);
+  passElapsed = 0;
+  passCurve.getTangentAt(0.02, tmpTan).normalize();
+  smoothForward.copy(tmpTan);
+  prevForward.copy(tmpTan);
+  crossFadeTo('takeoff', 0.18, true, 1.0);
+}
+
+function startPerchBehavior() {
+  const picks = ['stand_idle_1', 'stand_idle_2', 'stand_idle_0'];
+  const chosen = picks[Math.floor(Math.random() * picks.length)];
+  crossFadeTo(actions[chosen] ? chosen : 'stand_idle_0', 0.24, false, 1.0);
+}
+
+function updateFlightVectors(tan, dt, bankScale = 1.0) {
+  if (tan.lengthSq() < 1e-6) return;
+  tan.normalize();
+  prevForward.copy(smoothForward);
+  smoothForward.lerp(tan, Math.min(1, dt * 5.0)).normalize();
+  tmpCross.crossVectors(prevForward, smoothForward);
+  const turnRate = tmpCross.y / Math.max(0.008, dt);
+  const targetBank = THREE.MathUtils.clamp(-turnRate * 0.65 * bankScale, -0.52, 0.52);
+  smoothBank = THREE.MathUtils.lerp(smoothBank, targetBank, Math.min(1, dt * 3.5));
+  const targetPitch = THREE.MathUtils.clamp(-smoothForward.y * 0.62, -0.40, 0.40);
+  smoothPitch = THREE.MathUtils.lerp(smoothPitch, targetPitch, Math.min(1, dt * 4.0));
+}
+
+function orientAlongTangent(tan, dt, bankScale = 1.0) {
+  updateFlightVectors(tan, dt, bankScale);
+  const yaw = Math.atan2(smoothForward.x, smoothForward.z);
+  ravenRoot.rotation.set(smoothPitch, yaw, smoothBank, 'YXZ');
+}
+
+const loader = new GLTFLoader();
+loader.load(
+  'https://thor-local.assets/raven/nordic_raven_3d.glb',
+  (gltf) => {
+    const model = gltf.scene;
+    model.traverse((obj) => {
+      if (obj.isMesh) {
+        obj.frustumCulled = false;
+        const origMats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        const matte = origMats.map((m) => {
+          if (!m) return m;
+          const std = new THREE.MeshStandardMaterial({
+            name: 'NordicRavenTrueMatte2K',
+            color: new THREE.Color(0xffffff),
+            map: m.map || null,
+            normalMap: m.normalMap || null,
+            normalScale: new THREE.Vector2(1.85, 1.85),
+            aoMap: m.aoMap || null,
+            aoMapIntensity: 0.45,
+            roughnessMap: null,
+            metalnessMap: null,
+            roughness: 0.90,
+            metalness: 0.0,
+            envMapIntensity: 0.0,
+            side: THREE.DoubleSide,
+            alphaTest: 0.26,
+            transparent: false,
+            depthWrite: true,
+          });
+          if (std.map) std.map.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+          if (std.normalMap) std.normalMap.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+          return std;
+        });
+        obj.material = Array.isArray(obj.material) ? matte : matte[0];
+      }
+    });
+
+    mixer = new THREE.AnimationMixer(model);
+    for (const clip of gltf.animations) {
+      actions[clip.name] = mixer.clipAction(clip);
+    }
+
+    model.position.set(0, 0, 0);
+    model.rotation.set(0, 0, 0);
+    model.scale.set(1, 1, 1);
+    crossFadeTo('fly_flap', 0.0, false, 1.0);
+    mixer.update(0.15);
+    model.updateMatrixWorld(true);
+
+    const flyBox = new THREE.Box3().setFromObject(model);
+    const flySize = new THREE.Vector3();
+    const flyCenter = new THREE.Vector3();
+    flyBox.getSize(flySize);
+    flyBox.getCenter(flyCenter);
+
+    const flyBoneBox = new THREE.Box3();
+    let boneCount = 0;
+    const bp = new THREE.Vector3();
+    model.traverse((o) => {
+      if (o.isBone) {
+        o.getWorldPosition(bp);
+        flyBoneBox.expandByPoint(bp);
+        boneCount++;
+      }
+    });
+    const flyBoneSize = new THREE.Vector3();
+    const flyBoneCenter = new THREE.Vector3();
+    if (boneCount > 0) {
+      flyBoneBox.getSize(flyBoneSize);
+      flyBoneBox.getCenter(flyBoneCenter);
+    }
+    const refSize = Math.max(flySize.x, flySize.y, flySize.z, flyBoneSize.x, flyBoneSize.y, flyBoneSize.z);
+    const refCenter = boneCount > 0 ? flyBoneCenter : flyCenter;
+    baseAutoScale = refSize > 0.0001 ? (2.25 / refSize) : 1.0;
+
+    function measureToeBoneMinY() {
+      let minToeY = Infinity;
+      model.traverse((o) => {
+        if (o.isBone && /digit|toe|claw|foot/i.test(o.name)) {
+          o.getWorldPosition(bp);
+          if (bp.y < minToeY) minToeY = bp.y;
+        }
+      });
+      return minToeY;
+    }
+
+    let standMinY = -0.00004;
+    if (actions['stand_idle_1']) {
+      actions['fly_flap'].stop();
+      currentAction = null;
+      crossFadeTo('stand_idle_1', 0.0, false, 1.0);
+      mixer.update(0.30);
+      model.updateMatrixWorld(true);
+      const minToeY = measureToeBoneMinY();
+      if (Number.isFinite(minToeY)) standMinY = Math.min(standMinY, minToeY);
+      actions['stand_idle_1'].stop();
+      currentAction = null;
+    }
+    talonLocalOffsetY = (standMinY - refCenter.y) * baseAutoScale;
+
+    // Sample exact toe-bone Y trajectory across the entire 'land' animation clip (zero hover / zero step-down!)
+    landToeSamples.length = 0;
+    if (actions['land']) {
+      const landAct = actions['land'];
+      landClipDur = Math.max(0.25, landAct.getClip().duration || 1.0);
+      landAct.reset();
+      landAct.setLoop(THREE.LoopOnce, 1);
+      landAct.clampWhenFinished = true;
+      landAct.setEffectiveWeight(1.0);
+      landAct.setEffectiveTimeScale(1.0);
+      landAct.play();
+      for (let s = 0; s <= 20; s++) {
+        landAct.time = (s / 20) * landClipDur;
+        mixer.update(0);
+        model.updateMatrixWorld(true);
+        const minToeY = measureToeBoneMinY();
+        const offY = Number.isFinite(minToeY) ? (minToeY - refCenter.y) * baseAutoScale : talonLocalOffsetY;
+        landToeSamples.push(offY);
+      }
+      landAct.stop();
+      currentAction = null;
+      console.log(`[LAND_CALIB] dur=${landClipDur.toFixed(2)}s standToe=${talonLocalOffsetY.toFixed(4)} land0=${landToeSamples[0].toFixed(4)} landMid=${landToeSamples[12].toFixed(4)} landEnd=${landToeSamples[20].toFixed(4)}`);
+    }
+
+    model.position.set(-refCenter.x, -refCenter.y, -refCenter.z);
+    ravenNormGroup.position.set(0, 0, 0);
+    ravenNormGroup.scale.setScalar(baseAutoScale);
+    ravenNormGroup.add(model);
+    ravenRoot.scale.setScalar(getEffectivePerchScale());
+
+    startNewPass();
+    console.log(`[RAVEN_3D_READY] clips=${gltf.animations.length} mode=${viewMetrics.isWide ? 'LANDSCAPE' : 'PORTRAIT'} viewport=${window.innerWidth}x${window.innerHeight}`);
+  },
+  undefined,
+  (err) => {
+    console.error(`[RAVEN_3D_ERROR] ${err && err.message ? err.message : String(err)}`);
+  }
+);
+
+function resize() {
+  DPR = Math.max(1, Math.min(2.25, window.devicePixelRatio || 1));
+  const cssW = Math.max(240, window.innerWidth);
+  const cssH = Math.max(240, window.innerHeight);
+  W = Math.round(cssW * DPR);
+  H = Math.round(cssH * DPR);
+  bgCanvas.width = W; bgCanvas.height = H;
+  frameCanvas.width = W; frameCanvas.height = H;
+
+  const minDim = Math.min(W, H);
+  pad = Math.max(38, Math.round(minDim * 0.056));
+  cornerR = Math.max(24, Math.round(minDim * 0.042));
+  const innerTuck = -4 * DPR;
+  const outerSpan = pad * 0.98 - innerTuck;
+  const perim = 2 * ((W - 2 * pad) - 2 * cornerR) + 2 * ((H - 2 * pad) - 2 * cornerR) + 2 * Math.PI * cornerR;
+  tileCount = Math.max(8, Math.min(24, Math.round(perim / (outerSpan * (1536 / 224)))));
+  borderPts = [];
+  for (let i = 0; i <= SEGS; i++) {
+    borderPts.push(sampleRoundedBorderAndNormal(i / SEGS, pad, pad, W - pad, H - pad, cornerR));
+  }
+
+  const padCss = pad / DPR;
+  const crCss = cornerR / DPR;
+  glCanvas.style.clipPath = `inset(${padCss}px ${padCss}px ${padCss}px ${padCss}px round ${crCss}px)`;
+
+  renderer.setPixelRatio(Math.min(DPR, 2.0));
+  renderer.setSize(cssW, cssH, false);
+  camera.aspect = cssW / cssH;
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld(true);
+}
+
+let lastMs = performance.now();
+let fpsCount = 0;
+let fpsAccum = 0;
+let loggedFpsOnce = false;
+
+function render(now) {
+  const dt = Math.max(0.004, Math.min(0.05, (now - lastMs) / 1000));
+  lastMs = now;
+  const tSec = (now - startMs) / 1000;
+  const minDim = Math.min(W, H);
+
+  // 1. Storm Valley, Lightning Bolts, Rune Glow & Light Rain
+  bgCtx.fillStyle = '#020305';
+  bgCtx.fillRect(0, 0, W, H);
+
+  const fl = pad, ft = pad, fw = W - 2 * pad, fh = H - 2 * pad;
+  const isWide = fw >= fh;
+  const baseImg = isWide ? wideBase : tallBase;
+  const boltImgs = isWide ? wideBolts : tallBolts;
+
+  bgCtx.save();
+  drawRoundedRectPath(bgCtx, fl, ft, fw, fh, cornerR);
+  bgCtx.clip();
+
+  let peakFlash = 0;
+  if (baseImg.complete && baseImg.naturalWidth > 0) {
+    const scale = Math.max(fw / baseImg.naturalWidth, fh / baseImg.naturalHeight);
+    const dw = baseImg.naturalWidth * scale;
+    const dh = baseImg.naturalHeight * scale;
+    const dx = fl + (fw - dw) * 0.5;
+    const dy = ft + (fh - dh) * 0.5;
+    viewMetrics.fl = fl; viewMetrics.ft = ft; viewMetrics.fw = fw; viewMetrics.fh = fh;
+    viewMetrics.dx = dx; viewMetrics.dy = dy; viewMetrics.dw = dw; viewMetrics.dh = dh;
+    viewMetrics.isWide = isWide;
+
+    bgCtx.drawImage(baseImg, dx, dy, dw, dh);
+
+    bgCtx.save();
+    bgCtx.globalCompositeOperation = 'screen';
+    for (let i = 0; i < strikes.length; i++) {
+      const st = strikes[i];
+      if (now >= st.nextAt) {
+        st.startedAt = now; st.duration = 340 + Math.random() * 260;
+        st.power = 0.85 + Math.random() * 0.35;
+        st.nextAt = now + 2100 + Math.random() * 4800;
+      }
+      const age = now - st.startedAt;
+      if (age >= 0 && age <= st.duration) {
+        const p = age / st.duration;
+        let env = 0;
+        if (p < 0.12) env = p / 0.12;
+        else if (p < 0.28) env = 1.0 - ((p - 0.12) / 0.16) * 0.72;
+        else if (p < 0.44) env = 0.28 + ((p - 0.28) / 0.16) * 0.72;
+        else env = Math.max(0, 1.0 - (p - 0.44) / 0.56);
+        env *= st.power;
+        if (env > 0.02 && boltImgs[i].complete && boltImgs[i].naturalWidth > 0) {
+          peakFlash = Math.max(peakFlash, env);
+          bgCtx.globalAlpha = Math.min(1, env);
+          bgCtx.drawImage(boltImgs[i], dx, dy, dw, dh);
+          if (env > 0.65) {
+            bgCtx.globalAlpha = Math.min(0.70, (env - 0.55) * 0.80);
+            bgCtx.drawImage(boltImgs[i], dx, dy, dw, dh);
+          }
+        }
+      }
+    }
+    bgCtx.restore();
+
+    const runePulse = 0.50 + 0.50 * Math.sin(tSec * 1.85);
+    const rg = bgCtx.createRadialGradient(fl + fw * 0.5, ft + fh * 0.63, minDim * 0.01, fl + fw * 0.5, ft + fh * 0.63, minDim * 0.26);
+    rg.addColorStop(0, `rgba(254, 215, 102, ${(0.06 + 0.09 * runePulse).toFixed(3)})`);
+    rg.addColorStop(1, 'rgba(212, 162, 52, 0)');
+    bgCtx.fillStyle = rg;
+    bgCtx.fillRect(fl, ft, fw, fh);
+
+    bgCtx.save();
+    bgCtx.lineCap = 'round';
+    for (const rd of rainDrops) {
+      rd.y += rd.speed * dt; rd.x += rd.speed * dt * 0.16;
+      if (rd.y > 1.05) { rd.y = -0.05; rd.x = Math.random(); }
+      if (rd.x > 1.05) rd.x -= 1.05;
+      const x1 = fl + rd.x * fw, y1 = ft + rd.y * fh;
+      bgCtx.strokeStyle = `rgba(224, 236, 250, ${Math.min(0.40, rd.alpha * (1 + peakFlash * 1.9)).toFixed(3)})`;
+      bgCtx.lineWidth = Math.max(1.0, DPR * 0.75);
+      bgCtx.beginPath(); bgCtx.moveTo(x1, y1); bgCtx.lineTo(x1 + rd.len * fh * 0.16, y1 + rd.len * fh); bgCtx.stroke();
+    }
+    bgCtx.restore();
+  }
+  bgCtx.restore();
+
+  // 2. Sync Z-Buffer Pedestal Occluder & Live 3D Nordic Raven
+  updateOccluderPlane();
+  updatePerchWorldFromBackdrop();
+
+  if (lastIsWide !== null && lastIsWide !== viewMetrics.isWide) {
+    perchHeadingYaw = getActiveBaseYawRad();
+    if (state === 'perched' || state === 'landing') {
+      curPos.copy(getGroundedRootPos(talonLocalOffsetY));
+    } else if (state === 'approach') {
+      startNewPass('approach_perch');
+    }
+  }
+  lastIsWide = viewMetrics.isWide;
+  boltLight.intensity = peakFlash * 3.4;
+
+  if (mixer) {
+    mixer.update(dt);
+    stateTime += dt;
+    const effScale = getEffectivePerchScale();
+    let targetShadowOpacity = 0.0;
+    ravenRoot.scale.setScalar(THREE.MathUtils.lerp(ravenRoot.scale.x, effScale, Math.min(1, dt * 4.0)));
+
+    if (state === 'gap') {
+      ravenRoot.visible = false;
+      passGapTimer -= dt;
+      if (passGapTimer <= 0) {
+        ravenRoot.visible = true;
+        startNewPass();
+      }
+    } else if (state === 'pass' && passCurve) {
+      ravenRoot.visible = true;
+      passElapsed += dt;
+      const u = Math.min(1, passElapsed / passDuration);
+      passCurve.getPointAt(u, curPos);
+      passCurve.getTangentAt(u, tmpTan);
+      orientAlongTangent(tmpTan, dt, 1.0);
+
+      glideSwitchTimer -= dt;
+      const climbing = tmpTan.y > 0.075;
+      const flapSpeed = curPos.z < -9.0 ? 0.88 : 1.02;
+      if (climbing) {
+        if (isGliding) { isGliding = false; crossFadeTo('fly_flap', 0.35, false, flapSpeed); }
+      } else if (glideSwitchTimer <= 0) {
+        isGliding = !isGliding;
+        glideSwitchTimer = isGliding ? (3.0 + Math.random() * 2.4) : (2.0 + Math.random() * 1.6);
+        crossFadeTo(isGliding ? 'fly_glide' : 'fly_flap', 0.42, false, isGliding ? 0.94 : flapSpeed);
+      }
+
+      if (u >= 1.0) {
+        state = 'gap';
+        passGapTimer = 0.6 + Math.random() * 1.2;
+      }
+    } else if (state === 'approach' && passCurve) {
+      ravenRoot.visible = true;
+      passElapsed += dt;
+      const rawU = Math.min(1, passElapsed / passDuration);
+      const timeLeft = Math.max(0, passDuration - passElapsed);
+      // Fire 'land' clip so exact touchdown (~60% into clip) lands flush on stone with zero mid-air hover
+      const landLeadSec = Math.min(landClipDur * 0.60, Math.max(0.42, passDuration * 0.30));
+      const flareWindow = Math.max(0.70, landLeadSec * 1.25);
+      const flareRaw = Math.max(0, Math.min(1, 1 - timeLeft / flareWindow));
+      const flareBlend = flareRaw * flareRaw * (3 - 2 * flareRaw);
+
+      if (!landStarted && timeLeft <= landLeadSec) {
+        landStarted = true;
+        crossFadeTo('land', 0.16, true, 1.0);
+      }
+
+      const u = 1 - Math.pow(1 - rawU, 1.32);
+      passCurve.getPointAt(u, curPos);
+      passCurve.getTangentAt(Math.min(0.995, u), tmpTan);
+      updateFlightVectors(tmpTan, dt, 0.7);
+
+      // Compensate any pelvis/root offset inside 'land' so claws meet exact stone surface at rawU = 1.0
+      if (landStarted) {
+        const landNorm = Math.min(1, (actions['land'] ? actions['land'].time : 0) / landClipDur);
+        const toeDeltaY = (talonLocalOffsetY - sampleLandToeOffset(landNorm)) * effScale;
+        curPos.y += toeDeltaY * flareBlend;
+      }
+
+      // Level pitch & bank + align heading cleanly DURING the flare before touching rock
+      const flightYaw = Math.atan2(smoothForward.x, smoothForward.z);
+      const finalPitch = THREE.MathUtils.lerp(smoothPitch, 0, flareBlend);
+      const finalBank = THREE.MathUtils.lerp(smoothBank, 0, flareBlend);
+      const finalYaw = lerpAngle(flightYaw, perchHeadingYaw, flareBlend * 0.80);
+      ravenRoot.rotation.set(finalPitch, finalYaw, finalBank, 'YXZ');
+
+      targetShadowOpacity = Math.max(0, (flareRaw - 0.15) / 0.85) * 0.92;
+      if (rawU >= 1.0) {
+        state = 'landing';
+        stateTime = 0;
+      }
+    } else if (state === 'landing') {
+      // Claws are ALREADY planted flush on stone — finish folding wings cleanly with zero vertical drop
+      ravenRoot.visible = true;
+      const landNorm = Math.min(1, (actions['land'] ? actions['land'].time : landClipDur) / landClipDur);
+      const curToeOff = sampleLandToeOffset(landNorm);
+      curPos.copy(getGroundedRootPos(curToeOff));
+      targetShadowOpacity = 0.92;
+      ravenRoot.rotation.x = THREE.MathUtils.lerp(ravenRoot.rotation.x, 0, Math.min(1, dt * 12));
+      ravenRoot.rotation.z = THREE.MathUtils.lerp(ravenRoot.rotation.z, 0, Math.min(1, dt * 12));
+      ravenRoot.rotation.y = lerpAngle(ravenRoot.rotation.y, perchHeadingYaw, Math.min(1, dt * 9));
+      if (landNorm >= 0.95 || stateTime >= 0.55) {
+        state = 'perched';
+        stateTime = 0;
+        perchBlendTimer = 0;
+        perchStartToeOff = curToeOff;
+        perchDuration = 10.0 + Math.random() * 7.0;
+        startPerchBehavior();
+      }
+    } else if (state === 'perched') {
+      ravenRoot.visible = true;
+      perchBlendTimer = Math.min(0.24, perchBlendTimer + dt);
+      const pb = perchBlendTimer / 0.24;
+      const curToeOff = THREE.MathUtils.lerp(perchStartToeOff, talonLocalOffsetY, pb);
+      curPos.copy(getGroundedRootPos(curToeOff));
+      targetShadowOpacity = 0.92;
+      ravenRoot.rotation.set(0, perchHeadingYaw, 0, 'YXZ');
+      if (stateTime >= perchDuration) startTakeoff();
+    } else if (state === 'takeoff' && passCurve) {
+      ravenRoot.visible = true;
+      passElapsed += dt;
+      const rawU = Math.min(1, passElapsed / passDuration);
+      const u = Math.pow(rawU, 0.88);
+      passCurve.getPointAt(u, curPos);
+      passCurve.getTangentAt(Math.min(0.995, u), tmpTan);
+      targetShadowOpacity = Math.max(0, 1 - rawU * 4.5) * 0.90;
+      if (rawU > 0.24 && currentClipName !== 'fly_flap') {
+        crossFadeTo('fly_flap', 0.24, false, 1.06);
+      }
+      orientAlongTangent(tmpTan, dt, 0.85);
+      if (rawU >= 1.0) {
+        state = 'gap';
+        passGapTimer = 0.9 + Math.random() * 1.4;
+      }
+    }
+
+    ravenRoot.position.copy(curPos);
+    contactShadow.material.opacity = THREE.MathUtils.lerp(contactShadow.material.opacity, targetShadowOpacity, Math.min(1, dt * 9));
+  }
+  renderer.render(scene, camera);
+
+  // 3. Top Overlay: 1:1 Calm Molten Gold Rim (18s CW) + Outer Stardust (26s CCW)
+  frameCtx.clearRect(0, 0, W, H);
+  const cwPhase = ((now - startMs) % 18000) / 18000;
+  const ccwPhase = 1.0 - (((now - startMs) % 26000) / 26000);
+  const pulse = 0.89 + 0.11 * Math.sin(tSec * 1.6);
+  drawAspectLockedGoldStrip(frameCtx, rimCw, cwPhase, pulse);
+  drawAspectLockedGoldStrip(frameCtx, dustCcw, ccwPhase, 0.75 * (0.82 + 0.18 * Math.sin(tSec * 2.1 + 1.2)));
+
+  fpsCount++;
+  fpsAccum += dt;
+  if (!loggedFpsOnce && mixer && fpsAccum >= 2.0) {
+    loggedFpsOnce = true;
+    console.log(`[RAVEN_3D_TELEMETRY] fps=${Math.round(fpsCount / fpsAccum)} pass=${activePassName} z=${curPos.z.toFixed(1)} occW=${occWideLoaded} occT=${occTallLoaded}`);
+  }
+
+  requestAnimationFrame(render);
+}
+
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
