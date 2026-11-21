@@ -209,30 +209,11 @@ class ThorLocalBrain(private val context: Context) {
             if (spokeCaine) return
             Log.w(TAG, "Pocket-TTS INT8 fallback triggered -> using system British TTS")
         }
-        // Safety fallback: system UK TTS with Centh -> Kent phonetics
-        val engineTts = tts
-        if (!ttsReady || engineTts == null) {
-            onStart?.invoke()
-            onDone?.invoke()
-            return
-        }
-        val spoken = text
-            .replace(Regex("\\bCenth's\\b", RegexOption.IGNORE_CASE), "Kent's")
-            .replace(Regex("\\bCenth\\b", RegexOption.IGNORE_CASE), "Kent")
-        val utteranceId = UUID.randomUUID().toString()
-        engineTts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(id: String?) {
-                onStart?.invoke()
-            }
-            override fun onDone(id: String?) {
-                onDone?.invoke()
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(id: String?) {
-                onDone?.invoke()
-            }
-        })
-        engineTts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+        // WO-223 Voice Lock: NEVER fall back to Android's robotic system Locale.UK male voice.
+        // On-device Michael Caine Pocket-TTS INT8 is the sole offline voice; fail silently if unavailable.
+        Log.w(TAG, "WO-223 Voice Lock: Pocket-TTS INT8 unavailable/failed — skipping robotic system UK TTS fallback.")
+        onStart?.invoke()
+        onDone?.invoke()
     }
 
     private fun wrapPcm16MonoInWav(pcmData: ByteArray, sampleRate: Int): ByteArray {

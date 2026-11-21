@@ -70,6 +70,7 @@ class RavenCenterActivity : AppCompatActivity() {
         private val replaySeq = AtomicLong(0L)
         @Volatile private var activeReplayPlayer: MediaPlayer? = null
         @Volatile private var activeReplayFile: File? = null
+        @Volatile private var offlinePocketCaine: ThorPocketCaineEngine? = null
         @Volatile private var lastReplayTapMs: Long = 0L
         @Volatile private var lastReplayTextHash: Int = 0
 
@@ -139,6 +140,7 @@ class RavenCenterActivity : AppCompatActivity() {
                 activeReplayFile = null
             }
             try { fallbackTts?.stop() } catch (_: Exception) {}
+            try { offlinePocketCaine?.stopPlayback() } catch (_: Exception) {}
 
             val mySeq = replaySeq.incrementAndGet()
             val app = context.applicationContext
@@ -216,8 +218,21 @@ class RavenCenterActivity : AppCompatActivity() {
                         try { tmp?.delete() } catch (_: Exception) {}
                     }
                 }
-                if (replaySeq.get() == mySeq && fallbackTts != null) {
-                    fallbackTts.speak(cleanText.take(900), TextToSpeech.QUEUE_FLUSH, null, "raven_tts")
+                // WO-223 Voice Lock: Route offline/choppy-signal Raven replays to on-device Michael Caine Pocket-TTS INT8;
+                // NEVER fall back to Android robotic system Locale.UK male voice.
+                if (replaySeq.get() == mySeq) {
+                    try {
+                        val caine = synchronized(replayLock) {
+                            offlinePocketCaine ?: ThorPocketCaineEngine(app).also { offlinePocketCaine = it }
+                        }
+                        if (caine.isModelAvailable()) {
+                            caine.speakBlocking(cleanText.take(900))
+                        } else {
+                            Log.w("RavenReplay", "WO-223 Voice Lock: Cloud WAV & on-device Pocket-TTS unavailable; skipping system UK TTS.")
+                        }
+                    } catch (e: Exception) {
+                        Log.w("RavenReplay", "On-device Pocket-TTS replay note: ${e.message}")
+                    }
                 }
             }
         }
