@@ -779,6 +779,9 @@ class FloatingThorService : Service() {
     }
 
     private fun shutdownService() {
+        // WO-196 Uber/Lyft Safety Lock: always terminate Display Share & Rear Camera when Floating Thor closes
+        try { ThorDisplayShareService.stopSharing(this) } catch (_: Exception) {}
+        try { ThorFlashlightAndLensService.stopRearCamera(this) } catch (_: Exception) {}
         val wasAwaiting = awaitingThorReply
         userRequestedStop = true
         canAutoResumeMic = false
@@ -2532,6 +2535,13 @@ class FloatingThorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        // WO-196 Fail-Safe: never let MediaProjection screen capture outlive FloatingThorService
+        if (ThorDisplayShareService.isDisplayShareActive) {
+            try { ThorDisplayShareService.stopSharing(this) } catch (_: Exception) {}
+        }
+        if (ThorFlashlightAndLensService.isRearCameraActive) {
+            try { ThorFlashlightAndLensService.stopRearCamera(this) } catch (_: Exception) {}
+        }
         val shouldReviveAfterTaskSwipe = !userRequestedStop &&
             !getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).getBoolean("user_stopped", false)
         if (shouldReviveAfterTaskSwipe) {

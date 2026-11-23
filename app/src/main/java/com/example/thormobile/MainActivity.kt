@@ -877,6 +877,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopFloatingThorOverlay() {
         try {
+            // WO-196 Safety Lock: guarantee Display Share & Rear Camera shut down with Floating Thor
+            if (ThorDisplayShareService.isDisplayShareActive) {
+                ThorDisplayShareService.stopSharing(this)
+            }
+            if (ThorFlashlightAndLensService.isRearCameraActive) {
+                ThorFlashlightAndLensService.stopRearCamera(this)
+            }
             getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", true).apply()
             FloatingThorService.userRequestedStop = true
             val stopIntent = Intent(this, FloatingThorService::class.java).apply {

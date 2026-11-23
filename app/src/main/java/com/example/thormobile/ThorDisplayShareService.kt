@@ -110,17 +110,30 @@ class ThorDisplayShareService : Service() {
         }
 
         fun stopSharing(context: Context) {
+            val svc = activeService
+            val wasActive = isDisplayShareActive || svc != null
             isDisplayShareActive = false
             latestFrameJson = ""
-            dispatchPacket(
-                JSONObject()
-                    .put("action", "screen_watcher_state")
-                    .put("type", "screen_watcher_state")
-                    .put("active", false)
-                    .toString()
-            )
+            // WO-196 Safety Lock: synchronously release MediaProjection/VirtualDisplay & only notify cloud if active
+            if (svc != null) {
+                try {
+                    svc.forceImmediateTeardown(notifyCloudOff = wasActive)
+                } catch (_: Exception) {}
+            } else if (wasActive) {
+                dispatchPacket(
+                    JSONObject()
+                        .put("action", "screen_watcher_state")
+                        .put("type", "screen_watcher_state")
+                        .put("active", false)
+                        .toString()
+                )
+            }
             try {
                 context.stopService(Intent(context, ThorDisplayShareService::class.java))
+            } catch (_: Exception) {}
+            try {
+                val nm = context.getSystemService(NotificationManager::class.java)
+                nm?.cancel(SHARE_NOTIF_ID)
             } catch (_: Exception) {}
         }
 
@@ -418,8 +431,25 @@ class ThorDisplayShareService : Service() {
         }
     }
 
+    fun forceImmediateTeardown(notifyCloudOff: Boolean) {
+        teardownShare(notifyCloudOff = notifyCloudOff)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (_: Exception) {}
+        try {
+            getSystemService(NotificationManager::class.java)?.cancel(SHARE_NOTIF_ID)
+        } catch (_: Exception) {}
+        stopSelf()
+    }
+
     override fun onDestroy() {
-        teardownShare(notifyCloudOff = true)
+        val hadActiveProjection = isDisplayShareActive || mediaProjection != null || virtualDisplay != null
+        teardownShare(notifyCloudOff = hadActiveProjection)
         if (activeService === this) activeService = null
         try { workerThread?.quitSafely() } catch (_: Exception) {}
         workerThread = null
