@@ -310,7 +310,7 @@ object ObdLinkAutoWatchdog {
 
     @SuppressLint("MissingPermission")
     fun startAutonomousWatchdog(serverBaseUrl: String) {
-        pingWatchdogNow(serverBaseUrl)
+        // WO-227 FinOps: zero boot HTTP ping to Cloud Run until Bluetooth actually connects to OBDLink MX+
         if (running) return
         running = true
         Log.i(TAG, "Starting Bulletproof OBDLink MX+ Master Diagnostic Watchdog (V19.0)...")
@@ -328,13 +328,9 @@ object ObdLinkAutoWatchdog {
                 var lastValidFrame = ""
 
                 try {
-                    syncCloudWatchdogStatus(serverBaseUrl)
                     if (cloudWatchdogMode == "off") {
-                        for (i in 0 until 4) {
-                            Thread.sleep(8000)
-                            syncCloudWatchdogStatus(serverBaseUrl)
-                            if (cloudWatchdogMode != "off") break
-                        }
+                        // WO-227 FinOps: 0 Cloud Run pings when OBD Watchdog is OFF
+                        Thread.sleep(120_000L)
                         continue
                     }
 
@@ -395,8 +391,13 @@ object ObdLinkAutoWatchdog {
                         var timingAdv = 12.0
                         var baroPsi = 14.5
 
+                        var lastConnectedCloudSyncMs = 0L
                         while (running && socket.isConnected && cloudWatchdogMode != "off") {
-                            syncCloudWatchdogStatus(serverBaseUrl)
+                            val nowSyncMs = System.currentTimeMillis()
+                            if (nowSyncMs - lastConnectedCloudSyncMs >= 30_000L) {
+                                lastConnectedCloudSyncMs = nowSyncMs
+                                syncCloudWatchdogStatus(serverBaseUrl)
+                            }
                             if (cloudWatchdogMode == "off") {
                                 Log.i(TAG, "Boss switched Watchdog to OFF — closing Bluetooth socket immediately to free OBDLink app.")
                                 break
@@ -663,12 +664,9 @@ object ObdLinkAutoWatchdog {
                     try { socket?.close() } catch (_: Exception) {}
                 }
 
-                val waitCycles = if (cloudWatchdogMode == "live") 1 else 6
-                for (w in 0 until waitCycles) {
-                    Thread.sleep(8000)
-                    syncCloudWatchdogStatus(serverBaseUrl)
-                    if (cloudWatchdogMode == "live" || pendingServerCmd.isNotEmpty()) break
-                }
+                // WO-227 FinOps: 0 Cloud Run pings when parked/BT disconnected (local Bluetooth check only = $0.00)
+                val idleSleepMs = if (cloudWatchdogMode == "live") 15_000L else 60_000L
+                Thread.sleep(idleSleepMs)
             }
         }
     }

@@ -156,6 +156,83 @@ class MainActivity : AppCompatActivity() {
         root.addView(buildMjolnirPedestalHero())
 
         // ====================================================================
+        // 2B. WO-227 SMART SHIFT CLOUD SWITCH (AWAKE = WARM / SLEEP = $0/HR)
+        // ====================================================================
+        val shiftBar = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            val padH = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 14f, resources.displayMetrics).toInt()
+            val padV = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 10f, resources.displayMetrics).toInt()
+            val topM = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 10f, resources.displayMetrics).toInt()
+            setPadding(padH, padV, padH, padV)
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { setMargins(0, topM, 0, 0) }
+        }
+        val shiftTextCol = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val shiftTitleTv = android.widget.TextView(this).apply {
+            text = "SHIFT CLOUD MODE"
+            setTextColor(android.graphics.Color.parseColor("#F5D061"))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            letterSpacing = 0.08f
+        }
+        val shiftSubTv = android.widget.TextView(this).apply {
+            setTextColor(android.graphics.Color.parseColor("#94A3B8"))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+        }
+        shiftTextCol.addView(shiftTitleTv)
+        shiftTextCol.addView(shiftSubTv)
+        val shiftPillTv = android.widget.TextView(this).apply {
+            val ph = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics).toInt()
+            val pv = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 6f, resources.displayMetrics).toInt()
+            setPadding(ph, pv, ph, pv)
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = android.view.Gravity.CENTER
+        }
+        shiftBar.addView(shiftTextCol)
+        shiftBar.addView(shiftPillTv)
+        fun refreshShiftSwitchUi() {
+            val awake = VikingPopupOverlayManager.isShiftAwake(this@MainActivity)
+            val rad = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 14f, resources.displayMetrics)
+            val strokePx = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, 1.5f, resources.displayMetrics).toInt().coerceAtLeast(1)
+            shiftBar.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = rad
+                setColor(android.graphics.Color.parseColor(if (awake) "#131C2E" else "#0C111B"))
+                setStroke(strokePx, android.graphics.Color.parseColor(if (awake) "#D97706" else "#334155"))
+            }
+            shiftSubTv.text = if (awake) {
+                "AWAKE • Warm Voice & Ravens (auto-sleeps 14h)"
+            } else {
+                "SLEEP • $0.00/hr Cloud Idle (tap in morning to wake)"
+            }
+            shiftPillTv.text = if (awake) "AWAKE" else "SLEEP"
+            shiftPillTv.setTextColor(android.graphics.Color.parseColor(if (awake) "#FEF08A" else "#94A3B8"))
+            shiftPillTv.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = rad
+                setColor(android.graphics.Color.parseColor(if (awake) "#14532D" else "#1E293B"))
+                setStroke(strokePx, android.graphics.Color.parseColor(if (awake) "#22C55E" else "#475569"))
+            }
+        }
+        refreshShiftSwitchUi()
+        shiftBar.setOnClickListener {
+            val nextAwake = !VikingPopupOverlayManager.isShiftAwake(this@MainActivity)
+            VikingPopupOverlayManager.setShiftAwake(this@MainActivity, nextAwake, CLOUD_URL)
+            refreshShiftSwitchUi()
+            Toast.makeText(
+                this@MainActivity,
+                if (nextAwake) "Shift AWAKE — warming Thor Cloud" else "Shift SLEEP — $0/hr Cloud Idle",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+        root.addView(shiftBar)
+
+        // ====================================================================
         // 3. 2-COLUMN STRAIGHT-DOWN CLASSIC ROUND FLOATING ORB GRID (10 APPS)
         // ====================================================================
         root.addView(buildNorseSectionDivider("ᛟ   COMMAND ORBS   ᛟ"))

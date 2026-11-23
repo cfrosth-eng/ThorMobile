@@ -718,6 +718,11 @@ object VikingPopupOverlayManager {
     private fun showLivingRavenEmblem(cleanBase: String) {
         val ctx = appCtx ?: return
         if (!Settings.canDrawOverlays(ctx)) return
+        // WO-230 Single-Icon Guard: never stack a second Living Raven emblem over an active FloatingThorService pedestal
+        if (LivingPedestalDirector.isPedestalAttached()) {
+            hideLivingRavenEmblem()
+            return
+        }
         ensureRavenBitmapsLoaded(ctx)
         val baseB = ravenBaseBmp ?: run {
             openUnfoldedRavenMessageCard(cleanBase)
@@ -903,7 +908,7 @@ object VikingPopupOverlayManager {
         }
     }
 
-    private fun hideLivingRavenEmblem() {
+    fun hideLivingRavenEmblem() {
         ravenLoopAnimator?.cancel()
         ravenLoopAnimator = null
         val rv = livingRavenView ?: return
@@ -1133,15 +1138,68 @@ object VikingPopupOverlayManager {
         return if (cleanedBody.isNotBlank()) cleanedBody else "Tap a gold link button below to open."
     }
 
+    private const val SHIFT_PREFS = "thor_shift_prefs"
+    private const val KEY_SHIFT_AWAKE = "shift_awake"
+    private const val KEY_SHIFT_SINCE_MS = "shift_awake_since_ms"
+    private const val MAX_SHIFT_AWAKE_MS = 14L * 60L * 60L * 1000L
+
+    fun isShiftAwake(ctx: Context?): Boolean {
+        val c = ctx ?: appCtx ?: return true
+        val sp = c.getSharedPreferences(SHIFT_PREFS, Context.MODE_PRIVATE)
+        val awake = sp.getBoolean(KEY_SHIFT_AWAKE, true)
+        if (!awake) return false
+        val sinceMs = sp.getLong(KEY_SHIFT_SINCE_MS, 0L)
+        if (sinceMs > 0L && (System.currentTimeMillis() - sinceMs) >= MAX_SHIFT_AWAKE_MS) {
+            sp.edit().putBoolean(KEY_SHIFT_AWAKE, false).apply()
+            Log.i(TAG, "WO-227: 14-hour auto-sleep safety valve triggered -> Shift SLEEP ($0/hr Cloud Run idle).")
+            return false
+        }
+        return true
+    }
+
+    fun setShiftAwake(ctx: Context, awake: Boolean, serverBaseUrl: String) {
+        val app = ctx.applicationContext
+        appCtx = app
+        val sp = app.getSharedPreferences(SHIFT_PREFS, Context.MODE_PRIVATE)
+        val ed = sp.edit().putBoolean(KEY_SHIFT_AWAKE, awake)
+        if (awake) {
+            ed.putLong(KEY_SHIFT_SINCE_MS, System.currentTimeMillis())
+        }
+        ed.apply()
+        if (awake) {
+            val cleanBase = serverBaseUrl.trimEnd('/')
+            thread(start = true, isDaemon = true, name = "ThorShiftWarmupPing") {
+                try {
+                    val req = Request.Builder()
+                        .url("$cleanBase/ping?warm=1&src=shift_awake&t=${System.currentTimeMillis()}")
+                        .header("User-Agent", "ThorShiftWake/227 (Samsung-Note20Ultra)")
+                        .get()
+                        .build()
+                    http.newCall(req).execute().close()
+                    Log.i(TAG, "WO-227: Shift AWAKE -> warmed Cloud Run container.")
+                } catch (_: Exception) {}
+            }
+        } else {
+            Log.i(TAG, "WO-227: Shift SLEEP -> background Cloud Run polling paused ($0/hr idle).")
+        }
+    }
+
     fun start(context: Context, serverBaseUrl: String) {
         appCtx = context.applicationContext
         val cleanBase = serverBaseUrl.trimEnd('/')
         if (polling) return
         polling = true
-        Log.i(TAG, "Starting Viking Pop-Up Herald V8 (WO-145 Ultra-HD Living Raven V3 + Clockwise Floating Gold Ring)...")
+        Log.i(TAG, "Starting Viking Pop-Up Herald V8 (WO-227 Shift-Aware FinOps + WO-145 Living Raven V3)...")
 
         thread(start = true, isDaemon = true, name = "VikingPopupPoller") {
             while (polling) {
+                val nowMs = System.currentTimeMillis()
+                val fastActive = nowMs < fastPollUntilEpochMs
+                if (!fastActive && !isShiftAwake(appCtx)) {
+                    // WO-227 FinOps: Shift SLEEP -> 0 Cloud Run HTTP requests overnight ($0.00/hr)
+                    Thread.sleep(30000L)
+                    continue
+                }
                 try {
                     val req = Request.Builder()
                         .url("$cleanBase/api/pre-approval?action=status&t=${System.currentTimeMillis()}")
@@ -1155,7 +1213,14 @@ object VikingPopupOverlayManager {
                         }
                     }
                 } catch (_: Exception) {}
-                val sleepMs = if (System.currentTimeMillis() < fastPollUntilEpochMs) 2500L else 10000L
+                val pm = appCtx?.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                val screenInteractive = try { pm?.isInteractive ?: true } catch (_: Exception) { true }
+                // WO-227 FinOps: 2.5s fast-poll on active replies, 20s screen-on awake, 90s screen-off awake
+                val sleepMs = when {
+                    System.currentTimeMillis() < fastPollUntilEpochMs -> 2500L
+                    screenInteractive -> 20000L
+                    else -> 90000L
+                }
                 Thread.sleep(sleepMs)
             }
         }

@@ -447,6 +447,8 @@ class FloatingThorService : Service() {
         params.gravity = Gravity.TOP or Gravity.START
         params.x = defaultX
         params.y = defaultY
+        // WO-230 Single-Icon Guard: clear any standalone Raven emblem so strictly ONE icon occupies (-4dp, 20dp)
+        VikingPopupOverlayManager.hideLivingRavenEmblem()
         windowManager.addView(floatingView, params)
 
         applyVisualState()
@@ -1804,7 +1806,8 @@ class FloatingThorService : Service() {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                .setWillPauseWhenDucked(true)
+                // WO-231: allow smooth ducking instead of pausing/cutting playback on Uber offer notification pings
+                .setWillPauseWhenDucked(false)
                 .setOnAudioFocusChangeListener(audioFocusListener, mainHandler)
                 .build()
             audioFocusRequest = request
@@ -1952,10 +1955,11 @@ class FloatingThorService : Service() {
 
                 if (inPlaybackWindow) {
                     val inCalibOrVolGrace = (nowPlaybackMs < volChangedCooldownUntilMs) || (nowPlaybackMs - playbackStartedAtMs < 420L)
+                    // WO-231: raised wet-road/rain cabin spray margin & sustained-voice streak (9 frames / 2.2s cooldown)
                     val bargeTrig = if (cachedExternalAudioOut) {
-                        kotlin.math.max(780.0, echoBaselineRms * 1.85 + 340.0)
+                        kotlin.math.max(950.0, echoBaselineRms * 2.15 + 420.0)
                     } else {
-                        kotlin.math.max(960.0 + volRatio * 600.0, echoBaselineRms * 1.90 + 400.0)
+                        kotlin.math.max(1150.0 + volRatio * 680.0, echoBaselineRms * 2.20 + 480.0)
                     }
 
                     if (inCalibOrVolGrace || !canBargeNow) {
@@ -1965,7 +1969,7 @@ class FloatingThorService : Service() {
                         localBargeInStreak = 0
                     } else if (vocalRms >= bargeTrig) {
                         localBargeInStreak += 1
-                        if (localBargeInStreak >= 6 && !bargeRecordingActive && (nowPlaybackMs - lastBargeCheckSentMs) >= 1800L) {
+                        if (localBargeInStreak >= 9 && !bargeRecordingActive && (nowPlaybackMs - lastBargeCheckSentMs) >= 2200L) {
                             bargeRecordingActive = true
                             bargeStartedMs = nowPlaybackMs
                             bargeLastVoiceMs = nowPlaybackMs
