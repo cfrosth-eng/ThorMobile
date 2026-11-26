@@ -99,7 +99,7 @@ object VikingPopupOverlayManager {
     @Volatile private var latestPatchTitle: String = "Active Upgrade"
 
     @Volatile private var lastRavenKey: String = ""
-    @Volatile private var lastRavenCleanBase: String = "https://thor-api-443941171993.us-east4.run.app"
+    @Volatile private var lastRavenCleanBase: String = "https://api.thegodofthunder.com"
     @Volatile private var lastRavenTitle: String = ""
     @Volatile private var lastRavenMessage: String = ""
     @Volatile private var lastRavenLinks: JSONArray? = null
@@ -1138,50 +1138,11 @@ object VikingPopupOverlayManager {
         return if (cleanedBody.isNotBlank()) cleanedBody else "Tap a gold link button below to open."
     }
 
-    private const val SHIFT_PREFS = "thor_shift_prefs"
-    private const val KEY_SHIFT_AWAKE = "shift_awake"
-    private const val KEY_SHIFT_SINCE_MS = "shift_awake_since_ms"
-    private const val MAX_SHIFT_AWAKE_MS = 14L * 60L * 60L * 1000L
-
-    fun isShiftAwake(ctx: Context?): Boolean {
-        val c = ctx ?: appCtx ?: return true
-        val sp = c.getSharedPreferences(SHIFT_PREFS, Context.MODE_PRIVATE)
-        val awake = sp.getBoolean(KEY_SHIFT_AWAKE, true)
-        if (!awake) return false
-        val sinceMs = sp.getLong(KEY_SHIFT_SINCE_MS, 0L)
-        if (sinceMs > 0L && (System.currentTimeMillis() - sinceMs) >= MAX_SHIFT_AWAKE_MS) {
-            sp.edit().putBoolean(KEY_SHIFT_AWAKE, false).apply()
-            Log.i(TAG, "WO-227: 14-hour auto-sleep safety valve triggered -> Shift SLEEP ($0/hr Cloud Run idle).")
-            return false
-        }
-        return true
-    }
+    // WO-237 Sovereign VPS: 24/7 flat-rate Netcup server (no Cloud Run idle sleep needed)
+    fun isShiftAwake(ctx: Context?): Boolean = true
 
     fun setShiftAwake(ctx: Context, awake: Boolean, serverBaseUrl: String) {
-        val app = ctx.applicationContext
-        appCtx = app
-        val sp = app.getSharedPreferences(SHIFT_PREFS, Context.MODE_PRIVATE)
-        val ed = sp.edit().putBoolean(KEY_SHIFT_AWAKE, awake)
-        if (awake) {
-            ed.putLong(KEY_SHIFT_SINCE_MS, System.currentTimeMillis())
-        }
-        ed.apply()
-        if (awake) {
-            val cleanBase = serverBaseUrl.trimEnd('/')
-            thread(start = true, isDaemon = true, name = "ThorShiftWarmupPing") {
-                try {
-                    val req = Request.Builder()
-                        .url("$cleanBase/ping?warm=1&src=shift_awake&t=${System.currentTimeMillis()}")
-                        .header("User-Agent", "ThorShiftWake/227 (Samsung-Note20Ultra)")
-                        .get()
-                        .build()
-                    http.newCall(req).execute().close()
-                    Log.i(TAG, "WO-227: Shift AWAKE -> warmed Cloud Run container.")
-                } catch (_: Exception) {}
-            }
-        } else {
-            Log.i(TAG, "WO-227: Shift SLEEP -> background Cloud Run polling paused ($0/hr idle).")
-        }
+        appCtx = ctx.applicationContext
     }
 
     fun start(context: Context, serverBaseUrl: String) {
@@ -1189,17 +1150,12 @@ object VikingPopupOverlayManager {
         val cleanBase = serverBaseUrl.trimEnd('/')
         if (polling) return
         polling = true
-        Log.i(TAG, "Starting Viking Pop-Up Herald V8 (WO-227 Shift-Aware FinOps + WO-145 Living Raven V3)...")
+        Log.i(TAG, "Starting Viking Pop-Up Herald V8 (WO-237 24/7 Sovereign VPS + WO-145 Living Raven V3)...")
 
         thread(start = true, isDaemon = true, name = "VikingPopupPoller") {
             while (polling) {
                 val nowMs = System.currentTimeMillis()
                 val fastActive = nowMs < fastPollUntilEpochMs
-                if (!fastActive && !isShiftAwake(appCtx)) {
-                    // WO-227 FinOps: Shift SLEEP -> 0 Cloud Run HTTP requests overnight ($0.00/hr)
-                    Thread.sleep(30000L)
-                    continue
-                }
                 try {
                     val req = Request.Builder()
                         .url("$cleanBase/api/pre-approval?action=status&t=${System.currentTimeMillis()}")

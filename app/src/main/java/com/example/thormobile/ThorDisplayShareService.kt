@@ -91,7 +91,7 @@ class ThorDisplayShareService : Service() {
         private const val SHARE_CHANNEL_ID = "ThorDisplayShareChannel"
         private const val SHARE_NOTIF_ID = 42
         private const val REFRESH_INTERVAL_MS = 2200L
-        private const val LEDGER_WS_URL = "wss://thor-api-443941171993.us-east4.run.app/ws-ledger"
+        private const val LEDGER_WS_URL = "wss://api.thegodofthunder.com/ws-ledger"
 
         const val ACTION_START_SHARE = "com.example.thormobile.action.START_DISPLAY_SHARE"
         const val ACTION_STOP_SHARE = "com.example.thormobile.action.STOP_DISPLAY_SHARE"

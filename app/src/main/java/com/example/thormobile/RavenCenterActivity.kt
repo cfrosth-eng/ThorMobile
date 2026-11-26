@@ -63,7 +63,7 @@ class RavenCenterActivity : AppCompatActivity() {
         const val EXTRA_SHARED_URI = "shared_uri"
         const val EXTRA_SHARED_MIME = "shared_mime"
 
-        private const val CLOUD_URL = "https://thor-api-443941171993.us-east4.run.app"
+        private const val CLOUD_URL = "https://api.thegodofthunder.com"
         private const val SOVEREIGN_TOKEN = "9d943a8005992357c7d6ca29278e803b80521c4d0d703e1ad74fb141ac050d19"
         private val bgIo = Executors.newCachedThreadPool()
         private val replayLock = Any()

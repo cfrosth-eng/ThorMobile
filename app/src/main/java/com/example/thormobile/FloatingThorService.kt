@@ -105,7 +105,7 @@ class FloatingThorService : Service() {
         }
         @Volatile var userRequestedStop = false
         @Volatile var serviceCreatedElapsedMs = 0L
-        private const val BRIDGE_URL = "wss://thor-api-443941171993.us-east4.run.app"
+        private const val BRIDGE_URL = "wss://api.thegodofthunder.com"
         private const val TETHER_AUTH_TOKEN = "9d943a8005992357c7d6ca29278e803b80521c4d0d703e1ad74fb141ac050d19"
         // Single-Cloud Architecture (V25.2): Direct connection to primary thor-api only
         private const val END_SESSION_TEXT = "END_SESSION"
@@ -373,8 +373,8 @@ class FloatingThorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        ObdLinkAutoWatchdog.startAutonomousWatchdog("https://" + "thor-api-443941171993.us-east4.run.app")
-        VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
+        ObdLinkAutoWatchdog.startAutonomousWatchdog("https://" + "api.thegodofthunder.com")
+        VikingPopupOverlayManager.start(this, "https://" + "api.thegodofthunder.com")
         RavenHeraldService.ensureRunning(this)
         isServiceRunning = true
         activeInstance = this
@@ -675,7 +675,7 @@ class FloatingThorService : Service() {
             isStandby = true
             canAutoResumeMic = false
             if (awaitingThorReply) {
-                VikingPopupOverlayManager.enableFastReplyWatchPoll(this, "https://" + "thor-api-443941171993.us-east4.run.app", 45_000L)
+                VikingPopupOverlayManager.enableFastReplyWatchPoll(this, "https://" + "api.thegodofthunder.com", 45_000L)
             }
             awaitingThorReply = false
             stopStreamingAudio()
@@ -691,13 +691,13 @@ class FloatingThorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "com.example.thormobile.DEMO_SILENT_STANDBY") {
             if (!isStandby) toggleStandby()
-            VikingPopupOverlayManager.showRavenCard(this, "https://thor-api-443941171993.us-east4.run.app", "Huginn Patrol — V4 Polish", "Mic muted in Standby so you can watch in peace, Boss. Double-tap pedestal tomorrow to wake mic.", eventKeyOverride = "RAVEN_V4_${System.currentTimeMillis()}")
+            VikingPopupOverlayManager.showRavenCard(this, "https://api.thegodofthunder.com", "Huginn Patrol — V4 Polish", "Mic muted in Standby so you can watch in peace, Boss. Double-tap pedestal tomorrow to wake mic.", eventKeyOverride = "RAVEN_V4_${System.currentTimeMillis()}")
             return START_STICKY
         }
         if (intent?.action == "com.example.thormobile.DEMO_SILENT_RAVEN") {
             VikingPopupOverlayManager.showRavenCard(
                 context = this,
-                serverBaseUrl = "https://thor-api-443941171993.us-east4.run.app",
+                serverBaseUrl = "https://api.thegodofthunder.com",
                 title = "Huginn Patrol — Fluid V3 Check",
                 message = "60fps mesh Raven, continuous C1 spline flight, rich 24k 6:00 funnel drip, and full-bottom growing molten gold pile active in silent mode, Boss.",
                 eventKeyOverride = "RAVEN_SILENT_${System.currentTimeMillis()}"
@@ -729,7 +729,7 @@ class FloatingThorService : Service() {
         canAutoResumeMic = !isStandby
         getSharedPreferences("thor_overlay_prefs", MODE_PRIVATE).edit().putBoolean("user_stopped", false).apply()
         RavenHeraldService.ensureRunning(this)
-        VikingPopupOverlayManager.start(this, "https://" + "thor-api-443941171993.us-east4.run.app")
+        VikingPopupOverlayManager.start(this, "https://" + "api.thegodofthunder.com")
         return START_STICKY
     }
 
@@ -802,7 +802,7 @@ class FloatingThorService : Service() {
         // Keep zero-mic Silent Raven Herald alive even after long-press shutdown so Ravens always reach Boss!
         RavenHeraldService.ensureRunning(this)
         if (wasAwaiting) {
-            VikingPopupOverlayManager.enableFastReplyWatchPoll(this, "https://" + "thor-api-443941171993.us-east4.run.app", 45_000L)
+            VikingPopupOverlayManager.enableFastReplyWatchPoll(this, "https://" + "api.thegodofthunder.com", 45_000L)
         }
         stopSelf()
     }
@@ -937,7 +937,7 @@ class FloatingThorService : Service() {
         // 1. Instant Visual Heads-Up Card on screen (Zero extra notification-badge clutter!)
         VikingPopupOverlayManager.showDirectVoiceFailoverCard(
             this@FloatingThorService,
-            "https://thor-api-443941171993.us-east4.run.app",
+            "https://api.thegodofthunder.com",
             reasonLabel,
             replyText
         )
@@ -1483,7 +1483,7 @@ class FloatingThorService : Service() {
                     if (json.optString("action") == "raven_card") {
                         VikingPopupOverlayManager.showRavenCard(
                             context = this@FloatingThorService,
-                            serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
+                            serverBaseUrl = "https://" + "api.thegodofthunder.com",
                             title = json.optString("title", "Raven Dispatch"),
                             message = json.optString("message", ""),
                             linksJson = json.optJSONArray("links")
@@ -1500,13 +1500,13 @@ class FloatingThorService : Service() {
                         if (directPop != null) {
                             VikingPopupOverlayManager.showRavenCard(
                                 context = this@FloatingThorService,
-                                serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
+                                serverBaseUrl = "https://" + "api.thegodofthunder.com",
                                 title = directPop.optString("title", "Raven Dispatch"),
                                 message = directPop.optString("body", ""),
                                 linksJson = directPop.optJSONArray("links")
                             )
                         } else {
-                            VikingPopupOverlayManager.pollNow(this@FloatingThorService, "https://" + "thor-api-443941171993.us-east4.run.app")
+                            VikingPopupOverlayManager.pollNow(this@FloatingThorService, "https://" + "api.thegodofthunder.com")
                         }
                     }
                     if (json.optString("action") == "request_native_frame_now") {
@@ -1685,7 +1685,7 @@ class FloatingThorService : Service() {
                     Log.w(TAG_WS, "WO-139: Socket closed while Thor was still thinking -> keeping mic open & reconnecting!")
                     VikingPopupOverlayManager.enableFastReplyWatchPoll(
                         this@FloatingThorService,
-                        "https://" + "thor-api-443941171993.us-east4.run.app",
+                        "https://" + "api.thegodofthunder.com",
                         45_000L
                     )
                     mainHandler.postDelayed({
@@ -1731,7 +1731,7 @@ class FloatingThorService : Service() {
                         if (wasWaitingReply) {
                             VikingPopupOverlayManager.enableFastReplyWatchPoll(
                                 this@FloatingThorService,
-                                "https://" + "thor-api-443941171993.us-east4.run.app",
+                                "https://" + "api.thegodofthunder.com",
                                 120_000L
                             )
                         }
@@ -1745,7 +1745,7 @@ class FloatingThorService : Service() {
                             mainHandler.post {
                                 VikingPopupOverlayManager.showRavenCard(
                                     context = this@FloatingThorService,
-                                    serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
+                                    serverBaseUrl = "https://" + "api.thegodofthunder.com",
                                     title = dropTitle,
                                     message = dropBody,
                                     linksJson = null
@@ -2088,7 +2088,7 @@ class FloatingThorService : Service() {
                             awaitingReplySinceMs = nowMs
                             VikingPopupOverlayManager.enableFastReplyWatchPoll(
                                 this@FloatingThorService,
-                                "https://" + "thor-api-443941171993.us-east4.run.app",
+                                "https://" + "api.thegodofthunder.com",
                                 40_000L
                             )
                             try { target!!.send("END_OF_TURN") } catch (_: Exception) {}
@@ -2212,7 +2212,7 @@ class FloatingThorService : Service() {
                     if (!isStandby) toggleStandby()
                     VikingPopupOverlayManager.showRavenCard(
                         context = this@FloatingThorService,
-                        serverBaseUrl = "https://" + "thor-api-443941171993.us-east4.run.app",
+                        serverBaseUrl = "https://" + "api.thegodofthunder.com",
                         title = "Microphone Paused",
                         message = "Android temporarily claimed the microphone. Double-tap the red Thor ring to wake the mic back up.",
                         linksJson = null

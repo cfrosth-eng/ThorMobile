@@ -23,7 +23,7 @@ class RavenHeraldService : Service() {
         private const val TAG = "RavenHeraldService"
         private const val CHANNEL_ID = "ThorSilentRavenHeraldV1"
         const val RAVEN_NOTIFICATION_ID = 2
-        private const val SERVER_URL = "https://thor-api-443941171993.us-east4.run.app"
+        private const val SERVER_URL = "https://api.thegodofthunder.com"
 
         fun ensureRunning(context: Context) {
             try {
