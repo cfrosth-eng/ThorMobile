@@ -55,6 +55,14 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class RavenCenterActivity : AppCompatActivity() {
+    private var activeCategoryFilter: String = "ALL"
+    private var searchQuery: String = ""
+    private var searchInput: EditText? = null
+    private var filterChipButtons: MutableMap<String, Button> = mutableMapOf()
+    private var btnMarkAllRead: Button? = null
+    private var composeMicBtn: Button? = null
+    private var composeSpeechRecognizer: android.speech.SpeechRecognizer? = null
+    private var composeMicListening: Boolean = false
 
     companion object {
         const val EXTRA_INITIAL_FOLDER = "initial_folder"
@@ -566,6 +574,126 @@ class RavenCenterActivity : AppCompatActivity() {
         folderRow.addView(btnSync)
         root.addView(folderRow)
 
+        // WO-234 Search Bar Row
+        val searchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = pillBg("#0B1324", "#334155", 1, 14)
+            setPadding(dp(10), dp(4), dp(6), dp(4))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+        searchInput = EditText(this).apply {
+            hint = "🔍 Search Ravens (title, text, links, files)..."
+            setHintTextColor(Color.parseColor("#64748B"))
+            setTextColor(Color.parseColor("#F8FAFC"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            background = null
+            setSingleLine(true)
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    searchQuery = s?.toString()?.trim() ?: ""
+                    refreshLocalFolderView()
+                }
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            })
+        }
+        searchRow.addView(searchInput)
+        val btnClearSearch = Button(this).apply {
+            text = "✕"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, 0, 0, 0)
+            background = pillBg("#1E293B", "#475569", 1, 99)
+            layoutParams = LinearLayout.LayoutParams(dp(30), dp(30))
+            setOnClickListener {
+                searchInput?.setText("")
+                searchQuery = ""
+                refreshLocalFolderView()
+            }
+        }
+        searchRow.addView(btnClearSearch)
+        root.addView(searchRow)
+
+        // WO-234 Category Triage Chips + Mark All Read
+        val chipScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val chipDefs = listOf(
+            "ALL" to "All",
+            "UNREAD" to "● Unread",
+            "ALERTS" to "🔧 Alerts/OBD",
+            "LINKS" to "🔗 Links",
+            "FILES" to "📎 Files"
+        )
+        filterChipButtons.clear()
+        for ((key, lbl) in chipDefs) {
+            val cb = Button(this).apply {
+                text = lbl
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(12), dp(4), dp(12), dp(4))
+                minimumWidth = 0
+                minimumHeight = 0
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    dp(32)
+                ).apply { marginEnd = dp(6) }
+                setOnClickListener {
+                    activeCategoryFilter = key
+                    refreshLocalFolderView()
+                }
+            }
+            filterChipButtons[key] = cb
+            chipRow.addView(cb)
+        }
+        btnMarkAllRead = Button(this).apply {
+            text = "✓ Read All"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#86EFAC"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            minimumWidth = 0
+            minimumHeight = 0
+            background = pillBg("#082E1A", "#4ADE80", 1, 99)
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                dp(32)
+            )
+            setOnClickListener {
+                bgIo.execute {
+                    val dao = ThorDatabase.getDatabase(applicationContext).ravenMessageDao()
+                    for (m in dao.getMessagesByFolder("RECEIVED")) {
+                        if (!m.isRead) dao.markRead(m.msgId)
+                    }
+                    runOnUiThread {
+                        refreshLocalFolderView()
+                        Toast.makeText(this@RavenCenterActivity, "All Ravens marked read.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+        chipRow.addView(btnMarkAllRead)
+        chipScroll.addView(chipRow)
+        root.addView(chipScroll)
+
         val listScroll = ScrollView(this).apply {
             isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(
@@ -589,8 +717,81 @@ class RavenCenterActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopComposeMic()
         try { localTts?.shutdown() } catch (_: Exception) {}
         super.onDestroy()
+    }
+
+    private fun stopComposeMic() {
+        composeMicListening = false
+        try {
+            composeSpeechRecognizer?.stopListening()
+            composeSpeechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        composeSpeechRecognizer = null
+        runOnUiThread {
+            composeMicBtn?.text = "🎤"
+            composeMicBtn?.background = pillBg("#13203B", "#F5B942", 1, 14)
+        }
+    }
+
+    private fun toggleComposeMic() {
+        if (composeMicListening) {
+            stopComposeMic()
+            return
+        }
+        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(this)) {
+            Toast.makeText(this, "Voice dictation unavailable on this device.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        composeMicListening = true
+        composeMicBtn?.text = "🔴"
+        composeMicBtn?.background = pillBg("#7F1D1D", "#FCA5A5", 2, 14)
+        try {
+            composeSpeechRecognizer?.destroy()
+            val sr = android.speech.SpeechRecognizer.createSpeechRecognizer(this)
+            composeSpeechRecognizer = sr
+            sr.setRecognitionListener(object : android.speech.RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+                override fun onError(error: Int) {
+                    stopComposeMic()
+                    Toast.makeText(this@RavenCenterActivity, "Tap 🎤 to try dictating again.", Toast.LENGTH_SHORT).show()
+                }
+                override fun onResults(results: Bundle?) {
+                    val spoken = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim() ?: ""
+                    stopComposeMic()
+                    if (spoken.isNotEmpty()) {
+                        val cur = composeBodyInput.text?.toString()?.trim() ?: ""
+                        val merged = if (cur.isEmpty()) spoken else "$cur $spoken"
+                        composeBodyInput.setText(merged)
+                        composeBodyInput.setSelection(merged.length)
+                    }
+                }
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim() ?: ""
+                    if (partial.isNotEmpty()) {
+                        composeBodyInput.setText(partial)
+                        composeBodyInput.setSelection(partial.length)
+                    }
+                }
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+            val intent = Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            }
+            sr.startListening(intent)
+        } catch (e: Exception) {
+            stopComposeMic()
+            Toast.makeText(this, "Mic dictation error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun handleIncomingShareExtras(srcIntent: Intent?) {
@@ -725,6 +926,17 @@ class RavenCenterActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f)
                 setOnClickListener { dispatchComposedMessage() }
             }
+            composeMicBtn = Button(this@RavenCenterActivity).apply {
+                text = "🎤"
+                isAllCaps = false
+                setTextColor(Color.parseColor("#FDE047"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                setPadding(0, 0, 0, 0)
+                background = pillBg("#13203B", "#F5B942", 1, 14)
+                layoutParams = LinearLayout.LayoutParams(dp(46), dp(42)).apply { marginEnd = dp(8) }
+                setOnClickListener { toggleComposeMic() }
+            }
+            actionBarRow.addView(composeMicBtn)
             actionBarRow.addView(btnSendRaven)
             addView(actionBarRow)
         }
@@ -916,7 +1128,24 @@ class RavenCenterActivity : AppCompatActivity() {
             val recvCount = dao.getCountByFolder("RECEIVED")
             val unreadCount = dao.getUnreadReceivedCount()
             val sentCount = dao.getCountByFolder("SENT")
-            val items = dao.getMessagesByFolder(activeFolder)
+            val allFolderItems = dao.getMessagesByFolder(activeFolder)
+            val alertRx = Regex("\\b(obd|dtc|alert|warning|fault|battery|tpms|brake|engine|guard|backup|error|fail|check engine)\\b", RegexOption.IGNORE_CASE)
+            val qLow = searchQuery.lowercase()
+            val items = allFolderItems.filter { it ->
+                val catOk = when (activeCategoryFilter) {
+                    "UNREAD" -> !it.isRead
+                    "ALERTS" -> alertRx.containsMatchIn(it.title) || alertRx.containsMatchIn(it.body)
+                    "LINKS" -> it.linksJson.length > 4 || it.body.contains("http://", true) || it.body.contains("https://", true)
+                    "FILES" -> it.attachmentName.isNotBlank()
+                    else -> true
+                }
+                val qOk = qLow.isEmpty() ||
+                    it.title.lowercase().contains(qLow) ||
+                    it.body.lowercase().contains(qLow) ||
+                    it.sender.lowercase().contains(qLow) ||
+                    it.attachmentName.lowercase().contains(qLow)
+                catOk && qOk
+            }
 
             runOnUiThread {
                 val recvLabel = if (unreadCount > 0) "📥 Received ($unreadCount new / $recvCount)" else "📥 Received ($recvCount)"
@@ -930,10 +1159,19 @@ class RavenCenterActivity : AppCompatActivity() {
                 btnTabSent.background = pillBg(if (!isRecv) "#38BDF8" else "#0F172A", "#38BDF8", 2, 14)
                 btnTabSent.setTextColor(Color.parseColor(if (!isRecv) "#050811" else "#7DD3FC"))
 
+                for ((k, btn) in filterChipButtons) {
+                    val active = (k == activeCategoryFilter)
+                    btn.background = pillBg(if (active) "#F5B942" else "#0F172A", if (active) "#FDE047" else "#334155", if (active) 2 else 1, 99)
+                    btn.setTextColor(Color.parseColor(if (active) "#050811" else "#CBD5E1"))
+                }
+                btnMarkAllRead?.visibility = if (isRecv && unreadCount > 0) View.VISIBLE else View.GONE
+
                 listContainer.removeAllViews()
                 if (items.isEmpty()) {
                     listContainer.addView(TextView(this).apply {
-                        text = if (isRecv) {
+                        text = if (qLow.isNotEmpty() || activeCategoryFilter != "ALL") {
+                            "No Ravens match your current search/filter.\nTap 'All' or clear search to view all ${allFolderItems.size} messages."
+                        } else if (isRecv) {
                             "No Received Ravens yet.\nAsk Thor by voice to 'send me a Raven card' or tap ✉ New above to message Thor."
                         } else {
                             "No Sent dispatches yet.\nTap ✉ New above (and ＋ to attach screenshots, photos, videos, or files) to message Thor."
@@ -1016,10 +1254,21 @@ class RavenCenterActivity : AppCompatActivity() {
             addView(TextView(this@RavenCenterActivity).apply {
                 text = item.body
                 setTextColor(Color.parseColor("#CBD5E1"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-                maxLines = 3
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setLineSpacing(dp(1).toFloat(), 1.06f)
+                maxLines = 4
                 ellipsize = TextUtils.TruncateAt.END
             })
+
+            if (item.body.length > 150 || item.body.count { it == '\n' } >= 3) {
+                addView(TextView(this@RavenCenterActivity).apply {
+                    text = "Tap to read full message ›"
+                    setTextColor(Color.parseColor("#38BDF8"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }
 
             val pillsScroll = HorizontalScrollView(this@RavenCenterActivity).apply {
                 isHorizontalScrollBarEnabled = false
@@ -1092,6 +1341,11 @@ class RavenCenterActivity : AppCompatActivity() {
             row.addView(makeActionPill("🔊 Replay", "#1E1B4B", "#A78BFA") {
                 requestCloudVoiceReplay(this, item.body, localTts)
             })
+            row.addView(makeActionPill("↩ Reply", "#082E1A", "#4ADE80") {
+                toggleComposeDrawer(forceOpen = true)
+                composeSubjectInput.setText("Re: ${item.title.removePrefix("Re: ").take(42)}")
+                composeBodyInput.requestFocus()
+            })
         }
     }
 
@@ -1101,61 +1355,123 @@ class RavenCenterActivity : AppCompatActivity() {
             runOnUiThread { refreshLocalFolderView() }
         }
 
-        val detailWrap = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#070D19"))
-        }
-        val box = LinearLayout(this).apply {
+        var dialogRef: AlertDialog? = null
+        val maxReaderScrollPx = (resources.displayMetrics.heightPixels * 0.54f).toInt().coerceAtLeast(dp(260))
+
+        val outerSheet = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(16), dp(18), dp(16))
+            background = pillBg("#070D19", "#F5B942", 2, 20)
+            setPadding(dp(16), dp(16), dp(16), dp(14))
         }
-        box.addView(TextView(this).apply {
-            text = "${if (item.folder == "SENT") "SENT TO THOR" else "RECEIVED FROM THOR"} • ${item.timestampEt}"
+
+        // Pinned Header
+        outerSheet.addView(TextView(this).apply {
+            text = "${if (item.folder == "SENT") "SENT TO THOR" else "RECEIVED FROM THOR"} • ${item.timestampEt.ifBlank { formatEtNow(item.timestampMs) }}"
             setTextColor(Color.parseColor("#F5B942"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
         })
-        box.addView(TextView(this).apply {
+        outerSheet.addView(TextView(this).apply {
             text = item.title
             setTextColor(Color.parseColor("#F8FAFC"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(6), 0, dp(8))
+            setPadding(0, dp(4), 0, dp(8))
         })
         if (item.attachmentName.isNotEmpty()) {
-            box.addView(TextView(this).apply {
+            outerSheet.addView(TextView(this).apply {
                 text = "📎 Attachment: ${item.attachmentName} (${item.attachmentMime})"
                 setTextColor(Color.parseColor("#FDE047"))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 setPadding(0, 0, 0, dp(8))
             })
         }
-        box.addView(TextView(this).apply {
+
+        // Smooth Full-Length Scrollable Body (Zero Cutoff)
+        val detailWrap = object : ScrollView(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val capped = View.MeasureSpec.makeMeasureSpec(maxReaderScrollPx, View.MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, capped)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false
+            background = pillBg("#0B1324", "#1E293B", 1, 14)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+        }
+        detailWrap.addView(TextView(this).apply {
             text = item.body
-            setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(Color.parseColor("#F1F5F9"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            setLineSpacing(dp(2).toFloat(), 1.12f)
             setTextIsSelectable(true)
         })
+        outerSheet.addView(detailWrap)
 
+        // Tactical Action Pills (Links / Call / Navigate / Replay)
         val modalPillsScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
-            setPadding(0, dp(14), 0, dp(4))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
         }
         val modalPillsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         populateTacticalActionPills(modalPillsRow, item)
         modalPillsScroll.addView(modalPillsRow)
-        box.addView(modalPillsScroll)
-        detailWrap.addView(box)
+        outerSheet.addView(modalPillsScroll)
 
-        AlertDialog.Builder(this)
-            .setView(detailWrap)
-            .setPositiveButton("Reply to Thor") { d, _ ->
-                d.dismiss()
+        // Pinned Dark-Theme Bottom Action Bar (Copy / Reply / Delete / Close)
+        val actionBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        actionBar.addView(Button(this).apply {
+            text = "📋 Copy"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#E2E8F0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+            background = pillBg("#1E293B", "#475569", 1, 14)
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(6) }
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("Raven Message", item.body))
+                Toast.makeText(this@RavenCenterActivity, "Copied full message to clipboard.", Toast.LENGTH_SHORT).show()
+            }
+        })
+        actionBar.addView(Button(this).apply {
+            text = "↩ Reply"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#04120A"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
+            background = pillBg("#4ADE80", "#FDE047", 1, 14)
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1.1f).apply { marginEnd = dp(6) }
+            setOnClickListener {
+                dialogRef?.dismiss()
                 toggleComposeDrawer(forceOpen = true)
                 composeSubjectInput.setText("Re: ${item.title.removePrefix("Re: ").take(42)}")
                 composeBodyInput.requestFocus()
             }
-            .setNeutralButton("Delete") { d, _ ->
-                d.dismiss()
+        })
+        actionBar.addView(Button(this).apply {
+            text = "🗑"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#FECDD3"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            background = pillBg("#4C1D24", "#FB7185", 1, 14)
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(40)).apply { marginEnd = dp(6) }
+            setOnClickListener {
+                dialogRef?.dismiss()
                 bgIo.execute {
                     ThorDatabase.getDatabase(applicationContext).ravenMessageDao().deleteById(item.msgId)
                     sendLedgerWsRpcSync(
@@ -1165,9 +1481,24 @@ class RavenCenterActivity : AppCompatActivity() {
                     runOnUiThread { refreshLocalFolderView() }
                 }
             }
-            .setNegativeButton("Close", null)
+        })
+        actionBar.addView(Button(this).apply {
+            text = "✕"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+            background = pillBg("#0F172A", "#64748B", 1, 14)
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(40))
+            setOnClickListener { dialogRef?.dismiss() }
+        })
+        outerSheet.addView(actionBar)
+
+        dialogRef = AlertDialog.Builder(this)
+            .setView(outerSheet)
             .create()
-            .show()
+        dialogRef.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+        dialogRef.show()
     }
 
     private fun makeActionPill(label: String, bgHex: String, strokeHex: String, onClick: () -> Unit): Button {

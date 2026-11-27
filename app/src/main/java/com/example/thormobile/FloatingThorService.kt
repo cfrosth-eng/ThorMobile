@@ -1486,7 +1486,8 @@ class FloatingThorService : Service() {
                             serverBaseUrl = "https://" + "api.thegodofthunder.com",
                             title = json.optString("title", "Raven Dispatch"),
                             message = json.optString("message", ""),
-                            linksJson = json.optJSONArray("links")
+                            linksJson = json.optJSONArray("links"),
+                            eventKeyOverride = json.optString("msg_id", "")
                         )
                     }
                     if (json.optString("action") == "open_url") {

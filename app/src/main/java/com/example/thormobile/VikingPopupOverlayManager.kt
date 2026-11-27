@@ -83,6 +83,14 @@ object VikingPopupOverlayManager {
     private var runeHeaderView: TextView? = null
     private var titleView: TextView? = null
     private var subtitleView: TextView? = null
+    private var ravenBodyScroll: android.widget.ScrollView? = null
+    private var ravenReplyBar: LinearLayout? = null
+    private var ravenReplyInput: android.widget.EditText? = null
+    private var ravenReplyMicBtn: Button? = null
+    private var ravenReplySendBtn: Button? = null
+    private var ravenSpeechRecognizer: android.speech.SpeechRecognizer? = null
+    private var ravenMicListening: Boolean = false
+    private var ravenReplySending: Boolean = false
     private var progressBar: ProgressBar? = null
     private var pctLabelView: TextView? = null
     private var approveBtn: Button? = null
@@ -640,7 +648,7 @@ object VikingPopupOverlayManager {
                     eventKey = "VOICE_FAILOVER_${System.currentTimeMillis()}",
                     headerText = "THOR VOICE BACKUP • $reasonLabel",
                     mainTitle = "Thor Reply (Visual Failover):",
-                    subText = replyText.take(680),
+                    subText = replyText,
                     progressPct = 100,
                     mode = "THOR_REPLY"
                 )
@@ -707,12 +715,13 @@ object VikingPopupOverlayManager {
             eventKey = lastRavenKey.ifBlank { "RAVEN_${System.currentTimeMillis()}" },
             headerText = "ᚦᚱ • RAVEN MESSAGE • HUGINN & MUNINN",
             mainTitle = safeTitle,
-            subText = lastRavenMessage.take(640),
+            subText = lastRavenMessage,
             progressPct = 100,
             mode = "RAVEN"
         )
         val tidyText = extractAndPopulateRavenLinks(lastRavenMessage, lastRavenLinks)
-        subtitleView?.text = tidyText.take(620)
+        subtitleView?.text = tidyText
+        ravenBodyScroll?.post { ravenBodyScroll?.scrollTo(0, 0) }
     }
 
     private fun showLivingRavenEmblem(cleanBase: String) {
@@ -1506,9 +1515,10 @@ object VikingPopupOverlayManager {
 
         when (mode) {
             "RAVEN" -> {
-                pctLabelView?.text = "HUGINN & MUNINN • TAP PORTRAIT OR FOLD TO PERCH"
+                pctLabelView?.text = "HUGINN & MUNINN • SCROLL TO READ • REPLY BELOW"
                 pctLabelView?.setTextColor(Color.parseColor("#F5B942"))
                 progressBar?.visibility = View.GONE
+                ravenReplyBar?.visibility = View.VISIBLE
                 undoBtn?.text = "🐦‍⬛ FOLD"
                 undoBtn?.visibility = View.VISIBLE
                 undoBtn?.setOnClickListener {
@@ -1535,9 +1545,22 @@ object VikingPopupOverlayManager {
                     hideRecallBadge()
                     LivingPedestalDirector.dismissUnreadRavenWithTakeoff(ctx)
                 }
-                declineBtn?.visibility = View.GONE
+                declineBtn?.text = "📬 INBOX"
+                declineBtn?.setTextColor(Color.parseColor("#7DD3FC"))
+                declineBtn?.background = makePillDrawable("#0B2545", "#38BDF8", 1, 99, ctx)
+                declineBtn?.visibility = View.VISIBLE
+                declineBtn?.setOnClickListener {
+                    hideVikingShield()
+                    try {
+                        val openCenter = android.content.Intent(ctx, RavenCenterActivity::class.java).apply {
+                            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        ctx.startActivity(openCenter)
+                    } catch (_: Exception) {}
+                }
             }
             "HEADS_UP", "THOR_REPLY" -> {
+                ravenReplyBar?.visibility = View.GONE
                 pctLabelView?.text = "🦅 SILENT HEADS-UP NOTE"
                 pctLabelView?.setTextColor(Color.parseColor("#4ADE80"))
                 progressBar?.visibility = View.GONE
@@ -1554,6 +1577,7 @@ object VikingPopupOverlayManager {
                 undoBtn?.visibility = View.GONE
             }
             "APPLIED_UNDO_BAR" -> {
+                ravenReplyBar?.visibility = View.GONE
                 pctLabelView?.text = "🛡️ UNDO OR KEEP THIS UPGRADE"
                 pctLabelView?.setTextColor(Color.parseColor("#4ADE80"))
                 progressBar?.visibility = View.GONE
@@ -1579,6 +1603,9 @@ object VikingPopupOverlayManager {
                 declineBtn?.visibility = View.GONE
             }
             else -> {
+                ravenReplyBar?.visibility = View.GONE
+                declineBtn?.setTextColor(Color.parseColor("#FECDD3"))
+                declineBtn?.background = makePillDrawable("#4C1D24", "#FB7185", 1, 99, ctx)
                 pctLabelView?.text = "PROGRESS: ${progressPct.coerceIn(0, 100)}%"
                 pctLabelView?.setTextColor(Color.parseColor("#4ADE80"))
                 progressBar?.visibility = View.VISIBLE
@@ -1756,11 +1783,16 @@ object VikingPopupOverlayManager {
         }
         rootCard.addView(progressBar)
 
-        subtitleView = TextView(ctx).apply {
-            text = "Tap APPROVE below to apply live."
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            maxLines = 14
+        val maxBodyScrollPx = (ctx.resources.displayMetrics.heightPixels * 0.44f).toInt().coerceAtLeast(dp(ctx, 210))
+        ravenBodyScroll = object : android.widget.ScrollView(ctx) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val cappedSpec = View.MeasureSpec.makeMeasureSpec(maxBodyScrollPx, View.MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, cappedSpec)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1768,7 +1800,28 @@ object VikingPopupOverlayManager {
                 bottomMargin = dp(ctx, 8)
             }
         }
-        rootCard.addView(subtitleView)
+        val bodyScrollInner = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, dp(ctx, 4), 0)
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        subtitleView = TextView(ctx).apply {
+            text = "Tap APPROVE below to apply live."
+            setTextColor(Color.parseColor("#E2E8F0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setLineSpacing(dp(ctx, 2).toFloat(), 1.08f)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(ctx, 6)
+            }
+        }
+        bodyScrollInner.addView(subtitleView)
 
         ravenLinksContainer = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
@@ -1777,10 +1830,93 @@ object VikingPopupOverlayManager {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
+                topMargin = dp(ctx, 2)
+                bottomMargin = dp(ctx, 4)
+            }
+        }
+        bodyScrollInner.addView(ravenLinksContainer)
+        ravenBodyScroll?.addView(bodyScrollInner)
+        rootCard.addView(ravenBodyScroll)
+
+        // WO-228 Interactive Reply Bar (Text Input + Mic Dictation Toggle + Send)
+        ravenReplyBar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            background = makePillDrawable("#081124", "#334155", 1, 16, ctx)
+            setPadding(dp(ctx, 6), dp(ctx, 5), dp(ctx, 6), dp(ctx, 5))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
                 bottomMargin = dp(ctx, 8)
             }
         }
-        rootCard.addView(ravenLinksContainer)
+
+        ravenReplyMicBtn = Button(ctx).apply {
+            text = "🎤"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#FDE047"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setPadding(0, 0, 0, 0)
+            background = makePillDrawable("#13203B", "#F5B942", 1, 99, ctx)
+            layoutParams = LinearLayout.LayoutParams(dp(ctx, 38), dp(ctx, 38)).apply {
+                marginEnd = dp(ctx, 6)
+            }
+            setOnClickListener { toggleRavenCardMic(ctx) }
+        }
+        ravenReplyBar?.addView(ravenReplyMicBtn)
+
+        ravenReplyInput = android.widget.EditText(ctx).apply {
+            hint = "Reply to Thor (type or tap 🎤)..."
+            setHintTextColor(Color.parseColor("#64748B"))
+            setTextColor(Color.parseColor("#F8FAFC"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            background = null
+            setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 6), dp(ctx, 6))
+            maxLines = 3
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(ctx, 6)
+            }
+            setOnTouchListener { v, ev ->
+                if (ev.action == MotionEvent.ACTION_DOWN) {
+                    setPopupFocusable(ctx, true)
+                    v.requestFocus()
+                    mainHandler.postDelayed({
+                        try {
+                            val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                            imm.showSoftInput(v, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                        } catch (_: Exception) {}
+                    }, 80L)
+                }
+                false
+            }
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEND) {
+                    dispatchRavenCardQuickReply(ctx)
+                    true
+                } else false
+            }
+        }
+        ravenReplyBar?.addView(ravenReplyInput)
+
+        ravenReplySendBtn = Button(ctx).apply {
+            text = "➤"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#04120A"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 0)
+            background = makePillDrawable("#4ADE80", "#FDE047", 1, 99, ctx)
+            layoutParams = LinearLayout.LayoutParams(dp(ctx, 40), dp(ctx, 38))
+            setOnClickListener { dispatchRavenCardQuickReply(ctx) }
+        }
+        ravenReplyBar?.addView(ravenReplySendBtn)
+        rootCard.addView(ravenReplyBar)
 
         val btnRow = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2101,7 +2237,200 @@ object VikingPopupOverlayManager {
         }
     }
 
+    private fun setPopupFocusable(ctx: Context, focusable: Boolean) {
+        val v = popupView ?: return
+        val p = popupParams ?: return
+        val baseFlags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        p.flags = if (focusable) {
+            baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        } else {
+            baseFlags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+        p.softInputMode = if (focusable) {
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE
+        } else {
+            WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+        }
+        if (focusable && p.y > dp(ctx, 180)) {
+            p.y = dp(ctx, 28)
+        }
+        if (v.parent != null) {
+            try { windowManager?.updateViewLayout(v, p) } catch (_: Exception) {}
+        }
+        if (!focusable) {
+            try {
+                val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                imm.hideSoftInputFromWindow(v.windowToken, 0)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun stopRavenCardMic() {
+        ravenMicListening = false
+        try {
+            ravenSpeechRecognizer?.stopListening()
+            ravenSpeechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        ravenSpeechRecognizer = null
+        val ctx = appCtx
+        mainHandler.post {
+            ravenReplyMicBtn?.text = "🎤"
+            if (ctx != null) {
+                ravenReplyMicBtn?.background = makePillDrawable("#13203B", "#F5B942", 1, 99, ctx)
+            }
+        }
+    }
+
+    private fun toggleRavenCardMic(ctx: Context) {
+        if (ravenMicListening) {
+            stopRavenCardMic()
+            return
+        }
+        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(ctx)) {
+            Toast.makeText(ctx, "Voice dictation unavailable on this device.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        setPopupFocusable(ctx, true)
+        ravenMicListening = true
+        ravenReplyMicBtn?.text = "🔴"
+        ravenReplyMicBtn?.background = makePillDrawable("#7F1D1D", "#FCA5A5", 2, 99, ctx)
+        try {
+            ravenSpeechRecognizer?.destroy()
+            val sr = android.speech.SpeechRecognizer.createSpeechRecognizer(ctx)
+            ravenSpeechRecognizer = sr
+            sr.setRecognitionListener(object : android.speech.RecognitionListener {
+                override fun onReadyForSpeech(params: android.os.Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+                override fun onError(error: Int) {
+                    stopRavenCardMic()
+                    val msg = if (error == android.speech.SpeechRecognizer.ERROR_AUDIO ||
+                        error == android.speech.SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    ) "Mic busy — tap 🎤 again or type your reply." else "Didn't catch that — tap 🎤 to retry."
+                    Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+                }
+                override fun onResults(results: android.os.Bundle?) {
+                    val spoken = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim() ?: ""
+                    stopRavenCardMic()
+                    if (spoken.isNotEmpty()) {
+                        val existing = ravenReplyInput?.text?.toString()?.trim() ?: ""
+                        val combined = if (existing.isEmpty()) spoken else "$existing $spoken"
+                        ravenReplyInput?.setText(combined)
+                        ravenReplyInput?.setSelection(combined.length)
+                    }
+                }
+                override fun onPartialResults(partialResults: android.os.Bundle?) {
+                    val partial = partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()?.trim() ?: ""
+                    if (partial.isNotEmpty()) {
+                        ravenReplyInput?.setText(partial)
+                        ravenReplyInput?.setSelection(partial.length)
+                    }
+                }
+                override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
+            })
+            val intent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.packageName)
+            }
+            sr.startListening(intent)
+        } catch (e: Exception) {
+            stopRavenCardMic()
+            Toast.makeText(ctx, "Voice reply error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun dispatchRavenCardQuickReply(ctx: Context) {
+        if (ravenReplySending) return
+        val replyBody = ravenReplyInput?.text?.toString()?.trim() ?: ""
+        if (replyBody.isEmpty()) {
+            Toast.makeText(ctx, "Type a reply or tap 🎤 to speak first, Boss.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        stopRavenCardMic()
+        setPopupFocusable(ctx, false)
+        ravenReplySending = true
+        ravenReplyInput?.setText("")
+        ravenReplySendBtn?.isEnabled = false
+        ravenReplySendBtn?.text = "…"
+        val origTitle = lastRavenTitle.ifBlank { "Raven Message" }
+        val subj = "Re: ${origTitle.removePrefix("Re: ").take(42)}"
+        val msgId = "SENT_${System.currentTimeMillis()}"
+
+        thread(start = true, isDaemon = true) {
+            val dao = ThorDatabase.getDatabase(ctx.applicationContext).ravenMessageDao()
+            val localSent = RavenMessageEntity(
+                msgId = msgId,
+                folder = "SENT",
+                sender = "Boss",
+                title = subj,
+                body = replyBody,
+                timestampMs = System.currentTimeMillis(),
+                timestampEt = RavenCenterActivity.formatEtNow(),
+                isRead = true,
+                syncStatus = "QUEUED_OFFLINE"
+            )
+            try { dao.upsert(localSent) } catch (_: Exception) {}
+
+            val req = org.json.JSONObject()
+                .put("action", "raven_center")
+                .put("sub_action", "send")
+                .put("client_msg_id", msgId)
+                .put("title", subj)
+                .put("message", replyBody)
+                .put("attachment_b64", "")
+                .put("attachment_mime", "")
+                .put("attachment_name", "")
+
+            val resp = RavenCenterActivity.sendLedgerWsRpcSync(req, 65L)
+            if (resp != null && resp.optString("status") == "ok") {
+                try { dao.upsert(localSent.copy(syncStatus = "SYNCED")) } catch (_: Exception) {}
+                val recvObj = resp.optJSONObject("received_entry")
+                if (recvObj != null) {
+                    val ent = RavenCenterActivity.jsonToEntityStatic(recvObj)
+                    try { dao.upsert(ent) } catch (_: Exception) {}
+                    val linksArr = try { JSONArray(ent.linksJson) } catch (_: Exception) { null }
+                    mainHandler.post {
+                        ravenReplySending = false
+                        ravenReplySendBtn?.isEnabled = true
+                        ravenReplySendBtn?.text = "➤"
+                        lastRavenKey = ent.msgId
+                        lastRavenTitle = ent.title
+                        lastRavenMessage = ent.body
+                        lastRavenLinks = linksArr
+                        currentEventKey = ent.msgId
+                        titleView?.text = cleanShortTitle(ent.title)
+                        val tidy = extractAndPopulateRavenLinks(ent.body, linksArr)
+                        subtitleView?.text = tidy
+                        ravenBodyScroll?.post { ravenBodyScroll?.scrollTo(0, 0) }
+                        Toast.makeText(ctx, "🦅 Thor replied!", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    mainHandler.post {
+                        ravenReplySending = false
+                        ravenReplySendBtn?.isEnabled = true
+                        ravenReplySendBtn?.text = "➤"
+                        Toast.makeText(ctx, "🦅 Reply sent to Thor!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } else {
+                mainHandler.post {
+                    ravenReplySending = false
+                    ravenReplySendBtn?.isEnabled = true
+                    ravenReplySendBtn?.text = "➤"
+                    Toast.makeText(ctx, "Offline — reply queued & will auto-send on signal.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     private fun hideVikingShield() {
+        stopRavenCardMic()
+        appCtx?.let { setPopupFocusable(it, false) }
         mainHandler.post {
             val v = popupView ?: return@post
             if (v.parent != null) {
