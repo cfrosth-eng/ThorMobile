@@ -127,6 +127,20 @@ class ThorFlashlightAndLensService : Service() {
             return Pair(cm.cameraIdList.firstOrNull(), false)
         }
 
+        fun pushTorchHardwareState(enabled: Boolean = isTorchOn) {
+            try {
+                ThorDisplayShareService.dispatchPacket(
+                    JSONObject()
+                        .put("action", "phone_hw_state")
+                        .put("type", "phone_hw_state")
+                        .put("torch_on", enabled)
+                        .put("rear_camera", isRearCameraActive)
+                        .put("display_share", ThorDisplayShareService.isDisplayShareActive)
+                        .toString()
+                )
+            } catch (_: Exception) {}
+        }
+
         fun ensureTorchListener(context: Context) {
             if (cbRegistered) return
             try {
@@ -136,7 +150,9 @@ class ThorFlashlightAndLensService : Service() {
                 cm.registerTorchCallback(object : CameraManager.TorchCallback() {
                     override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
                         if (cameraId == backId && !isRearCameraActive) {
+                            val changed = (isTorchOn != enabled)
                             isTorchOn = enabled
+                            if (changed) pushTorchHardwareState(enabled)
                         }
                     }
                 }, Handler(Looper.getMainLooper()))
@@ -151,6 +167,7 @@ class ThorFlashlightAndLensService : Service() {
             if (isRearCameraActive && svc != null) {
                 isTorchOn = enable
                 svc.applySessionTorch(enable)
+                pushTorchHardwareState(enable)
                 return true
             }
             return try {
@@ -159,6 +176,7 @@ class ThorFlashlightAndLensService : Service() {
                 if (backId != null && hasFlash) {
                     cm.setTorchMode(backId, enable)
                     isTorchOn = enable
+                    pushTorchHardwareState(enable)
                     true
                 } else false
             } catch (e: Exception) {
@@ -254,12 +272,13 @@ class ThorFlashlightAndLensService : Service() {
 
         fun stopRearCamera(context: Context) {
             isRearCameraActive = false
+            isTorchOn = false
             latestCamFrameJson = ""
             ThorDisplayShareService.dispatchPacket(
-                JSONObject().put("action", "screen_watcher_state").put("type", "screen_watcher_state").put("active", false).toString()
+                JSONObject().put("action", "screen_watcher_state").put("type", "screen_watcher_state").put("active", false).put("torch_on", false).toString()
             )
+            pushTorchHardwareState(false)
             try { context.applicationContext.stopService(Intent(context.applicationContext, ThorFlashlightAndLensService::class.java)) } catch (_: Exception) {}
-            isTorchOn = false
         }
 
         fun sendImmediateHighResFrame() {
@@ -594,6 +613,7 @@ class ThorFlashlightAndLensService : Service() {
                 .put("jpeg_b64", b64)
                 .put("width", w)
                 .put("height", h)
+                .put("torch_on", if (shouldClose) false else isTorchOn)
                 .toString()
             ThorDisplayShareService.dispatchPacket(snapPkt)
             mainHandler.post {
@@ -634,14 +654,15 @@ class ThorFlashlightAndLensService : Service() {
         if (card != null) mainHandler.post { try { wm?.removeView(card) } catch (_: Exception) {} }
         if (notifyOff) {
             ThorDisplayShareService.dispatchPacket(
-                JSONObject().put("action", "screen_watcher_state").put("type", "screen_watcher_state").put("active", false).toString()
+                JSONObject().put("action", "screen_watcher_state").put("type", "screen_watcher_state").put("active", false).put("torch_on", isTorchOn).toString()
             )
+            pushTorchHardwareState(isTorchOn)
         }
     }
 
     override fun onDestroy() {
-        teardownAll(notifyOff = true)
         isTorchOn = false
+        teardownAll(notifyOff = true)
         if (activeSvc === this) activeSvc = null
         try { camThread?.quitSafely() } catch (_: Exception) {}
         camThread = null; camHandler = null
