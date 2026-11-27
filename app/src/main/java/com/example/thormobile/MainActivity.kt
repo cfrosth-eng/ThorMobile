@@ -291,6 +291,26 @@ class MainActivity : AppCompatActivity() {
         }
         orbGrid.addView(buildTwoColRow(altarCard, setupCard))
 
+        // Row 6: OBD Reader + Blueprint Room (WO-236)
+        val (obdCard, _) = buildClassicOrbTile(
+            label = "OBD Reader",
+            iconRes = R.drawable.orb_classic_bronze,
+            accentHex = "#FB923C",
+            initialStatus = null,
+        ) {
+            openInBrowser("$CLOUD_URL/obd?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
+        }
+
+        val (blueprintCard, _) = buildClassicOrbTile(
+            label = "Blueprint Room",
+            iconRes = R.drawable.orb_classic_teal,
+            accentHex = "#2DD4BF",
+            initialStatus = null,
+        ) {
+            openInBrowser("$CLOUD_URL/blueprint?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
+        }
+        orbGrid.addView(buildTwoColRow(obdCard, blueprintCard))
+
         root.addView(orbGrid)
 
         // ====================================================================
@@ -298,17 +318,19 @@ class MainActivity : AppCompatActivity() {
         // ====================================================================
         root.addView(buildNorseSectionDivider("ᛟ   REALMS & CONSOLES   ᛟ"))
 
+        // Grouped by purpose: AI Brains (left: Gemini -> Claude -> ChatGPT) paired with matching APIs (right),
+        // followed by Sovereign Infrastructure & Thor Repo (Supabase retired under WO-238).
         val links = listOf(
             Triple("Gemini", "#60A5FA", "https://gemini.google.com/app"),
-            Triple("ChatGPT", "#34D399", "https://chatgpt.com"),
-            Triple("Claude", "#FB923C", "https://claude.ai"),
             Triple("Google AI Studio", "#FBBF24", "https://aistudio.google.com/app/apikey"),
-            Triple("Supabase", "#22C55E", "https://supabase.com/dashboard"),
+            Triple("Claude", "#FB923C", "https://claude.ai"),
+            Triple("Anthropic API", "#F97316", "https://console.anthropic.com"),
+            Triple("ChatGPT", "#34D399", "https://chatgpt.com"),
+            Triple("OpenAI API", "#10B981", "https://platform.openai.com"),
             Triple("Netcup Server CP", "#10B981", "https://www.servercontrolpanel.de"),
             Triple("Cloudflare DNS", "#F97316", "https://dash.cloudflare.com"),
             Triple("Tailscale Mesh", "#38BDF8", "https://login.tailscale.com/admin/machines"),
-            Triple("Anthropic API", "#F97316", "https://console.anthropic.com"),
-            Triple("OpenAI API", "#10B981", "https://platform.openai.com"),
+            Triple("GitHub  ·  Thor Repo", "#CBD5E1", "https://github.com/cfrosth-eng/Thor"),
         )
 
         var idx = 0
@@ -324,19 +346,6 @@ class MainActivity : AppCompatActivity() {
             )
             idx += 2
         }
-
-        val ghBtn = buildNorseLinkButton("GitHub  ·  Thor Repo", "#CBD5E1") {
-            openInBrowser("https://github.com/cfrosth-eng/Thor")
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply {
-                topMargin = dp(2)
-                bottomMargin = dp(8)
-            }
-        }
-        root.addView(ghBtn)
 
         scroll.addView(root)
         outerFrame.addView(scroll)
