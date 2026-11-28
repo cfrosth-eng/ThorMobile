@@ -311,6 +311,18 @@ class MainActivity : AppCompatActivity() {
         }
         orbGrid.addView(buildTwoColRow(obdCard, blueprintCard))
 
+        // Row 7: Thought Process Live Chronicle (WO-263)
+        val (thoughtsCard, _) = buildClassicOrbTile(
+            label = "Thought Process",
+            iconRes = R.drawable.orb_classic_lime,
+            accentHex = "#A3E635",
+            initialStatus = "LIVE",
+        ) {
+            openInBrowser("$CLOUD_URL/thoughts?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
+        }
+        val row7Spacer = View(this@MainActivity).apply { visibility = View.INVISIBLE }
+        orbGrid.addView(buildTwoColRow(thoughtsCard, row7Spacer))
+
         root.addView(orbGrid)
 
         // ====================================================================
