@@ -180,7 +180,7 @@ class MainActivity : AppCompatActivity() {
         val (ravenCard, ravenRefs) = buildClassicOrbTile(
             label = "Raven Mail",
             iconRes = R.drawable.orb_classic_crimson,
-            accentHex = "#F43F5E",
+            accentHex = "#EF4444",
             initialStatus = "INBOX",
         ) { startActivity(Intent(this, RavenCenterActivity::class.java)) }
         ravenOrbRefs = ravenRefs
@@ -228,7 +228,7 @@ class MainActivity : AppCompatActivity() {
         val (torchCard, torchRefs) = buildClassicOrbTile(
             label = "Flashlight",
             iconRes = R.drawable.orb_classic_amber,
-            accentHex = "#F59E0B",
+            accentHex = "#FF7A00",
             initialStatus = "OFF",
         ) {
             val on = ThorFlashlightAndLensService.toggleTorch(this@MainActivity)
@@ -240,18 +240,18 @@ class MainActivity : AppCompatActivity() {
         val (ssCard, _) = buildClassicOrbTile(
             label = "Screensaver",
             iconRes = R.drawable.orb_classic_silver,
-            accentHex = "#E2E8F0",
+            accentHex = "#F8FAFC",
             initialStatus = null,
         ) {
             startActivity(Intent(this@MainActivity, ThorScreensaverActivity::class.java))
         }
         orbGrid.addView(buildTwoColRow(torchCard, ssCard))
 
-        // Row 4: 3D Sanctum + Thor Chat
+        // Row 4: 3D Sanctum (Hot Neon Rose-Pink) + Thor Chat (Electric Royal Cobalt Blue)
         val (sanctumCard, _) = buildClassicOrbTile(
             label = "3D Sanctum",
-            iconRes = R.drawable.orb_classic_indigo,
-            accentHex = "#818CF8",
+            iconRes = R.drawable.orb_classic_magenta,
+            accentHex = "#EC4899",
             initialStatus = null,
         ) {
             openInBrowser("$CLOUD_URL/notes?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
@@ -260,18 +260,18 @@ class MainActivity : AppCompatActivity() {
         val (chatCard, _) = buildClassicOrbTile(
             label = "Thor Chat",
             iconRes = R.drawable.orb_classic_sapphire,
-            accentHex = "#60A5FA",
+            accentHex = "#3B82F6",
             initialStatus = null,
         ) {
             openInBrowser("$CLOUD_URL/chat?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
         }
         orbGrid.addView(buildTwoColRow(sanctumCard, chatCard))
 
-        // Row 5: Runic Altar + Saver Setup
+        // Row 5: Runic Altar (Deep Amethyst Violet) + Saver Setup (Warm Sunset Coral)
         val (altarCard, _) = buildClassicOrbTile(
             label = "Runic Altar",
             iconRes = R.drawable.orb_classic_purple,
-            accentHex = "#C084FC",
+            accentHex = "#A855F7",
             initialStatus = null,
         ) {
             openInBrowser("$CLOUD_URL/observatory?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
@@ -279,8 +279,8 @@ class MainActivity : AppCompatActivity() {
 
         val (setupCard, _) = buildClassicOrbTile(
             label = "Saver Setup",
-            iconRes = R.drawable.orb_classic_magenta,
-            accentHex = "#F472B6",
+            iconRes = R.drawable.orb_classic_coral,
+            accentHex = "#FB7185",
             initialStatus = null,
         ) {
             try {
@@ -291,11 +291,11 @@ class MainActivity : AppCompatActivity() {
         }
         orbGrid.addView(buildTwoColRow(altarCard, setupCard))
 
-        // Row 6: OBD Reader + Blueprint Room (WO-236)
+        // Row 6: OBD Reader (Burnished Copper-Bronze) + Blueprint Room (Bright Mint Teal) (WO-236)
         val (obdCard, _) = buildClassicOrbTile(
             label = "OBD Reader",
             iconRes = R.drawable.orb_classic_bronze,
-            accentHex = "#FB923C",
+            accentHex = "#D97706",
             initialStatus = null,
         ) {
             openInBrowser("$CLOUD_URL/obd?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
@@ -304,14 +304,14 @@ class MainActivity : AppCompatActivity() {
         val (blueprintCard, _) = buildClassicOrbTile(
             label = "Blueprint Room",
             iconRes = R.drawable.orb_classic_teal,
-            accentHex = "#2DD4BF",
+            accentHex = "#14B8A6",
             initialStatus = null,
         ) {
             openInBrowser("$CLOUD_URL/blueprint?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
         }
         orbGrid.addView(buildTwoColRow(obdCard, blueprintCard))
 
-        // Row 7: Thought Process Live Chronicle (WO-263)
+        // Row 7: Thought Process (Electric Acid Lime) + Scheduled Tasks (Electric Neon Orchid) (WO-263 / WO-265)
         val (thoughtsCard, _) = buildClassicOrbTile(
             label = "Thought Process",
             iconRes = R.drawable.orb_classic_lime,
@@ -320,8 +320,46 @@ class MainActivity : AppCompatActivity() {
         ) {
             openInBrowser("$CLOUD_URL/thoughts?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
         }
-        val row7Spacer = View(this@MainActivity).apply { visibility = View.INVISIBLE }
-        orbGrid.addView(buildTwoColRow(thoughtsCard, row7Spacer))
+        val (tasksCard, tasksRefs) = buildClassicOrbTile(
+            label = "Scheduled Tasks",
+            iconRes = R.drawable.orb_classic_orchid,
+            accentHex = "#D946EF",
+            initialStatus = "24/7",
+        ) {
+            openInBrowser("$CLOUD_URL/tasks?key=$SOVEREIGN_TOKEN&v=${System.currentTimeMillis()}")
+        }
+        orbGrid.addView(buildTwoColRow(thoughtsCard, tasksCard))
+
+        // WO-265: Live glowing active-task count / VPS reboot indicator on Scheduled Tasks orb
+        kotlin.concurrent.thread(start = true, isDaemon = true) {
+            try {
+                val conn = java.net.URL("$CLOUD_URL/api/tasks?key=$SOVEREIGN_TOKEN").openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 6000
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val j = org.json.JSONObject(body)
+                    val activeCnt = j.optInt("active_count", 0)
+                    val rebootDue = j.optBoolean("reboot_required", false)
+                    runOnUiThread {
+                        tasksRefs.statusPill.text = when {
+                            rebootDue -> "REBOOT DUE"
+                            activeCnt > 0 -> "$activeCnt ACTIVE"
+                            else -> "24/7 READY"
+                        }
+                        val fillHex = if (rebootDue) "#451A03" else if (activeCnt > 0) "#3B0764" else "#182235"
+                        val strokeHex = if (rebootDue) "#F97316" else if (activeCnt > 0) "#E879F9" else "#475569"
+                        val txtHex = if (rebootDue) "#FDBA74" else if (activeCnt > 0) "#F5D0FE" else "#CBD5E1"
+                        tasksRefs.statusPill.setTextColor(Color.parseColor(txtHex))
+                        tasksRefs.statusPill.background = GradientDrawable().apply {
+                            setColor(Color.parseColor(fillHex))
+                            cornerRadius = dp(10).toFloat()
+                            setStroke(dp(1), Color.parseColor(strokeHex))
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
 
         root.addView(orbGrid)
 
@@ -635,7 +673,19 @@ class MainActivity : AppCompatActivity() {
             ).apply { topMargin = dp(3) }
         }
         card.addView(statusTv)
-        card.setOnClickListener { onClick() }
+        card.setOnTouchListener { v, ev ->
+            when (ev.action) {
+                android.view.MotionEvent.ACTION_DOWN ->
+                    v.animate().scaleX(0.95f).scaleY(0.95f).setDuration(80).start()
+                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL ->
+                    v.animate().scaleX(1.0f).scaleY(1.0f).setDuration(130).start()
+            }
+            false
+        }
+        card.setOnClickListener {
+            it.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+            onClick()
+        }
 
         return card to OrbTileRefs(ringFrame, statusTv, card)
     }
