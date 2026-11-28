@@ -88,7 +88,7 @@ object VikingPopupOverlayManager {
     private var ravenReplyInput: android.widget.EditText? = null
     private var ravenReplyMicBtn: Button? = null
     private var ravenReplySendBtn: Button? = null
-    private var ravenSpeechRecognizer: android.speech.SpeechRecognizer? = null
+    private var ravenDictationHelper: RavenGeminiDictationHelper? = null
     private var ravenMicListening: Boolean = false
     private var ravenReplySending: Boolean = false
     private var progressBar: ProgressBar? = null
@@ -2268,10 +2268,8 @@ object VikingPopupOverlayManager {
     private fun stopRavenCardMic() {
         ravenMicListening = false
         try {
-            ravenSpeechRecognizer?.stopListening()
-            ravenSpeechRecognizer?.destroy()
+            ravenDictationHelper?.cancel()
         } catch (_: Exception) {}
-        ravenSpeechRecognizer = null
         val ctx = appCtx
         mainHandler.post {
             ravenReplyMicBtn?.text = "🎤"
@@ -2282,66 +2280,38 @@ object VikingPopupOverlayManager {
     }
 
     private fun toggleRavenCardMic(ctx: Context) {
-        if (ravenMicListening) {
-            stopRavenCardMic()
-            return
-        }
-        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(ctx)) {
-            Toast.makeText(ctx, "Voice dictation unavailable on this device.", Toast.LENGTH_SHORT).show()
-            return
-        }
         setPopupFocusable(ctx, true)
-        ravenMicListening = true
-        ravenReplyMicBtn?.text = "🔴"
-        ravenReplyMicBtn?.background = makePillDrawable("#7F1D1D", "#FCA5A5", 2, 99, ctx)
-        try {
-            ravenSpeechRecognizer?.destroy()
-            val sr = android.speech.SpeechRecognizer.createSpeechRecognizer(ctx)
-            ravenSpeechRecognizer = sr
-            sr.setRecognitionListener(object : android.speech.RecognitionListener {
-                override fun onReadyForSpeech(params: android.os.Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onError(error: Int) {
-                    stopRavenCardMic()
-                    val msg = if (error == android.speech.SpeechRecognizer.ERROR_AUDIO ||
-                        error == android.speech.SpeechRecognizer.ERROR_RECOGNIZER_BUSY
-                    ) "Mic busy — tap 🎤 again or type your reply." else "Didn't catch that — tap 🎤 to retry."
-                    Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
-                }
-                override fun onResults(results: android.os.Bundle?) {
-                    val spoken = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()?.trim() ?: ""
-                    stopRavenCardMic()
-                    if (spoken.isNotEmpty()) {
-                        val existing = ravenReplyInput?.text?.toString()?.trim() ?: ""
-                        val combined = if (existing.isEmpty()) spoken else "$existing $spoken"
-                        ravenReplyInput?.setText(combined)
-                        ravenReplyInput?.setSelection(combined.length)
+        val helper = ravenDictationHelper ?: RavenGeminiDictationHelper(
+            context = ctx.applicationContext,
+            onStateChanged = { st ->
+                ravenMicListening = (st == RavenGeminiDictationHelper.State.RECORDING)
+                val c = appCtx ?: ctx
+                when (st) {
+                    RavenGeminiDictationHelper.State.IDLE -> {
+                        ravenReplyMicBtn?.text = "🎤"
+                        ravenReplyMicBtn?.background = makePillDrawable("#13203B", "#F5B942", 1, 99, c)
+                    }
+                    RavenGeminiDictationHelper.State.RECORDING -> {
+                        ravenReplyMicBtn?.text = "🔴"
+                        ravenReplyMicBtn?.background = makePillDrawable("#7F1D1D", "#FCA5A5", 2, 99, c)
+                    }
+                    RavenGeminiDictationHelper.State.TRANSCRIBING -> {
+                        ravenReplyMicBtn?.text = "⏳"
+                        ravenReplyMicBtn?.background = makePillDrawable("#1E3A5F", "#38BDF8", 2, 99, c)
                     }
                 }
-                override fun onPartialResults(partialResults: android.os.Bundle?) {
-                    val partial = partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()?.trim() ?: ""
-                    if (partial.isNotEmpty()) {
-                        ravenReplyInput?.setText(partial)
-                        ravenReplyInput?.setSelection(partial.length)
-                    }
-                }
-                override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
-            })
-            val intent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.packageName)
-            }
-            sr.startListening(intent)
-        } catch (e: Exception) {
-            stopRavenCardMic()
-            Toast.makeText(ctx, "Voice reply error: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
+            },
+            onTranscript = { spoken ->
+                val existing = ravenReplyInput?.text?.toString()?.trim() ?: ""
+                val combined = if (existing.isEmpty()) spoken else "$existing $spoken"
+                ravenReplyInput?.setText(combined)
+                ravenReplyInput?.setSelection(combined.length)
+            },
+            onNotice = { msg ->
+                Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+            },
+        ).also { ravenDictationHelper = it }
+        helper.toggle()
     }
 
     private fun dispatchRavenCardQuickReply(ctx: Context) {
@@ -2358,7 +2328,7 @@ object VikingPopupOverlayManager {
         ravenReplySendBtn?.isEnabled = false
         ravenReplySendBtn?.text = "…"
         val origTitle = lastRavenTitle.ifBlank { "Raven Message" }
-        val subj = "Re: ${origTitle.removePrefix("Re: ").take(42)}"
+        val subj = RavenCenterActivity.formatReplySubject(origTitle)
         val msgId = "SENT_${System.currentTimeMillis()}"
 
         thread(start = true, isDaemon = true) {

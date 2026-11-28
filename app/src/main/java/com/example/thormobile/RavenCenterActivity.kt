@@ -61,7 +61,7 @@ class RavenCenterActivity : AppCompatActivity() {
     private var filterChipButtons: MutableMap<String, Button> = mutableMapOf()
     private var btnMarkAllRead: Button? = null
     private var composeMicBtn: Button? = null
-    private var composeSpeechRecognizer: android.speech.SpeechRecognizer? = null
+    private var composeDictationHelper: RavenGeminiDictationHelper? = null
     private var composeMicListening: Boolean = false
 
     companion object {
@@ -279,6 +279,14 @@ class RavenCenterActivity : AppCompatActivity() {
             } catch (_: Exception) {
                 null
             }
+        }
+
+        fun formatReplySubject(origTitle: String): String {
+            val cleanBase = origTitle
+                .replace(Regex("""^(?:\s*re:\s*)+""", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .ifBlank { "Raven Message" }
+            return "Re: ${cleanBase.take(42)}"
         }
 
         private val flushLock = Any()
@@ -725,10 +733,8 @@ class RavenCenterActivity : AppCompatActivity() {
     private fun stopComposeMic() {
         composeMicListening = false
         try {
-            composeSpeechRecognizer?.stopListening()
-            composeSpeechRecognizer?.destroy()
+            composeDictationHelper?.cancel()
         } catch (_: Exception) {}
-        composeSpeechRecognizer = null
         runOnUiThread {
             composeMicBtn?.text = "🎤"
             composeMicBtn?.background = pillBg("#13203B", "#F5B942", 1, 14)
@@ -736,62 +742,36 @@ class RavenCenterActivity : AppCompatActivity() {
     }
 
     private fun toggleComposeMic() {
-        if (composeMicListening) {
-            stopComposeMic()
-            return
-        }
-        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(this)) {
-            Toast.makeText(this, "Voice dictation unavailable on this device.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        composeMicListening = true
-        composeMicBtn?.text = "🔴"
-        composeMicBtn?.background = pillBg("#7F1D1D", "#FCA5A5", 2, 14)
-        try {
-            composeSpeechRecognizer?.destroy()
-            val sr = android.speech.SpeechRecognizer.createSpeechRecognizer(this)
-            composeSpeechRecognizer = sr
-            sr.setRecognitionListener(object : android.speech.RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onError(error: Int) {
-                    stopComposeMic()
-                    Toast.makeText(this@RavenCenterActivity, "Tap 🎤 to try dictating again.", Toast.LENGTH_SHORT).show()
-                }
-                override fun onResults(results: Bundle?) {
-                    val spoken = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()?.trim() ?: ""
-                    stopComposeMic()
-                    if (spoken.isNotEmpty()) {
-                        val cur = composeBodyInput.text?.toString()?.trim() ?: ""
-                        val merged = if (cur.isEmpty()) spoken else "$cur $spoken"
-                        composeBodyInput.setText(merged)
-                        composeBodyInput.setSelection(merged.length)
+        val helper = composeDictationHelper ?: RavenGeminiDictationHelper(
+            context = this,
+            onStateChanged = { st ->
+                composeMicListening = (st == RavenGeminiDictationHelper.State.RECORDING)
+                when (st) {
+                    RavenGeminiDictationHelper.State.IDLE -> {
+                        composeMicBtn?.text = "🎤"
+                        composeMicBtn?.background = pillBg("#13203B", "#F5B942", 1, 14)
+                    }
+                    RavenGeminiDictationHelper.State.RECORDING -> {
+                        composeMicBtn?.text = "🔴"
+                        composeMicBtn?.background = pillBg("#7F1D1D", "#FCA5A5", 2, 14)
+                    }
+                    RavenGeminiDictationHelper.State.TRANSCRIBING -> {
+                        composeMicBtn?.text = "⏳"
+                        composeMicBtn?.background = pillBg("#1E3A5F", "#38BDF8", 2, 14)
                     }
                 }
-                override fun onPartialResults(partialResults: Bundle?) {
-                    val partial = partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()?.trim() ?: ""
-                    if (partial.isNotEmpty()) {
-                        composeBodyInput.setText(partial)
-                        composeBodyInput.setSelection(partial.length)
-                    }
-                }
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-            val intent = Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            }
-            sr.startListening(intent)
-        } catch (e: Exception) {
-            stopComposeMic()
-            Toast.makeText(this, "Mic dictation error: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
+            },
+            onTranscript = { spoken ->
+                val cur = composeBodyInput.text?.toString()?.trim() ?: ""
+                val merged = if (cur.isEmpty()) spoken else "$cur $spoken"
+                composeBodyInput.setText(merged)
+                composeBodyInput.setSelection(merged.length)
+            },
+            onNotice = { msg ->
+                Toast.makeText(this@RavenCenterActivity, msg, Toast.LENGTH_SHORT).show()
+            },
+        ).also { composeDictationHelper = it }
+        helper.toggle()
     }
 
     private fun handleIncomingShareExtras(srcIntent: Intent?) {
@@ -1343,7 +1323,7 @@ class RavenCenterActivity : AppCompatActivity() {
             })
             row.addView(makeActionPill("↩ Reply", "#082E1A", "#4ADE80") {
                 toggleComposeDrawer(forceOpen = true)
-                composeSubjectInput.setText("Re: ${item.title.removePrefix("Re: ").take(42)}")
+                composeSubjectInput.setText(formatReplySubject(item.title))
                 composeBodyInput.requestFocus()
             })
         }
@@ -1459,7 +1439,7 @@ class RavenCenterActivity : AppCompatActivity() {
             setOnClickListener {
                 dialogRef?.dismiss()
                 toggleComposeDrawer(forceOpen = true)
-                composeSubjectInput.setText("Re: ${item.title.removePrefix("Re: ").take(42)}")
+                composeSubjectInput.setText(formatReplySubject(item.title))
                 composeBodyInput.requestFocus()
             }
         })
